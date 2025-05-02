@@ -1,0 +1,4 @@
+gymnasium~=1.1.1
+numpy < 2
+matplotlib~=3.10.1
+torch
