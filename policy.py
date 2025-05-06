@@ -20,13 +20,23 @@ class Policy(nn.Module):
         )
 
         # Global features encoder (fully connected layer)
-        self.global_encoder = nn.Linear(4, hidden_dim)
+        # self.global_encoder = nn.Linear(4, hidden_dim)
 
         # Unit encoder (flattened units data)
-        self.unit_encoder = nn.Linear(2 * 2 * 2, hidden_dim)
+        self.unit_encoder = nn.Sequential(
+            nn.Linear(2, 16),
+            nn.ReLU(),
+            nn.Linear(16, 32)
+        )
 
         # Final policy head
-        self.fc = nn.Linear(hidden_dim * 3, action_dim)
+        self.policy_head = nn.Sequential(
+            nn.Linear(hidden_dim + 4 + 32, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
 
         self.device = device
 
@@ -35,18 +45,24 @@ class Policy(nn.Module):
         board = self.encode_board(obs['board']).astype(float)
         board = torch.tensor(board, dtype=torch.float32).unsqueeze(0).to(self.device)
         global_feats = torch.tensor(obs['global'].astype(float), dtype=torch.float32).unsqueeze(0).to(self.device)  # (1, 2)
-        units = torch.tensor(obs['units'].astype(float).flatten(), dtype=torch.float32).unsqueeze(0).to(self.device)  # (1, 8)
+        # units = torch.tensor(obs['units'].astype(float).flatten(), dtype=torch.float32).unsqueeze(0).to(self.device)  # (1, 8)
+
+        unit_coords = torch.tensor(obs['units'], dtype=torch.float32).to(self.device)
+        unit_coords = unit_coords.view(2, 2, 2)  # [player, unit, coord]
+
+        encoded_units = self.unit_encoder(unit_coords.view(-1, 2))
+        unit_features = encoded_units.mean(dim=0, keepdim=True)
 
         # Forward through encoders
         board_features = self.board_encoder(board)
-        global_features = self.global_encoder(global_feats)
-        unit_features = self.unit_encoder(units)
+        # global_features = self.global_encoder(global_feats)
+        # unit_features = self.unit_encoder(units)
 
         # Concatenate all features
-        combined = torch.cat([board_features, global_features, unit_features], dim=-1)
+        combined = torch.cat([board_features, global_feats, unit_features], dim=-1)
 
         # Policy head (action logits)
-        logits = self.fc(combined)
+        logits = self.policy_head(combined)
 
         action_mask = np.expand_dims(obs['valid_action_mask'].astype(bool), 0)
         masked_logits = logits.clone()

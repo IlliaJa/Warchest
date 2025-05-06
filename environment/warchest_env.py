@@ -26,7 +26,7 @@ UNIT_COLORS = {
 CLAIM_BASE_ACTION = 'claim_base'
 MOVE_ACTION = 'move'
 
-MOVE_REWARD = 1
+MOVE_REWARD_PER_TURN = -0.005
 INVALID_ACTION_REWARD = -10
 CLAIM_BASE_REWARD = 15
 WIN_REWARD = 100
@@ -303,8 +303,9 @@ class WarChestEnv(gym.Env):
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False, txt_result=wrong_move_reason, is_valid=False)
         moving_unit.move(loc=end)
 
-        reward = (self.max_rewardable_moving_action - self.action_count // 2) / self.max_rewardable_moving_action * MOVE_REWARD
-        reward = max(0, reward)  # Ensure non-negative reward
+        reward = MOVE_REWARD_PER_TURN * (self.action_count // 2)
+        # reward = (self.max_rewardable_moving_action - self.action_count // 2) / self.max_rewardable_moving_action * MOVE_REWARD
+        # reward = max(0, reward)  # Ensure non-negative reward
         return Action(reward=reward, finishes_game=False, txt_result='Move successful', is_valid=True)
 
     def get_move_action_id(self, start, end):
