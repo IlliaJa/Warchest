@@ -26,11 +26,15 @@ UNIT_COLORS = {
 CLAIM_BASE_ACTION = 'claim_base'
 MOVE_ACTION = 'move'
 
-MOVE_REWARD_PER_TURN = -0.005
+MOVE_EXPLORE_REWARD_MAX_TURN = 5
+MOVE_EXPLORE_REWARD_PER_TURN = 0.1
+MOVE_ON_BASE_REWARD = 2.5
+MOVE_NEAR_BASE_REWARD = 0.5
+MOVE_NEG_REWARD_PER_TURN = -0.002
 INVALID_ACTION_REWARD = -10
 CLAIM_BASE_REWARD = 15
-WIN_REWARD = 100
-LOSS_REWARD = -100
+WIN_REWARD = 500
+LOSS_REWARD = -500
 
 NUM_PLAYERS = 2
 MAX_UNITS_PER_PLAYER = 2 # will be 4 when game will be more developed
@@ -48,6 +52,7 @@ class WarChestEnv(gym.Env):
 
         self.state = None
         self.history = [] if save_game_history else None
+        self.exploration_map_dict = None
         self.set_init_state()
 
         self.observation_space = self.get_observation_space()
@@ -69,6 +74,10 @@ class WarChestEnv(gym.Env):
 
     def set_init_state(self):
         board = Board()
+        map = np.where(board.board == INVALID_CELL_ID, INVALID_CELL_ID, 0)
+        self.exploration_map_dict = {1: map.copy(), 2: map.copy()}
+        bases = list(zip(*np.where(board.board == UNCONTROLLED_BASE_CELL_ID)))
+        self.unclaimed_bases_approach_reward = {base: {1:{'near': False, 'on': False}, 2:{'near': False, 'on': False}} for base in bases}
         self.place_default_units(board)
         state = GameState(board=board, active_player=1, action_count=0)
         self.state = state
@@ -235,6 +244,7 @@ class WarChestEnv(gym.Env):
         valid_action_mask[valid_action_ids] = 1
         return {
             'board': self.board.board,
+            'exploration_map': self.exploration_map_dict[self.active_player],
             'units': units_obs,
             'global': global_feats,
             'valid_action_mask': valid_action_mask
@@ -303,9 +313,28 @@ class WarChestEnv(gym.Env):
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False, txt_result=wrong_move_reason, is_valid=False)
         moving_unit.move(loc=end)
 
-        reward = MOVE_REWARD_PER_TURN * (self.action_count // 2)
-        # reward = (self.max_rewardable_moving_action - self.action_count // 2) / self.max_rewardable_moving_action * MOVE_REWARD
-        # reward = max(0, reward)  # Ensure non-negative reward
+        neg_reward = MOVE_NEG_REWARD_PER_TURN * (self.action_count // 2)
+        # explore_multiplier = (MOVE_EXPLORE_REWARD_MAX_TURN - self.exploration_map_dict[self.active_player][end])
+        # explore_reward = max(0, MOVE_EXPLORE_REWARD_PER_TURN * explore_multiplier)
+        # reward = neg_reward + explore_reward
+        self.exploration_map_dict[self.active_player][end] += 1
+
+        # TODO rewrite this stupid shit
+        base_approach_reward = 0
+        unclaimed_bases = self.unclaimed_bases_approach_reward.keys()
+        step_to_unclaimed_base = end in unclaimed_bases
+        if step_to_unclaimed_base:
+            if not self.unclaimed_bases_approach_reward[end][self.active_player]['on']:
+                base_approach_reward = MOVE_ON_BASE_REWARD
+                self.unclaimed_bases_approach_reward[end][self.active_player]['on'] = True
+        else:
+            for base_loc in unclaimed_bases:
+                if not self.unclaimed_bases_approach_reward[base_loc][self.active_player]['near']:
+                    if base_loc in self.board.get_free_adjacent_cells(*end):
+                        self.unclaimed_bases_approach_reward[base_loc][self.active_player]['near'] = True
+                        base_approach_reward = MOVE_NEAR_BASE_REWARD
+                        break
+        reward = neg_reward if base_approach_reward == 0 else base_approach_reward
         return Action(reward=reward, finishes_game=False, txt_result='Move successful', is_valid=True)
 
     def get_move_action_id(self, start, end):

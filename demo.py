@@ -23,7 +23,7 @@ def evaluate_agent(_env, n_eval_episodes, policy):
         turn_num = 0
         while True:
             # AI turn
-            action, log_prob = policy.act(_state)
+            action, log_prob, value, _ = policy.act(_state)
             _state, reward, terminated, truncated, info = env.step(action)
             ai_rewards_ep += reward
             if not info['action'].is_valid:
@@ -57,16 +57,18 @@ def evaluate_agent(_env, n_eval_episodes, policy):
 
 def play_ai_vs_ai(_env, policy):
     _state, _ = _env.reset()
+    rewards = []
     while True:
-        action, log_prob = policy.act(_state)
+        action, log_prob, value, _ = policy.act(_state)
         _state, reward, terminated, truncated, info = env.step(action)
+        rewards.append(reward)
         if not info['action'].is_valid:
             raise ValueError('Invalid action taken by the agent')
 
         if terminated or truncated:
             print('AI vs AI game is finished')
             break
-    return _env
+    return _env, rewards
 
 if __name__ == '__main__':
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -76,14 +78,14 @@ if __name__ == '__main__':
     state, _ = env.reset()
 
     training_hyperparameters = {
-        'hidden_dim': 512
+        'hidden_dim': 64
     }
 
     warchest_policy = Policy(
         action_dim= env.action_space.n,
         device=device,
         hidden_dim=training_hyperparameters["hidden_dim"]).to(device)
-    warchest_policy.load_state_dict(torch.load('data/warchest_policy_20250506-12:12.pth'))
+    warchest_policy.load_state_dict(torch.load('data/warchest_policy_20250515-10:50.pth'))
     warchest_policy.eval()
 
     # Evaluate the agent
@@ -91,5 +93,6 @@ if __name__ == '__main__':
     ai_wins, draws, random_wins, mean_rwd, std_rwd = evaluate_agent(env, total_games, warchest_policy)
 
     # AI vs AI
-    result_env = play_ai_vs_ai(env, warchest_policy)
+    result_env, rewards = play_ai_vs_ai(env, warchest_policy)
+    print("AI vs AI game rewards:", rewards)
     result_env.render_game()

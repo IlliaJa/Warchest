@@ -1,0 +1,16 @@
+queues:
+  - warchest
+
+resource: local-container
+
+docker:
+  image: ghcr.io/illiaja/warchest:latest
+  ports:
+    - "8888:8888"
+  volumes:
+    - ./data:/app/data
+
+environment:
+  variables:
+    REPO_URL: https://github.com/IlliaJa/Warchest.git
+    SCRIPT_PATH: reinforce.py
