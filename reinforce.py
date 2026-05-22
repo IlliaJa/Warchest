@@ -1,3 +1,5 @@
+import logging
+import os
 import numpy as np
 
 from collections import deque
@@ -11,6 +13,26 @@ import wandb
 from policy import Policy
 from environment.warchest_env import WarChestEnv, NUM_PLAYERS, WIN_REWARD, CLAIM_BASE_REWARD, LOSS_REWARD
 
+logger = logging.getLogger('warchest')
+
+
+def setup_run_logger(run_id: str) -> None:
+    os.makedirs('logs', exist_ok=True)
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+    fh = logging.FileHandler(f'logs/run_{run_id}.log')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+
 def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, lam, print_every):
     info = {1: {}, 2: {}}
     bot1_wins_deque = deque(maxlen=100)
@@ -21,6 +43,7 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
 
     for i_episode in range(1, n_training_episodes + 1):
         episode_start_time = time.time()
+        invalid_action_count = 0
         for p_info in info.values():
             p_info['log_probs'] = []
             p_info['values'] = []
@@ -31,9 +54,14 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
         player_1_is_random = np.random.random() < 0.3
         player_2_is_random = np.random.random() < 0.3
         policy_control_both_bots = (not player_1_is_random) and (not player_2_is_random)
+
+        winner = None
+        outcome = 'truncated'
+
         for turn_num in range(max_t):
             for pid in info:
-                if (player_1_is_random and pid == 1) or (player_2_is_random and pid == 2):
+                is_random = (player_1_is_random and pid == 1) or (player_2_is_random and pid == 2)
+                if is_random:
                     action = np.random.choice(env.get_possible_actions())
                     log_prob = torch.tensor(-1e-6).to(device)
                     value = torch.tensor(0.0).to(device)
@@ -49,7 +77,11 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
                 info[pid]['rewards'].append(reward)
 
                 if not step_info['action'].is_valid:
-                    print(f'Invalid action taken by the agent {pid}')
+                    invalid_action_count += 1
+                    role = 'random' if is_random else 'policy'
+                    logger.warning(
+                        f'ep={i_episode} turn={turn_num} player={pid}({role}) invalid_action={action}'
+                    )
                     state, reward, terminated, truncated, step_info = env.make_random_step()
 
                 if reward in (WIN_REWARD, CLAIM_BASE_REWARD):
@@ -57,6 +89,8 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
                     info[opponent_pid]['rewards'][-1] -= reward
 
                 if terminated:
+                    winner = pid
+                    outcome = 'win'
                     if policy_control_both_bots:
                         bot1_wins_deque.append(int(pid == 1))
                     if (not player_1_is_random) and player_2_is_random:
@@ -70,7 +104,6 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
                     if ((not player_1_is_random) and player_2_is_random) or ((not player_2_is_random) and player_1_is_random):
                         wins_against_random_deque.append(0)
 
-                    # Both players lost because game is ended
                     info[1]['rewards'][-1] += LOSS_REWARD
                     info[2]['rewards'][-1] += LOSS_REWARD
 
@@ -81,7 +114,7 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
 
         for pid, p_info in info.items():
             rewards = p_info['rewards']
-            values = p_info['values'] + [torch.tensor(0.0).to(device)]  # bootstrap with 0
+            values = p_info['values'] + [torch.tensor(0.0).to(device)]
 
             gae = 0
             advantages = []
@@ -93,7 +126,6 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
             returns = [adv + val for adv, val in zip(advantages, values[:-1])]
 
             advantages = torch.tensor(advantages).to(device)
-            # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             returns = torch.tensor(returns).to(device)
 
             log_probs = torch.stack(p_info['log_probs'])
@@ -110,6 +142,14 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
             p_info['scores_deque'].append(sum(rewards))
             p_info['entropy_bonus'] = entropy_bonus
 
+            logger.debug(
+                f'ep={i_episode} pid={pid} '
+                f'adv_mean={advantages.mean().item():.3f} adv_std={advantages.std().item():.3f} '
+                f'actor_loss={actor_loss.item():.4f} critic_loss={critic_loss.item():.4f} '
+                f'entropy={entropy_bonus.item():.4f}'
+            )
+
+        total_grad_norm = 0.0
         loss = None
         if (not player_1_is_random) and (not player_2_is_random):
             loss = (info[1]['loss'] / 2 + info[2]['loss'] / 2)
@@ -117,114 +157,129 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
             loss = info[1]['loss']
         elif player_1_is_random and not player_2_is_random:
             loss = info[2]['loss']
-        else:
-            # both players are random, so we do not update the model
-            pass
+
         if loss is not None:
             optimizer.zero_grad()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
 
-            # Calculate the sum of all gradients
-            total_grad_norm = 0
             for param in policy.parameters():
                 if param.grad is not None:
                     total_grad_norm += param.grad.data.norm(2).item() ** 2
             total_grad_norm = total_grad_norm ** 0.5
 
-            # Log the gradient sum (norm) to wandb
+            if torch.isnan(loss):
+                logger.error(f'ep={i_episode} NaN loss detected, skipping optimizer step')
+            else:
+                optimizer.step()
+
             if use_wandb:
                 wandb.log({'grad_norm': total_grad_norm})
-            optimizer.step()
+
+        episode_time = time.time() - episode_start_time
+        loss_str = f'{loss.item():.4f}' if loss is not None else 'n/a'
+        p1_role = 'rng' if player_1_is_random else 'pol'
+        p2_role = 'rng' if player_2_is_random else 'pol'
+        logger.info(
+            f'ep={i_episode}/{n_training_episodes} '
+            f'turns={turn_num} outcome={outcome} winner=p{winner} '
+            f'p1={p1_role} p2={p2_role} '
+            f'score_p1={info[1]["scores"][-1]:.1f} score_p2={info[2]["scores"][-1]:.1f} '
+            f'loss={loss_str} '
+            f'ent={info[1]["entropy_bonus"].item():.3f} '
+            f'wr_self={np.mean(bot1_wins_deque):.3f} wr_rng={np.mean(wins_against_random_deque):.3f} '
+            f'grad={total_grad_norm:.3f} invalid={invalid_action_count} '
+            f't={episode_time:.2f}s'
+        )
 
         if i_episode % print_every == 0:
-            print(f"Episode {i_episode}\tAverage Score: {[round(np.mean(v['scores_deque']), 1) for v in info.values()]}")
+            logger.info(
+                f'--- ep={i_episode} avg_score='
+                f'{[round(np.mean(v["scores_deque"]), 1) for v in info.values()]} ---'
+            )
 
         if use_wandb:
             wandb.log({
-                'episode_time': time.time() - episode_start_time,
+                'episode_time': episode_time,
                 'winrate_bot1': np.mean(bot1_wins_deque),
                 'winrate_agaist_random': np.mean(wins_against_random_deque),
-                # 'avg_loss': info[1]['loss'].item() / len(info[1]['log_probs']),
                 'loss_bot1': info[1]['loss'].item(),
                 'score_bot1': np.mean(info[1]['scores_deque']),
                 'entropy_bonus': info[1]['entropy_bonus'].item(),
                 'score_bot2': np.mean(info[2]['scores_deque']),
                 'avg_log_prob_bot1': torch.mean(torch.stack(info[1]['log_probs'])).item(),
-                'last_turn': turn_num
+                'last_turn': turn_num,
+                'invalid_actions': invalid_action_count,
             })
 
     return [v['scores'] for v in info.values()]
+
 
 if __name__ == '__main__':
     use_wandb = bool(1)
     save_game_history = False
     torch.autograd.set_detect_anomaly(True)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print('Using device:', device)
+
+    run_id = time.strftime('%Y%m%d-%H%M%S')
+    setup_run_logger(run_id)
+    logger.info(f'run_id={run_id} device={device}')
 
     environment = WarChestEnv(save_game_history=save_game_history, debug_mode=False)
     obs, _ = environment.reset()
 
     training_hyperparameters = {
         'device': device,
-        "n_training_episodes": 3000,
-        "max_t": 1000,
-        "gamma": 0.9,
-        "lr": 5e-3,
-        "action_space": environment.action_space.n,
+        'n_training_episodes': 3000,
+        'max_t': 1000,
+        'gamma': 0.9,
+        'lr': 5e-3,
+        'action_space': environment.action_space.n,
         'hidden_dim': 64,
-        'lambda': 0.95
+        'lambda': 0.95,
     }
+    logger.info(f'hyperparameters={training_hyperparameters}')
+
     if use_wandb:
         run = wandb.init(
-            project="warchest",
+            project='warchest',
             config={
-            "epochs": training_hyperparameters["n_training_episodes"],
-            "learning_rate": training_hyperparameters["lr"]
+                'epochs': training_hyperparameters['n_training_episodes'],
+                'learning_rate': training_hyperparameters['lr'],
             }
         )
+        logger.info(f'wandb_run={run.url}')
 
     warchest_policy = Policy(
-        action_dim=training_hyperparameters["action_space"],
-        device=training_hyperparameters["device"],
-        hidden_dim=training_hyperparameters["hidden_dim"]).to(device)
-    warchest_optimizer = optim.Adam(warchest_policy.parameters(), lr=training_hyperparameters["lr"])
+        action_dim=training_hyperparameters['action_space'],
+        device=training_hyperparameters['device'],
+        hidden_dim=training_hyperparameters['hidden_dim']).to(device)
+    warchest_optimizer = optim.Adam(warchest_policy.parameters(), lr=training_hyperparameters['lr'])
+
     exception_for_raising = None
     try:
-        scores = train_with_gae(environment,
-                           warchest_policy,
-                           warchest_optimizer,
-                           training_hyperparameters["n_training_episodes"],
-                           training_hyperparameters["max_t"],
-                           training_hyperparameters["gamma"],
-                           training_hyperparameters["lambda"],
-                           3)
+        scores = train_with_gae(
+            environment,
+            warchest_policy,
+            warchest_optimizer,
+            training_hyperparameters['n_training_episodes'],
+            training_hyperparameters['max_t'],
+            training_hyperparameters['gamma'],
+            training_hyperparameters['lambda'],
+            3,
+        )
     except KeyboardInterrupt:
-        print('Interrupted')
+        logger.info('Training interrupted by user')
     except Exception as e:
         exception_for_raising = e
+        logger.exception(f'Training failed: {e}')
     finally:
         if exception_for_raising is not None:
             raise exception_for_raising
         else:
             save_results = input('Save results? (y/n)')
             if save_results == 'y' or True:
-                timestamp = time.strftime("%Y%m%d-%H:%M")
+                timestamp = time.strftime('%Y%m%d-%H%M')
                 filename = f'warchest_policy_{timestamp}.pth'
-
                 torch.save(warchest_policy.state_dict(), f'data/{filename}')
-                print(f"Model saved as {filename}")
-
-# pd.DataFrame({'rewards': p_info['rewards'],
-#               'log_probs': [l.cpu().detach().numpy() for l in p_info['saved_log_probs']],
-#               'returns': returns
-#               })
-
-# pd.DataFrame({
-#     'rewards': p_info['rewards'],
-#     'values': values.squeeze().cpu().detach().numpy(),
-#     'advantages': advantages.cpu().detach().numpy(),
-#     'log_probs': log_probs.squeeze().cpu().detach().numpy(),
-#     'returns': returns.cpu().detach().numpy()
-# })
+                logger.info(f'Model saved to data/{filename}')

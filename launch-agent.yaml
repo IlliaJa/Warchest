@@ -6,3 +6,4 @@ queues:
 
 run_config:
   resource: local-container
+
