@@ -28,20 +28,20 @@ MOVE_ACTION = 'move'
 
 MOVE_EXPLORE_REWARD_MAX_TURN = 5
 MOVE_EXPLORE_REWARD_PER_TURN = 0.1
-MOVE_ON_BASE_REWARD = 2.5
-MOVE_NEAR_BASE_REWARD = 0.5
+MOVE_ON_BASE_REWARD = 0.005
+MOVE_NEAR_BASE_REWARD = 0.001
 MOVE_NEG_REWARD_PER_TURN = -0.002
-INVALID_ACTION_REWARD = -10
-CLAIM_BASE_REWARD = 15
-WIN_REWARD = 500
-LOSS_REWARD = -500
+INVALID_ACTION_REWARD = -0.02
+CLAIM_BASE_REWARD = 0.03
+WIN_REWARD = 1.0
+LOSS_REWARD = -1.0
 
 NUM_PLAYERS = 2
 MAX_UNITS_PER_PLAYER = 2 # will be 4 when game will be more developed
 
 
 class WarChestEnv(gym.Env):
-    max_actions = 500
+    max_actions = 200
     winning_base_count = 6
     max_rewardable_moving_action = 30
 
@@ -313,7 +313,7 @@ class WarChestEnv(gym.Env):
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False, txt_result=wrong_move_reason, is_valid=False)
         moving_unit.move(loc=end)
 
-        neg_reward = MOVE_NEG_REWARD_PER_TURN * (self.action_count // 2)
+        neg_reward = MOVE_NEG_REWARD_PER_TURN
         # explore_multiplier = (MOVE_EXPLORE_REWARD_MAX_TURN - self.exploration_map_dict[self.active_player][end])
         # explore_reward = max(0, MOVE_EXPLORE_REWARD_PER_TURN * explore_multiplier)
         # reward = neg_reward + explore_reward

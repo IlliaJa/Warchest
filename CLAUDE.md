@@ -9,6 +9,7 @@ Turn-based hex-grid strategy game with a reinforcement learning agent (REINFORCE
 - [Policy network](docs/policy_network.md) — CNN + MLP architecture, encoding, hyperparameters
 - [Training guide](docs/training.md) — algorithm, hyperparameters, W&B metrics, cloud training
 - [Environment API](docs/environment_api.md) — Gymnasium interface, observation/action spaces, Board API
+- [Improvement ideas](docs/improvement_ideas.md) — issues found from log analysis, prioritised fixes
 
 ## Quick orientation
 
