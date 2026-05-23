@@ -59,29 +59,27 @@ Requirements:
 
 Effect:
 - Ownership transfers immediately.
-- Opponent receives a −15 penalty to maintain zero-sum balance.
 
 ## Win / end conditions
 
 | Condition | Outcome |
 |---|---|
-| Player controls 6 bases | That player wins (+500 reward) |
-| Total actions reach 500 | Truncation; both players receive −500 |
+| Player controls 6 bases | That player wins (`WIN_REWARD = +1.0`) |
+| Total actions reach 200 | Truncation; both players receive `LOSS_REWARD = −1.0` |
 
 ## Reward table
 
 | Event | Reward |
 |---|---|
-| Win | +500 |
-| Claim unclaimed base | +15 |
-| Opponent claims base | −15 |
-| Truncation (draw) | −500 |
-| Invalid action attempt | −10 |
-| First move onto unclaimed base | +2.5 |
-| First move adjacent to unclaimed base | +0.5 |
+| Win | +1.0 |
+| Claim unclaimed base | +0.15 |
+| Truncation (draw) | −1.0 |
+| Invalid action attempt | −0.02 |
+| Move onto unclaimed base | +0.005 |
+| Move adjacent to unclaimed base | +0.001 |
 | Each action taken | −0.002 |
 
-Exploration rewards (`MOVE_ON_BASE_REWARD`, `MOVE_NEAR_BASE_REWARD`) are only issued for the first `max_rewardable_moving_action = 30` steps to encourage early spread.
+Base approach rewards (`MOVE_ON_BASE_REWARD`, `MOVE_NEAR_BASE_REWARD`) fire on every qualifying move for the duration of the episode — the once-per-base flag was removed (fix #3).
 
 ## Turn order
 

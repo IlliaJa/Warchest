@@ -16,6 +16,29 @@ from environment.warchest_env import WarChestEnv, NUM_PLAYERS, WIN_REWARD, CLAIM
 logger = logging.getLogger('warchest')
 
 
+class RunningMeanStd:
+    """Welford online algorithm for tracking running mean and variance."""
+    def __init__(self):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = 1e-4
+
+    def update(self, x: np.ndarray):
+        batch_mean = x.mean()
+        batch_var = x.var()
+        batch_count = len(x)
+        total_count = self.count + batch_count
+        delta = batch_mean - self.mean
+        self.mean += delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        self.var = (m_a + m_b + delta ** 2 * self.count * batch_count / total_count) / total_count
+        self.count = total_count
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / (self.var ** 0.5 + 1e-8)
+
+
 def setup_run_logger(run_id: str) -> None:
     os.makedirs('logs', exist_ok=True)
     logger.setLevel(logging.DEBUG)
@@ -40,6 +63,8 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
     for p_info in info.values():
         p_info['scores'] = []
         p_info['scores_deque'] = deque(maxlen=print_every)
+
+    returns_rms = RunningMeanStd()
 
     for i_episode in range(1, n_training_episodes + 1):
         episode_start_time = time.time()
@@ -93,6 +118,12 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
                         f'ep={i_episode} turn={turn_num} player={pid}({role}) invalid_action={action}'
                     )
                     state, reward, terminated, truncated, step_info = env.make_random_step()
+                    # The policy's log_prob/value/entropy were recorded for the invalid action.
+                    # Zero them out so this step produces no gradient — the reward stays as
+                    # INVALID_ACTION_REWARD but nothing is attributed to any policy decision.
+                    info[pid]['log_probs'][-1] = torch.tensor(0.0).to(device)
+                    info[pid]['values'][-1] = torch.tensor(0.0).to(device)
+                    info[pid]['entropies'][-1] = torch.tensor(0.0).to(device)
 
                 if terminated:
                     winner = pid
@@ -134,6 +165,14 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
 
         gae_start = time.time()
         for pid, p_info in info.items():
+            is_random = (player_1_is_random and pid == 1) or (player_2_is_random and pid == 2)
+            p_info['scores'].append(sum(p_info['rewards']))
+            p_info['scores_deque'].append(sum(p_info['rewards']))
+            if is_random:
+                p_info['loss'] = torch.tensor(0.0)
+                p_info['entropy_bonus'] = torch.tensor(0.0)
+                continue
+
             rewards = p_info['rewards']
             values = p_info['values'] + [torch.tensor(0.0).to(device)]
 
@@ -149,6 +188,8 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
             advantages = torch.tensor(advantages).to(device)
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             returns = torch.tensor(returns).to(device)
+            returns_rms.update(returns.detach().cpu().numpy())
+            returns = returns_rms.normalize(returns)
 
             log_probs = torch.stack(p_info['log_probs'])
             values = torch.stack(p_info['values'])
@@ -160,8 +201,6 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
             critic_loss = F.mse_loss(values.squeeze(), returns.detach())
 
             p_info['loss'] = actor_loss + critic_loss - entropy_coeff * entropy_bonus
-            p_info['scores'].append(sum(rewards))
-            p_info['scores_deque'].append(sum(rewards))
             p_info['entropy_bonus'] = entropy_bonus
 
             logger.debug(
@@ -264,7 +303,7 @@ if __name__ == '__main__':
         'device': device,
         'n_training_episodes': 3000,
         'max_t': 1000,
-        'gamma': 0.9,
+        'gamma': 0.99,
         'lr_actor': 1e-4,
         'lr_critic': 5e-4,
         'action_space': environment.action_space.n,

@@ -16,7 +16,9 @@ The fact that `wr_rng < 0.5` after training is the smoking gun: the policy is pr
 
 ## Fixes (correctness bugs blocking learning)
 
-### 1. Observation is absolute, action space is relative — the policy is trying to learn two contradictory functions
+### 1. ✅ Observation is absolute, action space is relative — the policy is trying to learn two contradictory functions
+
+> **Done 2026-05-23.** `generate_observation` now always puts the active player's units in slot 0 and the opponent's in slot 1. `global_feats` drops `active_player` and uses `[turn_count, my_bases, opp_bases]` (3 features). `encode_board` swaps channels 3/4 based on `active_player` so channel 3 is always "my bases". `observation_space` updated to match. Network input shrunk from `hidden_dim+4+32` to `hidden_dim+3+32`.
 
 This is the single biggest reason the policy can't beat random.
 
@@ -52,7 +54,9 @@ This is a **prerequisite** for everything below to actually work in self-play. W
 
 ---
 
-### 2. `observation_space` lies about its shape
+### 2. ✅ `observation_space` lies about its shape
+
+> **Done 2026-05-23** (resolved as part of fix #1). `global_feats` now has 3 elements to match the declared shape. `active_player` added as a separate `Discrete(2)` key in the space.
 
 `warchest_env.py:218-227`:
 ```python
@@ -64,7 +68,7 @@ But `generate_observation` emits **4** features. Gymnasium consumers and any wra
 
 ---
 
-### 3. Reward shaping fires once per `(base, player)` and then goes silent
+### 3. ~~Reward shaping fires once per `(base, player)` and then goes silent~~ ✅ DONE
 
 `warchest_env.py:316-337`: `MOVE_ON_BASE_REWARD` and `MOVE_NEAR_BASE_REWARD` are gated on `unclaimed_bases_approach_reward[base][player]['on'/'near']` — once True, never reset. After the first ~10 moves of any episode all six bases have been "visited near" by both players, and the only reward signal left is the −0.002 time penalty (until a claim or a win). The critic has almost nothing to predict for the middle 80 turns of every game.
 
@@ -72,7 +76,7 @@ But `generate_observation` emits **4** features. Gymnasium consumers and any wra
 
 ---
 
-### 4. `make_random_step` corrupts credit assignment when the policy emits an invalid action
+### 4. ~~`make_random_step` corrupts credit assignment when the policy emits an invalid action~~ ✅ DONE
 
 `reinforce.py:89-95`:
 ```python
@@ -86,7 +90,7 @@ When the policy chooses an invalid action (rare since masking is correct, but th
 
 ---
 
-### 5. Random player's trajectory still runs full GAE + critic loss
+### 5. ~~Random player's trajectory still runs full GAE + critic loss~~ ✅ DONE
 
 `reinforce.py:126-152`: the GAE loop iterates `for pid, p_info in info.items()` for both players, even when one is random. The random player's `log_probs`, `values`, `entropies` are constant tensors. GAE produces meaningless advantages, an MSE critic_loss of ~0.038 every time (just the squared `LOSS_REWARD` term), an actor_loss near zero, and an entropy of 0. The result is discarded (loss assembly excludes random side), so the only damage is wasted compute and confusing debug lines.
 
@@ -94,7 +98,9 @@ When the policy chooses an invalid action (rare since masking is correct, but th
 
 ---
 
-### 6. `generate_observation` uses sorted units, action IDs use raw board order
+### 6. ✅ `generate_observation` uses sorted units, action IDs use raw board order
+
+> **Done 2026-05-23.** Removed `sorted(...)` from `generate_observation`; both paths now iterate `self.board.units` directly.
 
 `warchest_env.py:233`: `all_units = sorted(self.board.units, key=lambda u: u.__class__.__name__)` for the observation, but `get_active_player_units` uses raw `self.board.units` order. These coincidentally agree today because every unit is a `Swordsman` and Python's sort is stable — the moment a second unit type is added (or a unit is removed and re-added), observation slot 0 and action's "unit 0" will refer to different units.
 
@@ -104,7 +110,7 @@ When the policy chooses an invalid action (rare since masking is correct, but th
 
 ## Small improvements (tuning and minor refactors)
 
-### 7. `gamma=0.9` is too aggressive for 99-turn episodes
+### 7. ~~`gamma=0.9` is too aggressive for 99-turn episodes~~ ✅ DONE
 
 `0.9^99 ≈ 3×10⁻⁵`. The final WIN_REWARD is essentially invisible to the critic for the first ~50 turns. Combined with the silent middle-game reward shaping (#3), the critic has almost no learning signal for early actions. **Try `gamma=0.99`** (so the win reward decays to ~0.37 after 99 turns).
 
@@ -120,11 +126,11 @@ Each update is one episode of ~100 transitions. With advantage normalization tha
 
 Even at `entropy_coeff=0.005`, the bonus contributes `0.005 × 2.2 ≈ 0.011` to the loss while actor_loss is `< 0.0001`. It's ~100× the actor signal. **Try 0.001 from the start, or 0.005 → 0.0001 linearly** over training.
 
-### 11. `WIN_REWARD = 1.0` but `CLAIM_BASE_REWARD = 0.03` — claims contribute almost nothing
+### 11. ~~`WIN_REWARD = 1.0` but `CLAIM_BASE_REWARD = 0.03` — claims contribute almost nothing~~ ✅ DONE
 
 The agent needs 4 claims to win (6 bases total, starts with 2). Total claim reward = 0.12 vs the final 1.0 — claims look almost free relative to winning. But since most episodes truncate without a win, claims should be your dominant learning signal. **Try `CLAIM_BASE_REWARD = 0.15`** so the cumulative claim reward (~0.6) is comparable to the win signal.
 
-### 12. Normalize returns for the critic, not just advantages for the actor
+### 12. ~~Normalize returns for the critic, not just advantages for the actor~~ ✅ DONE
 
 `reinforce.py:139-141`: advantages are normalized but returns (the critic target) are not. With `gamma=0.99` and dense rewards the return scale will balloon; the critic will spend its capacity tracking that scale instead of the relative ordering. **Use a running mean/std on returns** when changing gamma.
 

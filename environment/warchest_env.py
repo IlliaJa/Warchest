@@ -32,7 +32,7 @@ MOVE_ON_BASE_REWARD = 0.005
 MOVE_NEAR_BASE_REWARD = 0.001
 MOVE_NEG_REWARD_PER_TURN = -0.002
 INVALID_ACTION_REWARD = -0.02
-CLAIM_BASE_REWARD = 0.03
+CLAIM_BASE_REWARD = 0.15
 WIN_REWARD = 1.0
 LOSS_REWARD = -1.0
 
@@ -76,8 +76,6 @@ class WarChestEnv(gym.Env):
         board = Board()
         map = np.where(board.board == INVALID_CELL_ID, INVALID_CELL_ID, 0)
         self.exploration_map_dict = {1: map.copy(), 2: map.copy()}
-        bases = list(zip(*np.where(board.board == UNCONTROLLED_BASE_CELL_ID)))
-        self.unclaimed_bases_approach_reward = {base: {1:{'near': False, 'on': False}, 2:{'near': False, 'on': False}} for base in bases}
         self.place_default_units(board)
         state = GameState(board=board, active_player=1, action_count=0)
         self.state = state
@@ -218,36 +216,40 @@ class WarChestEnv(gym.Env):
     def get_observation_space(self):
         board_channels = 5 # all types of cell ids
         unit_features = 2 # row, column
-        global_features = 3 # active player, number of bases for each player
+        global_features = 3 # turn count, my bases, opponent bases
 
         return gym.spaces.Dict({
             "board": gym.spaces.Box(low=-1, high=3, shape=(board_channels, self.board.board_size, self.board.board_size), dtype=np.int32),
             "units": gym.spaces.Box(low=0, high=7, shape=(NUM_PLAYERS, MAX_UNITS_PER_PLAYER, unit_features), dtype=np.int32),
-            "global": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(global_features,), dtype=np.float32)
+            "global": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(global_features,), dtype=np.float32),
+            "active_player": gym.spaces.Discrete(2),
         })
 
 
     def generate_observation(self):
         unit_features = 2
         units_obs = np.zeros((NUM_PLAYERS, MAX_UNITS_PER_PLAYER, unit_features), dtype=np.int32)
-        all_units = sorted(self.board.units, key=lambda u: u.__class__.__name__)
-        for player_id in range(1, NUM_PLAYERS + 1):
-            player_units = [u for u in all_units if u.player_id == player_id]
+        active = self.active_player
+        opponent = 3 - active
+        for slot, pid in enumerate([active, opponent]):
+            player_units = [u for u in self.board.units if u.player_id == pid]
             for i, _unit in enumerate(player_units[:MAX_UNITS_PER_PLAYER]):
-                units_obs[player_id - 1, i] = _unit.loc
+                units_obs[slot, i] = _unit.loc
 
-        global_feats = np.array([self.active_player - 1, self.action_count // 2,
-                                 len(self.board.get_controlled_bases(1)), len(self.board.get_controlled_bases(2))])
+        my_bases = len(self.board.get_controlled_bases(active))
+        opp_bases = len(self.board.get_controlled_bases(opponent))
+        global_feats = np.array([self.action_count // 2, my_bases, opp_bases], dtype=np.float32)
 
         valid_action_mask = np.zeros(self.total_actions)
         valid_action_ids = self.get_possible_actions()
         valid_action_mask[valid_action_ids] = 1
         return {
             'board': self.board.board,
-            'exploration_map': self.exploration_map_dict[self.active_player],
+            'exploration_map': self.exploration_map_dict[active],
             'units': units_obs,
             'global': global_feats,
-            'valid_action_mask': valid_action_mask
+            'valid_action_mask': valid_action_mask,
+            'active_player': active,
         }
 
     def get_all_actions_ids(self) -> Tuple[Dict, int]:
@@ -319,21 +321,17 @@ class WarChestEnv(gym.Env):
         # reward = neg_reward + explore_reward
         self.exploration_map_dict[self.active_player][end] += 1
 
-        # TODO rewrite this stupid shit
         base_approach_reward = 0
-        unclaimed_bases = self.unclaimed_bases_approach_reward.keys()
-        step_to_unclaimed_base = end in unclaimed_bases
-        if step_to_unclaimed_base:
-            if not self.unclaimed_bases_approach_reward[end][self.active_player]['on']:
-                base_approach_reward = MOVE_ON_BASE_REWARD
-                self.unclaimed_bases_approach_reward[end][self.active_player]['on'] = True
+        rows, cols = np.where(self.board.board == UNCONTROLLED_BASE_CELL_ID)
+        unclaimed_bases = list(zip(rows.tolist(), cols.tolist()))
+        if end in unclaimed_bases:
+            base_approach_reward = MOVE_ON_BASE_REWARD
         else:
+            free_adjacent = self.board.get_free_adjacent_cells(*end)
             for base_loc in unclaimed_bases:
-                if not self.unclaimed_bases_approach_reward[base_loc][self.active_player]['near']:
-                    if base_loc in self.board.get_free_adjacent_cells(*end):
-                        self.unclaimed_bases_approach_reward[base_loc][self.active_player]['near'] = True
-                        base_approach_reward = MOVE_NEAR_BASE_REWARD
-                        break
+                if base_loc in free_adjacent:
+                    base_approach_reward = MOVE_NEAR_BASE_REWARD
+                    break
         reward = neg_reward if base_approach_reward == 0 else base_approach_reward
         return Action(reward=reward, finishes_game=False, txt_result='Move successful', is_valid=True)
 

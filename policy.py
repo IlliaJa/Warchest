@@ -30,19 +30,19 @@ class Policy(nn.Module):
         )
 
         self.actor_head = nn.Sequential(
-            nn.Linear(hidden_dim + 4 + 32, hidden_dim * 2),
+            nn.Linear(hidden_dim + 3 + 32, hidden_dim * 2),
             nn.ReLU(),
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, action_dim)
         )
-        self.critic_head = nn.Linear(hidden_dim + 4 + 32, 1)
+        self.critic_head = nn.Linear(hidden_dim + 3 + 32, 1)
 
         self.device = device
 
     def forward(self, obs):
         # Extract inputs from observation dict # (1, 5, 7, 7)
-        board = self.encode_board(obs['board'], exploration_map=obs['exploration_map']).astype(float)
+        board = self.encode_board(obs['board'], exploration_map=obs['exploration_map'], active_player=obs['active_player']).astype(float)
         board = torch.tensor(board, dtype=torch.float32).unsqueeze(0).to(self.device)
         board_features = self.board_encoder(board)
 
@@ -79,14 +79,18 @@ class Policy(nn.Module):
         entropy = dist.entropy()
         return log_prob, entropy, value
 
-    def encode_board(self, board, exploration_map):
+    def encode_board(self, board, exploration_map, active_player):
         one_hot = np.zeros((6, 7, 7), dtype=np.float32)
 
         one_hot[0] = (board == INVALID_CELL_ID)
         one_hot[1] = (board == EMPTY_CELL_ID)
         one_hot[2] = (board == UNCONTROLLED_BASE_CELL_ID)
-        one_hot[3] = (board == CONTROLLED_BASE_PLAYER_1_CELL_ID)
-        one_hot[4] = (board == CONTROLLED_BASE_PLAYER_2_CELL_ID)
+        if active_player == 1:
+            one_hot[3] = (board == CONTROLLED_BASE_PLAYER_1_CELL_ID)
+            one_hot[4] = (board == CONTROLLED_BASE_PLAYER_2_CELL_ID)
+        else:
+            one_hot[3] = (board == CONTROLLED_BASE_PLAYER_2_CELL_ID)
+            one_hot[4] = (board == CONTROLLED_BASE_PLAYER_1_CELL_ID)
 
         visits = exploration_map.astype(np.float32)
         visits[visits < 0] = 0
