@@ -30,13 +30,13 @@ class Policy(nn.Module):
         )
 
         self.actor_head = nn.Sequential(
-            nn.Linear(hidden_dim + 3 + 32, hidden_dim * 2),
+            nn.Linear(hidden_dim + 3 + 64, hidden_dim * 2),
             nn.ReLU(),
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, action_dim)
         )
-        self.critic_head = nn.Linear(hidden_dim + 3 + 32, 1)
+        self.critic_head = nn.Linear(hidden_dim + 3 + 64, 1)
 
         self.device = device
 
@@ -50,14 +50,16 @@ class Policy(nn.Module):
 
         unit_coords = torch.tensor(obs['units'], dtype=torch.float32).to(self.device)
         unit_coords = unit_coords.view(2, 2, 2)  # [player, unit, coord]
-        encoded_units = self.unit_encoder(unit_coords.view(-1, 2))
-        unit_features = encoded_units.mean(dim=0, keepdim=True)
+        encoded_units = self.unit_encoder(unit_coords.view(-1, 2)).view(2, 2, -1)  # [player, unit, 32]
+        my_unit_features = encoded_units[0].mean(dim=0, keepdim=True)   # [1, 32] — my units
+        opp_unit_features = encoded_units[1].mean(dim=0, keepdim=True)  # [1, 32] — opponent units
+        unit_features = torch.cat([my_unit_features, opp_unit_features], dim=-1)  # [1, 64]
 
         combined = torch.cat([board_features, global_feats, unit_features], dim=-1)
 
         # Policy head (action logits)
         logits = self.actor_head(combined)
-        value = self.critic_head(combined)
+        value = self.critic_head(combined.detach())
 
         action_mask = np.expand_dims(obs['valid_action_mask'].astype(bool), 0)
         masked_logits = logits.clone()

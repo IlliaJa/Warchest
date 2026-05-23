@@ -11,7 +11,7 @@ import time
 import wandb
 
 from policy import Policy
-from environment.warchest_env import WarChestEnv, NUM_PLAYERS, WIN_REWARD, CLAIM_BASE_REWARD, LOSS_REWARD
+from environment.warchest_env import WarChestEnv, NUM_PLAYERS, WIN_REWARD, CLAIM_BASE_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION
 
 SHAPING_C = 0.05  # potential-based shaping scale; see docs/rewards.md idea 3
 
@@ -67,10 +67,12 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
         p_info['scores_deque'] = deque(maxlen=print_every)
 
     returns_rms = RunningMeanStd()
+    advantages_rms = RunningMeanStd()
 
     for i_episode in range(1, n_training_episodes + 1):
         episode_start_time = time.time()
         invalid_action_count = 0
+        claims = {1: 0, 2: 0}
         for p_info in info.values():
             p_info['log_probs'] = []
             p_info['values'] = []
@@ -113,6 +115,9 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
                 state, reward, terminated, truncated, step_info = env.step(action)
                 t_env_step += time.time() - _t
                 info[pid]['rewards'].append(reward)
+
+                if step_info['action'].type == CLAIM_BASE_ACTION and step_info['action'].is_valid:
+                    claims[pid] += 1
 
                 if not step_info['action'].is_valid:
                     invalid_action_count += 1
@@ -191,34 +196,50 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
 
             returns = [adv + val for adv, val in zip(advantages, values[:-1])]
 
-            advantages = torch.tensor(advantages).to(device)
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            # Bug 3 check: if raw_adv_std ≈ 0, z-scoring collapses all advantages to 0
+            # and actor_loss is mathematically 0 regardless of the policy
+            raw_adv = torch.tensor(advantages)
+            raw_adv_std = raw_adv.std().item()
+            raw_adv_mean = raw_adv.mean().item()
+
+            advantages = torch.tensor(advantages)
+            advantages_rms.update(advantages.numpy())
+            advantages = advantages_rms.normalize(advantages).to(device)
             returns = torch.tensor(returns).to(device)
             returns_rms.update(returns.detach().cpu().numpy())
             returns = returns_rms.normalize(returns)
 
             log_probs = torch.stack(p_info['log_probs'])
-            values = torch.stack(p_info['values'])
+            values_stacked = torch.stack(p_info['values'])
             entropies = torch.stack(p_info['entropies'])
             entropy_bonus = entropies.mean()
             entropy_coeff = 0.005 if i_episode < (n_training_episodes * 0.75) else 0.001
 
             actor_loss = -torch.mean(log_probs * advantages.detach())
-            critic_loss = F.mse_loss(values.squeeze(), returns.detach())
+            critic_loss = F.mse_loss(values_stacked.squeeze(), returns.detach())
 
             p_info['loss'] = actor_loss + critic_loss - entropy_coeff * entropy_bonus
             p_info['entropy_bonus'] = entropy_bonus
 
+            # Bug 1 check: actor_loss in scientific notation reveals true magnitude vs critic_loss
+            # Bug 3 check: raw_adv_std ≈ 0 means advantages are collapsed before normalization
+            # Value stats: if value_std ≈ 0 the critic predicts constant values → useless advantages
             logger.debug(
                 f'ep={i_episode} pid={pid} '
-                f'adv_mean={advantages.mean().item():.3f} adv_std={advantages.std().item():.3f} '
-                f'actor_loss={actor_loss.item():.4f} critic_loss={critic_loss.item():.4f} '
+                f'raw_adv mean={raw_adv_mean:.4f} std={raw_adv_std:.4f} '
+                f'norm_adv mean={advantages.mean().item():.4f} sum={advantages.sum().item():.4f} '
+                f'val mean={values_stacked.mean().item():.4f} std={values_stacked.std().item():.4f} '
+                f'actor_loss={actor_loss.item():.3e} critic_loss={critic_loss.item():.4f} '
                 f'entropy={entropy_bonus.item():.4f}'
             )
+
+            values = values_stacked
 
         t_gae = time.time() - gae_start
 
         total_grad_norm = 0.0
+        actor_clip_norm = 0.0
+        critic_clip_norm = 0.0
         loss = None
         if (not player_1_is_random) and (not player_2_is_random):
             loss = (info[1]['loss'] / 2 + info[2]['loss'] / 2)
@@ -231,7 +252,26 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
         if loss is not None:
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=5.0)
+
+            def _grad_norm(params):
+                return sum(p.grad.data.norm(2).item() ** 2 for p in params if p.grad is not None) ** 0.5
+            actor_head_grad = _grad_norm(policy.actor_head.parameters())
+            critic_head_grad = _grad_norm(policy.critic_head.parameters())
+            board_enc_grad = _grad_norm(policy.board_encoder.parameters())
+
+            actor_side_params = (
+                list(policy.board_encoder.parameters())
+                + list(policy.unit_encoder.parameters())
+                + list(policy.actor_head.parameters())
+            )
+            actor_clip_norm = torch.nn.utils.clip_grad_norm_(actor_side_params, max_norm=1.0).item()
+            critic_clip_norm = torch.nn.utils.clip_grad_norm_(policy.critic_head.parameters(), max_norm=1.0).item()
+            logger.debug(
+                f'ep={i_episode} '
+                f'actor_side_preclip={actor_clip_norm:.4f} critic_side_preclip={critic_clip_norm:.4f} '
+                f'actor_head={actor_head_grad:.4f} critic_head={critic_head_grad:.4f} '
+                f'board_enc={board_enc_grad:.4f}'
+            )
 
             for param in policy.parameters():
                 if param.grad is not None:
@@ -244,7 +284,10 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
                 optimizer.step()
 
             if use_wandb:
-                wandb.log({'grad_norm': total_grad_norm})
+                wandb.log({
+                    'grad_norm_actor': actor_clip_norm,
+                    'grad_norm_critic': critic_clip_norm,
+                })
         t_backward = time.time() - backward_start
 
         episode_time = time.time() - episode_start_time
@@ -262,6 +305,7 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
             f'ent={info[1]["entropy_bonus"].item():.3f} '
             f'wr_self={wr_self:.3f} wr_rng={wr_rng:.3f} '
             f'grad={total_grad_norm:.3f} invalid={invalid_action_count} '
+            f'claims_p1={claims[1]} claims_p2={claims[2]} '
             f't={episode_time:.2f}s '
             f'[rollout={t_rollout:.2f}s inference={t_inference:.2f}s env={t_env_step:.2f}s gae={t_gae:.3f}s bwd={t_backward:.3f}s]'
         )
@@ -283,7 +327,6 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
                 'score_bot2': np.mean(info[2]['scores_deque']),
                 'avg_log_prob_bot1': torch.mean(torch.stack(info[1]['log_probs'])).item(),
                 'last_turn': turn_num,
-                'invalid_actions': invalid_action_count,
             })
 
     return [v['scores'] for v in info.values()]
