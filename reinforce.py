@@ -13,6 +13,8 @@ import wandb
 from policy import Policy
 from environment.warchest_env import WarChestEnv, NUM_PLAYERS, WIN_REWARD, CLAIM_BASE_REWARD, LOSS_REWARD
 
+SHAPING_C = 0.05  # potential-based shaping scale; see docs/rewards.md idea 3
+
 logger = logging.getLogger('warchest')
 
 
@@ -106,6 +108,7 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
                 info[pid]['values'].append(value)
                 info[pid]['entropies'].append(entropy)
 
+                phi_before = SHAPING_C * (len(env.board.get_controlled_bases(pid)) - len(env.board.get_controlled_bases(3 - pid)))
                 _t = time.time()
                 state, reward, terminated, truncated, step_info = env.step(action)
                 t_env_step += time.time() - _t
@@ -124,6 +127,9 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
                     info[pid]['log_probs'][-1] = torch.tensor(0.0).to(device)
                     info[pid]['values'][-1] = torch.tensor(0.0).to(device)
                     info[pid]['entropies'][-1] = torch.tensor(0.0).to(device)
+
+                phi_after = SHAPING_C * (len(env.board.get_controlled_bases(pid)) - len(env.board.get_controlled_bases(3 - pid)))
+                info[pid]['rewards'][-1] += gamma * phi_after - phi_before
 
                 if terminated:
                     winner = pid

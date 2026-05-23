@@ -67,19 +67,9 @@ Effect:
 | Player controls 6 bases | That player wins (`WIN_REWARD = +1.0`) |
 | Total actions reach 200 | Truncation; both players receive `LOSS_REWARD = −1.0` |
 
-## Reward table
+## Rewards
 
-| Event | Reward |
-|---|---|
-| Win | +1.0 |
-| Claim unclaimed base | +0.15 |
-| Truncation (draw) | −1.0 |
-| Invalid action attempt | −0.02 |
-| Move onto unclaimed base | +0.005 |
-| Move adjacent to unclaimed base | +0.001 |
-| Each action taken | −0.002 |
-
-Base approach rewards (`MOVE_ON_BASE_REWARD`, `MOVE_NEAR_BASE_REWARD`) fire on every qualifying move for the duration of the episode — the once-per-base flag was removed (fix #3).
+See [Reward Design](rewards.md) for the full reward table, implementation notes, and ideas for denser shaping.
 
 ## Turn order
 
