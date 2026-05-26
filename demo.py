@@ -23,7 +23,7 @@ def evaluate_agent(_env, n_eval_episodes, policy):
         turn_num = 0
         while True:
             # AI turn
-            action, log_prob, value, _ = policy.act(_state)
+            action, _, _ = policy.act(_state)
             _state, reward, terminated, truncated, info = env.step(action)
             ai_rewards_ep += reward
             if not info['action'].is_valid:
@@ -59,7 +59,7 @@ def play_ai_vs_ai(_env, policy):
     _state, _ = _env.reset()
     rewards = []
     while True:
-        action, log_prob, value, _ = policy.act(_state)
+        action, _, _ = policy.act(_state)
         _state, reward, terminated, truncated, info = env.step(action)
         rewards.append(reward)
         if not info['action'].is_valid:

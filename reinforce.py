@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import time
 import wandb
 
-from policy import Policy
+from policy import Policy, Critic
 from environment.warchest_env import WarChestEnv, NUM_PLAYERS, WIN_REWARD, CLAIM_BASE_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION
 
 SHAPING_C = 0.05  # potential-based shaping scale; see docs/rewards.md idea 3
@@ -59,7 +59,7 @@ def setup_run_logger(run_id: str) -> None:
     logger.addHandler(ch)
 
 
-def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, lam, print_every):
+def train_with_gae(env, policy, critic, optimizer, n_training_episodes, max_t, gamma, lam, print_every):
     info = {1: {}, 2: {}}
     bot1_wins_deque = deque(maxlen=100)
     wins_against_random_deque = deque(maxlen=100)
@@ -104,7 +104,9 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
                     entropy = torch.tensor(0.0).to(device)
                 else:
                     _t = time.time()
-                    action, log_prob, value, entropy = policy.act(state)
+                    action, log_prob, entropy = policy.act(state)
+                    with torch.no_grad():
+                        value = critic.value_single(state)
                     t_inference += time.time() - _t
 
                 info[pid]['log_probs'].append(log_prob)
@@ -257,7 +259,7 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
             def _grad_norm(params):
                 return sum(p.grad.data.norm(2).item() ** 2 for p in params if p.grad is not None) ** 0.5
             actor_head_grad = _grad_norm(policy.actor_head.parameters())
-            critic_head_grad = _grad_norm(policy.critic_head.parameters())
+            critic_head_grad = _grad_norm(critic.parameters())
             board_enc_grad = _grad_norm(policy.board_encoder.parameters())
 
             actor_side_params = (
@@ -266,7 +268,7 @@ def train_with_gae(env, policy, optimizer, n_training_episodes, max_t, gamma, la
                 + list(policy.actor_head.parameters())
             )
             actor_clip_norm = torch.nn.utils.clip_grad_norm_(actor_side_params, max_norm=1.0).item()
-            critic_clip_norm = torch.nn.utils.clip_grad_norm_(policy.critic_head.parameters(), max_norm=1.0).item()
+            critic_clip_norm = torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=1.0).item()
             logger.debug(
                 f'ep={i_episode} '
                 f'actor_side_preclip={actor_clip_norm:.4f} critic_side_preclip={critic_clip_norm:.4f} '
@@ -376,11 +378,14 @@ if __name__ == '__main__':
         action_dim=training_hyperparameters['action_space'],
         device=training_hyperparameters['device'],
         hidden_dim=training_hyperparameters['hidden_dim']).to(device)
+    warchest_critic = Critic(
+        device=device,
+        hidden_dim=training_hyperparameters['hidden_dim']).to(device)
     warchest_optimizer = optim.Adam([
         {'params': warchest_policy.board_encoder.parameters(), 'lr': training_hyperparameters['lr_actor']},
         {'params': warchest_policy.unit_encoder.parameters(), 'lr': training_hyperparameters['lr_actor']},
         {'params': warchest_policy.actor_head.parameters(), 'lr': training_hyperparameters['lr_actor']},
-        {'params': warchest_policy.critic_head.parameters(), 'lr': training_hyperparameters['lr_critic']},
+        {'params': warchest_critic.parameters(), 'lr': training_hyperparameters['lr_critic']},
     ])
 
     exception_for_raising = None
@@ -388,6 +393,7 @@ if __name__ == '__main__':
         scores = train_with_gae(
             environment,
             warchest_policy,
+            warchest_critic,
             warchest_optimizer,
             training_hyperparameters['n_training_episodes'],
             training_hyperparameters['max_t'],
