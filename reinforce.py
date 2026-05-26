@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 import numpy as np
 
 from collections import deque
@@ -403,7 +404,9 @@ if __name__ == '__main__':
         if exception_for_raising is not None:
             raise exception_for_raising
         else:
-            save_results = input('Save results? (y/n)')
+            sys.stdout.write('Save results? (y/n)')
+            sys.stdout.flush()
+            save_results = sys.stdin.buffer.readline().decode('utf-8', errors='replace').strip()
             if save_results == 'y':
                 timestamp = time.strftime('%Y%m%d-%H%M')
                 filename = f'warchest_policy_{timestamp}.pth'

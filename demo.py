@@ -85,7 +85,7 @@ if __name__ == '__main__':
         action_dim= env.action_space.n,
         device=device,
         hidden_dim=training_hyperparameters["hidden_dim"]).to(device)
-    warchest_policy.load_state_dict(torch.load('data/warchest_policy_20260522-2000.pth'))
+    warchest_policy.load_state_dict(torch.load('data/warchest_ppo_20260524-0000.pth'))
     warchest_policy.eval()
 
     # Evaluate the agent
