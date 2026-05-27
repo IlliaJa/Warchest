@@ -2,6 +2,8 @@ from collections import deque
 
 import numpy as np
 
+from .base import Bot
+
 OFFSETS = [(-1, -1), (-1, 0), (0, 1), (1, 1), (1, 0), (0, -1)]
 BOARD_SIZE = 7
 INVALID = -1
@@ -11,14 +13,14 @@ PLAYER2_BASE = 3
 CLAIM_START = 12  # move actions occupy IDs 0-11, claims start at 12
 
 
-class GreedyBot:
+class GreedyBot(Bot):
     """Claims immediately if possible; otherwise BFS-moves toward the nearest unclaimed or enemy base."""
 
     # --- temporary handicap: remove this block once the game grows more complex ---
     RANDOM_ACTION_PROB = 0.30
     # ------------------------------------------------------------------------------
 
-    def act(self, obs):
+    def act(self, obs: dict) -> tuple[int, None, None]:
         board = obs['board']
         units = obs['units']  # (2, max_units, 2): [player_slot, unit_slot, (row, col)]
         active = int(obs['active_player'])
