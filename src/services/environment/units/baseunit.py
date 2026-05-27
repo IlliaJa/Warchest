@@ -1,5 +1,6 @@
 from abc import ABC
 
+
 class BaseUnit(ABC):
     id = -1
     icon = '.'

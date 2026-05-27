@@ -1,3 +1,11 @@
+import sys as _sys
+from pathlib import Path as _Path
+
+# Ensure project root is on sys.path when the script is run directly
+_root = str(_Path(__file__).resolve().parent.parent.parent)
+if _root not in _sys.path:
+    _sys.path.insert(0, _root)
+
 import logging
 import os
 import sys
@@ -10,12 +18,12 @@ import torch.nn.functional as F
 import time
 import wandb
 
-from policy import Policy, Critic
-from environment.warchest_env import WarChestEnv, WIN_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION
-from opponent_pool import OpponentPool
-from rollout_buffer import RolloutBuffer
-from src.bots import GreedyBot, RandomBot
-from elo import EloTracker
+from src.services.policy.policy import Policy, Critic
+from src.services.environment.warchest_env import WarChestEnv, WIN_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION
+from src.services.opponent_pool import OpponentPool
+from src.utils.rollout_buffer import RolloutBuffer
+from src.services.bots import GreedyBot, RandomBot
+from src.utils.elo import EloTracker
 
 SHAPING_C = 0.05
 use_wandb = False
@@ -73,6 +81,11 @@ class PPOTrainer:
         self._eval_every = hp.get('eval_every', 10)
         self._eval_episodes = hp.get('eval_episodes', 20)
         self._wr_finetune_threshold = hp['wr_random_finetune_threshold']
+        self._opp_weights_initial = {
+            'p_random': hp['p_random_initial'],
+            'p_greedy': hp['p_greedy_initial'],
+            'p_pool': hp['p_pool_initial'],
+        }
         self._opp_weights_finetune = {
             'p_random': hp['p_random_finetune'],
             'p_greedy': hp['p_greedy_finetune'],
@@ -90,7 +103,6 @@ class PPOTrainer:
         self._buffer = RolloutBuffer()
         self._greedy_bot = GreedyBot()
         self._elo = EloTracker()
-        self._finetune_active = False
         self._score_deque = deque(maxlen=self._print_every * self._collect_episodes)
         self._wr_vs_random = deque(maxlen=100)
         self._wr_vs_pool = deque(maxlen=100)
@@ -355,10 +367,17 @@ class PPOTrainer:
         elo_pol = self._elo.rating('policy')
         elo_grdy = self._elo.rating('greedy')
         elo_rnd = self._elo.rating('random')
+        wr_random_eval = random_eval_wins / self._eval_episodes
+
+        if wr_random_eval >= self._wr_finetune_threshold:
+            self._pool.set_weights(**self._opp_weights_finetune)
+        else:
+            self._pool.set_weights(**self._opp_weights_initial)
+
         logger.info(
             f'[eval] batch={batch_num} '
             f'wr_greedy={greedy_wins / self._eval_episodes:.3f} '
-            f'wr_random={random_eval_wins / self._eval_episodes:.3f} '
+            f'wr_random={wr_random_eval:.3f} '
             f'elo_policy={elo_pol:.0f} elo_greedy={elo_grdy:.0f} elo_random={elo_rnd:.0f}'
         )
         if use_wandb:
@@ -367,7 +386,7 @@ class PPOTrainer:
                 'elo_greedy': elo_grdy,
                 'elo_random': elo_rnd,
                 'wr_vs_greedy': greedy_wins / self._eval_episodes,
-                'wr_vs_random_eval': random_eval_wins / self._eval_episodes,
+                'wr_vs_random_eval': wr_random_eval,
             })
 
     def _eval_episode(self, opp, main_pid) -> str:
@@ -406,18 +425,6 @@ class PPOTrainer:
         wr_rnd = float(np.mean(self._wr_vs_random)) if self._wr_vs_random else 0.0
         wr_pool = float(np.mean(self._wr_vs_pool)) if self._wr_vs_pool else 0.0
         wr_greedy = float(np.mean(self._wr_vs_greedy)) if self._wr_vs_greedy else 0.0
-
-        if (
-            not self._finetune_active
-            and len(self._wr_vs_random) >= 20
-            and wr_rnd >= self._wr_finetune_threshold
-        ):
-            self._pool.set_weights(**self._opp_weights_finetune)
-            self._finetune_active = True
-            logger.info(
-                f'batch={batch_num} wr_vs_random={wr_rnd:.3f} >= {self._wr_finetune_threshold} '
-                f'— switching to fine-tune opponent weights {self._opp_weights_finetune}'
-            )
 
         s = update_stats
         avg_turns = float(np.mean([ep['turns'] for ep in self._batch_eps]))

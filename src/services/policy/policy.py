@@ -3,7 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from environment.cell_ids import *
+from ..environment.cell_ids import *
+
 
 class Policy(nn.Module):
     def __init__(self, action_dim, device, hidden_dim=128):
@@ -18,9 +19,6 @@ class Policy(nn.Module):
             nn.Flatten(),
             nn.Linear(64 * 7 * 7, hidden_dim)
         )
-
-        # Global features encoder (fully connected layer)
-        # self.global_encoder = nn.Linear(4, hidden_dim)
 
         # Unit encoder (flattened units data)
         self.unit_encoder = nn.Sequential(

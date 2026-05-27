@@ -1,3 +1,11 @@
+import sys as _sys
+from pathlib import Path as _Path
+
+# Ensure project root is on sys.path when the script is run directly
+_root = str(_Path(__file__).resolve().parent.parent.parent)
+if _root not in _sys.path:
+    _sys.path.insert(0, _root)
+
 import logging
 import os
 import sys
@@ -11,8 +19,10 @@ import torch.nn.functional as F
 import time
 import wandb
 
-from policy import Policy, Critic
-from environment.warchest_env import WarChestEnv, NUM_PLAYERS, WIN_REWARD, CLAIM_BASE_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION
+from src.services.policy.policy import Policy, Critic
+from src.services.environment.warchest_env import (
+    WarChestEnv, NUM_PLAYERS, WIN_REWARD, CLAIM_BASE_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION
+)
 
 SHAPING_C = 0.05  # potential-based shaping scale; see docs/rewards.md idea 3
 
@@ -199,8 +209,6 @@ def train_with_gae(env, policy, critic, optimizer, n_training_episodes, max_t, g
 
             returns = [adv + val for adv, val in zip(advantages, values[:-1])]
 
-            # Bug 3 check: if raw_adv_std ≈ 0, z-scoring collapses all advantages to 0
-            # and actor_loss is mathematically 0 regardless of the policy
             raw_adv = torch.tensor(advantages)
             raw_adv_std = raw_adv.std().item()
             raw_adv_mean = raw_adv.mean().item()
@@ -224,9 +232,6 @@ def train_with_gae(env, policy, critic, optimizer, n_training_episodes, max_t, g
             p_info['loss'] = actor_loss + critic_loss - entropy_coeff * entropy_bonus
             p_info['entropy_bonus'] = entropy_bonus
 
-            # Bug 1 check: actor_loss in scientific notation reveals true magnitude vs critic_loss
-            # Bug 3 check: raw_adv_std ≈ 0 means advantages are collapsed before normalization
-            # Value stats: if value_std ≈ 0 the critic predicts constant values → useless advantages
             logger.debug(
                 f'ep={i_episode} pid={pid} '
                 f'raw_adv mean={raw_adv_mean:.4f} std={raw_adv_std:.4f} '

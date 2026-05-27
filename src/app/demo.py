@@ -1,13 +1,22 @@
+import sys as _sys
+from pathlib import Path as _Path
+
+# Ensure project root is on sys.path when the script is run directly
+_root = str(_Path(__file__).resolve().parent.parent.parent)
+if _root not in _sys.path:
+    _sys.path.insert(0, _root)
+
 import numpy as np
 
 import torch
-from policy import Policy
-from environment.warchest_env import WarChestEnv
+from src.services.policy.policy import Policy
+from src.services.environment.warchest_env import WarChestEnv
+
 
 def evaluate_agent(_env, n_eval_episodes, policy):
     """
     Evaluate the agent for ``n_eval_episodes`` episodes and returns average reward and std of reward.
-    :param env: The evaluation environment
+    :param _env: The evaluation environment
     :param n_eval_episodes: Number of episode to evaluate the agent
     :param policy: The Reinforce agent
     """
@@ -24,7 +33,7 @@ def evaluate_agent(_env, n_eval_episodes, policy):
         while True:
             # AI turn
             action, _, _ = policy.act(_state)
-            _state, reward, terminated, truncated, info = env.step(action)
+            _state, reward, terminated, truncated, info = _env.step(action)
             ai_rewards_ep += reward
             if not info['action'].is_valid:
                 raise ValueError('Invalid action taken by the agent')
@@ -36,9 +45,9 @@ def evaluate_agent(_env, n_eval_episodes, policy):
                 break
 
             # Random bot turn
-            possible_actions = env.get_possible_actions()
+            possible_actions = _env.get_possible_actions()
             action_id = np.random.choice(possible_actions)
-            _state, reward, terminated, truncated, info = env.step(action_id)
+            _state, reward, terminated, truncated, info = _env.step(action_id)
             random_bot_rewards_ep += reward
             if terminated:
                 random_bot_win_cnt += 1
@@ -55,12 +64,13 @@ def evaluate_agent(_env, n_eval_episodes, policy):
 
     return ai_win_cnt, draw_cnt, random_bot_win_cnt, mean_reward, std_reward
 
+
 def play_ai_vs_ai(_env, policy):
     _state, _ = _env.reset()
     rewards = []
     while True:
         action, _, _ = policy.act(_state)
-        _state, reward, terminated, truncated, info = env.step(action)
+        _state, reward, terminated, truncated, info = _env.step(action)
         rewards.append(reward)
         if not info['action'].is_valid:
             raise ValueError('Invalid action taken by the agent')
@@ -69,6 +79,7 @@ def play_ai_vs_ai(_env, policy):
             print('AI vs AI game is finished')
             break
     return _env, rewards
+
 
 if __name__ == '__main__':
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -82,10 +93,10 @@ if __name__ == '__main__':
     }
 
     warchest_policy = Policy(
-        action_dim= env.action_space.n,
+        action_dim=env.action_space.n,
         device=device,
         hidden_dim=training_hyperparameters["hidden_dim"]).to(device)
-    warchest_policy.load_state_dict(torch.load('data/warchest_ppo_20260527-1028.pth'))
+    warchest_policy.load_state_dict(torch.load('data/warchest_ppo_20260527-1702.pth'))
     warchest_policy.eval()
 
     # Evaluate the agent

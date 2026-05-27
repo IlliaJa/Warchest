@@ -17,26 +17,44 @@ Turn-based hex-grid strategy game with a reinforcement learning agent (REINFORCE
 ## Quick orientation
 
 ```
-environment/    game engine (Gymnasium env, board, units, renderer)
-policy.py       actor-critic neural network
-reinforce.py    training entry point
-test.py         evaluation + interactive replay
-demo.py / main.py  minimal smoke tests
-Dockerfile      cloud training container
-launch-agent.yaml  W&B Agents queue config
+src/
+  services/
+    environment/    game engine (Gymnasium env, board, units, renderer)
+    policy/         actor-critic neural network (Policy + Critic)
+    bots/           Bot ABC, RandomBot, GreedyBot
+    opponent_pool.py  weighted opponent sampler (random / greedy / pool snapshots)
+  app/
+    ppo.py          PPO training entry point (PPOTrainer class)
+    reinforce.py    legacy REINFORCE+GAE trainer
+    demo.py         evaluation vs random + interactive replay
+    main.py         minimal random-action smoke test
+    policy_viz.py   export policy graph to TensorBoard
+    test.py         entropy distribution visualiser
+  utils/
+    elo.py          Elo rating tracker
+    rollout_buffer.py  GAE rollout buffer for PPO
+  config/           reserved for future config files
+Dockerfile          cloud training container
+launch-agent.yaml   W&B Agents queue config
 ```
 
 ## Running the project
 
-```bash
-# Train
-python reinforce.py
+Scripts add the project root to `sys.path` automatically, so run them from
+the project root with either of these forms:
 
-# Evaluate against random opponents + replay
-python test.py
+```bash
+# Train with PPO (recommended)
+python src/app/ppo.py
+
+# Legacy REINFORCE trainer
+python src/app/reinforce.py
+
+# Evaluate a saved model + interactive replay
+python src/app/demo.py
 
 # Quick random-action smoke test
-python demo.py
+python src/app/main.py
 ```
 
 ## Stack

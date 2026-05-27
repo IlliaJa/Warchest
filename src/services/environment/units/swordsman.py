@@ -1,4 +1,5 @@
-from environment.units.baseunit import BaseUnit
+from .baseunit import BaseUnit
+
 
 class Swordsman(BaseUnit):
     id = 1

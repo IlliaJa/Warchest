@@ -1,8 +1,17 @@
+import sys as _sys
+from pathlib import Path as _Path
+
+# Ensure project root is on sys.path when the script is run directly
+_root = str(_Path(__file__).resolve().parent.parent.parent)
+if _root not in _sys.path:
+    _sys.path.insert(0, _root)
+
 import torch
-from policy import Policy
-from environment.warchest_env import WarChestEnv
+from src.services.policy.policy import Policy
+from src.services.environment.warchest_env import WarChestEnv
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
+
 
 def trace_model(model, obs):
     # This function will wrap the original forward pass to fit TensorBoard
@@ -16,6 +25,7 @@ def trace_model(model, obs):
             return self.model(self.obs)
 
     return WrappedModel(model, obs)
+
 
 if __name__ == '__main__':
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -47,4 +57,4 @@ if __name__ == '__main__':
     writer.add_graph(wrapped, dummy_input)
     writer.close()
 
-    # RIUN tensorboard --logdir=runs
+    # RUN tensorboard --logdir=runs

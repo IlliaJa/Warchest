@@ -2,7 +2,7 @@ import copy
 import numpy as np
 from collections import deque
 
-from src.bots import GreedyBot, RandomBot
+from .bots import GreedyBot, RandomBot
 
 
 class OpponentPool:

@@ -3,13 +3,13 @@ import gymnasium as gym
 from gymnasium import spaces
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from environment.units import *
-from environment.board import Board
-from environment.cell_ids import *
-from environment.game_renderer import GameRenderer
+from .units import *
+from .board import Board
+from .cell_ids import *
+from .game_renderer import GameRenderer
 from typing import Tuple, Dict
-from environment.action import Action
-from environment.game_state import GameState
+from .action import Action
+from .game_state import GameState
 from copy import deepcopy
 
 
@@ -32,19 +32,18 @@ MOVE_ON_BASE_REWARD = 0.005
 MOVE_NEAR_BASE_REWARD = 0.001
 MOVE_NEG_REWARD_PER_TURN = -0.002
 INVALID_ACTION_REWARD = -0.02
-CLAIM_BASE_REWARD = 0.15
+CLAIM_BASE_REWARD = 0.0  # direct claim reward removed; potential shaping handles base value
 WIN_REWARD = 1.0
 LOSS_REWARD = -1.0
 
 NUM_PLAYERS = 2
-MAX_UNITS_PER_PLAYER = 2 # will be 4 when game will be more developed
+MAX_UNITS_PER_PLAYER = 2  # will be 4 when game will be more developed
 
 
 class WarChestEnv(gym.Env):
     max_actions = 200
     winning_base_count = 6
     max_rewardable_moving_action = 30
-
 
     def __init__(self, save_game_history: bool = False, debug_mode: bool = False):
         super().__init__()
@@ -83,9 +82,7 @@ class WarChestEnv(gym.Env):
             self.history = [deepcopy(state)]
 
     def set_state(self, state: GameState):
-        """
-        Set the state of the environment to a specific state in the history.
-        """
+        """Set the state of the environment to a specific state in the history."""
         self.state = state
 
     @property
@@ -105,11 +102,8 @@ class WarChestEnv(gym.Env):
         return self.state.active_player
 
     def swap_active_player(self):
-        """
-        Swap the active player between 1 and 2.
-        """
+        """Swap the active player between 1 and 2."""
         self.state.active_player = 1 if self.state.active_player == 2 else 2
-
 
     def step(self, action_id):
         """
@@ -131,22 +125,18 @@ class WarChestEnv(gym.Env):
         """
         action_type, action_info = self.get_action_info(action_id)
 
-        # reward, terminated, info = self.action_dict[action_type]['act_function'](*action_info)
         action = self.action_dict[action_type]['act_function'](*action_info)
         action.id = action_id
         action.player_id = self.active_player
         action.type = action_type
         action.additional_info = action_info
 
-        # TODO I should directly pass invalid action. Because I can have negative reward for positive action, for example loosing a unit
         if action.is_valid:
             self.action_count += 1
             self.swap_active_player()
             if self.history is not None:
                 self.history.append(deepcopy(self.state))
         truncated = self.action_count >= self.max_actions
-        # if action_type == CLAIM_BASE_ACTION and reward > 0:
-        #     print("Successful claim base action")
         if self.debug_mode:
             print(f"Got action_id {action.id} with type {action.type} and info {action.additional_info}")
         terminated = action.finishes_game
@@ -171,7 +161,7 @@ class WarChestEnv(gym.Env):
         for r in range(board.shape[0]):
             for q in range(board.shape[1]):
                 if board[r, q] != INVALID_CELL_ID:
-                    x, y = self.convert_hex_grid_to_cartesian(r ,q, hex_radius=hex_radius)
+                    x, y = self.convert_hex_grid_to_cartesian(r, q, hex_radius=hex_radius)
                     hexagon = patches.RegularPolygon((x, y), numVertices=6, radius=hex_radius, orientation=np.pi/2,
                                                      edgecolor='black', facecolor=BASE_COLORS[int(board[r, q])])
                     ax.add_patch(hexagon)
@@ -214,9 +204,9 @@ class WarChestEnv(gym.Env):
         return board
 
     def get_observation_space(self):
-        board_channels = 5 # all types of cell ids
-        unit_features = 2 # row, column
-        global_features = 3 # turn count, my bases, opponent bases
+        board_channels = 5  # all types of cell ids
+        unit_features = 2  # row, column
+        global_features = 3  # turn count, my bases, opponent bases
 
         return gym.spaces.Dict({
             "board": gym.spaces.Box(low=-1, high=3, shape=(board_channels, self.board.board_size, self.board.board_size), dtype=np.int32),
@@ -224,7 +214,6 @@ class WarChestEnv(gym.Env):
             "global": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(global_features,), dtype=np.float32),
             "active_player": gym.spaces.Discrete(2),
         })
-
 
     def generate_observation(self):
         unit_features = 2
@@ -296,7 +285,6 @@ class WarChestEnv(gym.Env):
                 return action_type, info['decrypt_func'](offset_id)
 
     def perform_move_action(self, start, end) -> Action:
-        # TODO maybe this logic should be in Unit's class, because unit will have tactics and other stuff in the Future
         try:
             moving_unit = [u for u in self.get_active_player_units() if u.loc == start][0]
         except IndexError:
@@ -316,9 +304,6 @@ class WarChestEnv(gym.Env):
         moving_unit.move(loc=end)
 
         neg_reward = MOVE_NEG_REWARD_PER_TURN
-        # explore_multiplier = (MOVE_EXPLORE_REWARD_MAX_TURN - self.exploration_map_dict[self.active_player][end])
-        # explore_reward = max(0, MOVE_EXPLORE_REWARD_PER_TURN * explore_multiplier)
-        # reward = neg_reward + explore_reward
         self.exploration_map_dict[self.active_player][end] += 1
 
         base_approach_reward = 0

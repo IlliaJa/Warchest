@@ -1,6 +1,6 @@
 import numpy as np
-from environment.cell_ids import *
-from environment.units.baseunit import BaseUnit
+from .cell_ids import *
+from .units.baseunit import BaseUnit
 from typing import List
 
 

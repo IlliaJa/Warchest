@@ -1,12 +1,10 @@
 from dataclasses import dataclass
-from environment.board import Board
+from .board import Board
 
 
 @dataclass
 class GameState:
-    """
-    Class representing the state of the game.
-    """
+    """Class representing the state of the game."""
     board: Board
     active_player: int
     action_count: int = 0
