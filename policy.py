@@ -68,7 +68,7 @@ class Policy(nn.Module):
         probs = self.forward(obs)
         dist = Categorical(probs)
         action = dist.sample()
-        return action.item(), dist.log_prob(action), dist.entropy()
+        return action.item(), dist.log_prob(action).squeeze(0), dist.entropy().squeeze(0)
 
     def evaluate_actions(self, obs, action):
         probs = self.forward(obs)
