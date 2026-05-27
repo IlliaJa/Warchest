@@ -1,11 +1,3 @@
-import sys as _sys
-from pathlib import Path as _Path
-
-# Ensure project root is on sys.path when the script is run directly
-_root = str(_Path(__file__).resolve().parent.parent.parent)
-if _root not in _sys.path:
-    _sys.path.insert(0, _root)
-
 import torch
 from src.services.policy.policy import Policy
 from src.services.environment.warchest_env import WarChestEnv
