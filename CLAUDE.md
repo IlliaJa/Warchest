@@ -12,6 +12,7 @@ Turn-based hex-grid strategy game with a reinforcement learning agent (REINFORCE
 - [Environment API](docs/environment_api.md) — Gymnasium interface, observation/action spaces, Board API
 - [Improvement ideas](docs/improvement_ideas.md) — issues found from log analysis, prioritised fixes
 - [RL algorithms](docs/rl_algorithms.md) — GAE, PPO, DQN, and alternatives with Warchest-specific trade-offs
+- [Metrics reference](docs/METRICS.md) — W&B metrics explained: ideal ranges, trends, warning signs
 
 ## Quick orientation
 

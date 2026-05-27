@@ -18,6 +18,7 @@ from greedy_bot import GreedyBot
 from elo import EloTracker
 
 SHAPING_C = 0.05
+GREEDY_TRAIN_PROB = 0.20  # fraction of training episodes played against the greedy bot
 use_wandb = False
 
 logger = logging.getLogger('warchest')
@@ -183,6 +184,7 @@ def train_ppo(
     score_deque = deque(maxlen=print_every * collect_episodes)
     wr_vs_random = deque(maxlen=100)
     wr_vs_pool = deque(maxlen=100)
+    wr_vs_greedy = deque(maxlen=100)
 
     for batch_num in range(1, n_batches + 1):
         batch_start = time.time()
@@ -193,7 +195,10 @@ def train_ppo(
         critic.train()
         for _ in range(collect_episodes):
             main_pid = np.random.choice([1, 2])
-            opp_policy, opp_type = pool.sample(policy_constructor, device)
+            if np.random.random() < GREEDY_TRAIN_PROB:
+                opp_policy, opp_type = greedy_bot, 'greedy'
+            else:
+                opp_policy, opp_type = pool.sample(policy_constructor, device)
             ep = collect_episode(env, policy, critic, opp_policy, main_pid, max_t, gamma, device, buffer)
             ep['opp_type'] = opp_type
             batch_eps.append(ep)
@@ -208,9 +213,9 @@ def train_ppo(
         critic_accum = 0.0
         entropy_accum = 0.0
         clip_frac_accum = 0.0
-        val_mae_accum = 0.0
-        val_mean_accum = 0.0
-        val_std_accum = 0.0
+        critic_mae_accum = 0.0
+        critic_mean_accum = 0.0
+        critic_std_accum = 0.0
 
         actor_side_params = (
             list(policy.board_encoder.parameters())
@@ -269,22 +274,22 @@ def train_ppo(
                 entropy_accum += ent.detach().mean().item()
                 clip_frac_accum += ((ratio - 1.0).abs() > ppo_eps).float().mean().item()
                 val_det = val.detach()
-                val_mae_accum += (val_det - ret).abs().mean().item()
-                val_mean_accum += val_det.mean().item()
-                val_std_accum += val_det.std().item()
+                critic_mae_accum += (val_det - ret).abs().mean().item()
+                critic_mean_accum += val_det.mean().item()
+                critic_std_accum += val_det.std().item()
                 n_updates += 1
 
         denom = max(n_updates, 1)
         avg_clip_frac = clip_frac_accum / denom
-        avg_val_mae = val_mae_accum / denom
-        avg_val_mean = val_mean_accum / denom
-        avg_val_std = val_std_accum / denom
+        avg_critic_mae = critic_mae_accum / denom
+        avg_critic_mean = critic_mean_accum / denom
+        avg_critic_std = critic_std_accum / denom
         logger.debug(
             f'batch={batch_num} n_updates={n_updates} '
             f'adv mean={buffer.raw_adv_mean:.4f} std={buffer.raw_adv_std:.4f} '
             f'ret mean={buffer.raw_ret_mean:.4f} std={buffer.raw_ret_std:.4f} '
-            f'val mean={avg_val_mean:.4f} std={avg_val_std:.4f} '
-            f'clip_frac={avg_clip_frac:.3f} val_mae={avg_val_mae:.4f}'
+            f'critic mean={avg_critic_mean:.4f} std={avg_critic_std:.4f} '
+            f'clip_frac={avg_clip_frac:.3f} critic_mae={avg_critic_mae:.4f}'
         )
 
         pool.maybe_snapshot(policy)
@@ -339,11 +344,14 @@ def train_ppo(
             score_deque.append(ep['main_score'])
             if ep['opp_type'] == 'random':
                 wr_vs_random.append(int(ep['outcome'] == 'win'))
+            elif ep['opp_type'] == 'greedy':
+                wr_vs_greedy.append(int(ep['outcome'] == 'win'))
             else:
                 wr_vs_pool.append(int(ep['outcome'] == 'win'))
 
         wr_rnd = float(np.mean(wr_vs_random)) if wr_vs_random else 0.0
         wr_pool_val = float(np.mean(wr_vs_pool)) if wr_vs_pool else 0.0
+        wr_greedy_val = float(np.mean(wr_vs_greedy)) if wr_vs_greedy else 0.0
         avg_kl = kl_accum / denom
         avg_actor = actor_accum / denom
         avg_critic = critic_accum / denom
@@ -357,7 +365,7 @@ def train_ppo(
         logger.info(
             f'batch={batch_num}/{n_batches} [{outcomes_str}] '
             f'score={np.mean(score_deque):.2f} '
-            f'wr_rnd={wr_rnd:.3f} wr_pool={wr_pool_val:.3f} '
+            f'wr_rnd={wr_rnd:.3f} wr_pool={wr_pool_val:.3f} wr_greedy={wr_greedy_val:.3f} '
             f'actor={avg_actor:.3e} critic={avg_critic:.4f} kl={avg_kl:.4f} ent={avg_entropy:.3f} '
             f'grad_a={last_actor_grad:.3f} grad_c={last_critic_grad:.3f} pool={len(pool)} '
             f'turns={avg_turns:.0f} invalid={total_invalid} '
@@ -369,6 +377,7 @@ def train_ppo(
                 'score_main': float(np.mean(score_deque)),
                 'winrate_vs_random': wr_rnd,
                 'winrate_vs_pool': wr_pool_val,
+                'winrate_vs_greedy_train': wr_greedy_val,
                 'actor_loss': avg_actor,
                 'critic_loss': avg_critic,
                 'ppo_kl': avg_kl,
@@ -376,9 +385,9 @@ def train_ppo(
                 'grad_norm_actor': last_actor_grad,
                 'grad_norm_critic': last_critic_grad,
                 'clip_frac': avg_clip_frac,
-                'val_mae': avg_val_mae,
-                'val_mean': avg_val_mean,
-                'val_std': avg_val_std,
+                'critic_mae': avg_critic_mae,
+                'critic_mean': avg_critic_mean,
+                'critic_std': avg_critic_std,
                 'adv_std': buffer.raw_adv_std,
                 'ret_mean': buffer.raw_ret_mean,
                 'ret_std': buffer.raw_ret_std,
@@ -400,7 +409,7 @@ if __name__ == '__main__':
     environment = WarChestEnv(save_game_history=False, debug_mode=False)
 
     hp = {
-        'n_batches': 100,
+        'n_batches': 300,
         'collect_episodes': 16,
         'max_t': 1000,
         'gamma': 0.99,
@@ -408,8 +417,8 @@ if __name__ == '__main__':
         'ppo_epochs': 1,
         'ppo_eps': 0.2,
         'minibatch_size': 64,
-        'lr_actor': 1e-4,
-        'lr_critic': 1e-4,
+        'lr_actor': 3e-4,
+        'lr_critic': 3e-4,
         'action_space': environment.action_space.n,
         'hidden_dim': 64,
         'print_every': 10,
