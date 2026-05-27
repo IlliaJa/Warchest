@@ -1,48 +1,51 @@
 # Policy Network
 
-`policy.py` implements an actor-critic network that takes the environment observation and outputs action probabilities and a state value.
+`src/services/policy/policy.py` implements two separate networks: `Policy` (actor) and `Critic` (value function). They share the same input encoding structure but have independent weights, allowing the critic to learn value-specific representations without conflicting with the actor's policy gradient.
 
 ## Input encoding
 
 ### Board encoder (CNN)
 
-The board observation `[7,7]` is first expanded into 6 binary channels by `encode_board()`:
+The raw board `[7,7]` is first expanded into 6 channels by `encode_board()`:
 
 | Channel | Content |
 |---|---|
 | 0 | Invalid cells |
 | 1 | Empty cells |
 | 2 | Uncontrolled bases |
-| 3 | Player 1 bases |
-| 4 | Player 2 bases |
-| 5 | Exploration map (normalised visit counts) |
+| 3 | Active player's own bases |
+| 4 | Opponent's bases |
+| 5 | Exploration map (normalised visit counts, from active player's perspective) |
 
-Two conv layers process the `[6,7,7]` input:
+Channels 3 and 4 are always ego-centric (own vs opponent) regardless of which player is active. Two conv layers process the `[6,7,7]` input:
+
 ```
 Conv2d(6→32, kernel=3, padding=1) + ReLU
 Conv2d(32→64, kernel=3, padding=1) + ReLU
-Flatten → Linear(64*7*7 → hidden_dim) + ReLU
+Flatten → Linear(64*7*7 → hidden_dim)
 ```
 
 ### Unit encoder (MLP)
 
-Unit positions `[2,2]` (flattened to 4 values):
+Unit positions are shaped `[2, 2, 2]` (2 player slots × 2 units × (row, col)). Each unit's 2D position is encoded independently:
+
 ```
-Linear(4 → 16) + ReLU
+Linear(2 → 16) + ReLU
 Linear(16 → 32)
 ```
 
+The two units per player slot are averaged, then the two player slots are concatenated, giving a 64-dimensional unit feature vector.
+
 ### Global features
 
-`global[4]` is passed directly:
-- `active_player − 1` (0 or 1)
-- Normalised turn count
-- Player 1 base count
-- Player 2 base count
+`global[3]` is passed directly:
+- `turn // 2` (half-turn counter)
+- Active player's base count
+- Opponent's base count
 
 ## Feature fusion and heads
 
-All encoded features are concatenated: `[hidden_dim + 32 + 4]`.
+All encoded features are concatenated: `[hidden_dim + 3 + 64]`.
 
 **Actor head** — outputs action logits:
 ```
@@ -52,27 +55,37 @@ Linear(hidden_dim → action_space)
 ```
 Invalid actions are masked with −1e9 before softmax.
 
-**Critic head** — outputs scalar state value:
+**Critic (separate network)** — same board and unit encoders, then:
 ```
-Linear(fused → 1)
+Linear(hidden_dim + 3 + 64 → hidden_dim) + ReLU
+Linear(hidden_dim → 1)
 ```
 
 ## Key methods
 
+### Policy
+
 | Method | Returns | Notes |
 |---|---|---|
-| `forward(obs)` | `(probs, value)` | Full forward pass |
-| `act(obs)` | `(action, log_prob, value, entropy)` | Sample from policy |
-| `evaluate_actions(obs, action)` | `(log_prob, entropy, value)` | Used during loss computation |
-| `encode_board(board, exploration_map)` | `[6,7,7]` tensor | Static board encoding |
+| `act(obs)` | `(action, log_prob, entropy)` | Sample from policy; used during rollout |
+| `evaluate_actions_batch(batch)` | `(log_probs, entropies)` | Batched re-evaluation; used in PPO update |
+| `encode_board(board, exploration_map, active_player)` | `[6,7,7]` array | Static encoding, single observation |
+| `encode_board_batch(boards, maps, players)` | `[N,6,7,7]` array | Vectorised encoding for a full batch |
 
-## Hyperparameters (defaults in reinforce.py)
+### Critic
+
+| Method | Returns | Notes |
+|---|---|---|
+| `value_single(obs)` | scalar tensor | Used during rollout collection |
+| `value_batch(batch)` | `[N]` tensor | Used during PPO update |
+
+## Hyperparameters (defaults in `src/app/ppo.py`)
 
 | Parameter | Default |
 |---|---|
 | `hidden_dim` | 64 |
 | `action_space` | 14 |
-| Learning rate | 5e-3 (Adam) |
-| Entropy coeff (early) | 0.1 |
-| Entropy coeff (late, after 75% episodes) | 0.01 |
-| Gradient clip max_norm | 1.0 |
+| Actor LR | 3e-4 (Adam) |
+| Critic LR | 3e-4 (Adam) |
+| `ENTROPY_COEFF` | 0.001 |
+| Gradient clip max_norm | 1.0 (applied separately to actor-side and critic parameters) |

@@ -4,84 +4,156 @@
 
 ```bash
 pip install -r requirements.txt
-python reinforce.py
+python -m src.app.ppo
 ```
 
 A W&B run is created automatically. The trained model is saved to:
 ```
-data/warchest_policy_YYYYMMDD-HH:MM.pth
+data/warchest_ppo_YYYYMMDD-HH:MM.pth
 ```
 
-## Algorithm: REINFORCE + GAE
+The legacy REINFORCE trainer is kept at `src/app/reinforce.py` for reference but is no longer the primary training path.
 
-The training loop in `reinforce.py` uses the REINFORCE policy gradient algorithm augmented with Generalized Advantage Estimation (GAE).
+---
+
+## Algorithm: PPO with GAE
+
+The trainer (`PPOTrainer` in `src/app/ppo.py`) uses Proximal Policy Optimization with Generalized Advantage Estimation.
 
 ### Advantage computation
 
-After each episode the trajectory is processed backwards:
+After each batch of episodes the trajectories are processed backwards within each episode boundary:
 
 ```
-delta_t   = r_t + gamma * V(s_{t+1}) - V(s_t)      (TD residual)
-A_t       = delta_t + gamma * lambda * A_{t+1}       (GAE)
-return_t  = A_t + V(s_t)                             (target for critic)
+delta_t  = r_t + gamma * V(s_{t+1}) - V(s_t)     (TD residual)
+A_t      = delta_t + gamma * lambda * A_{t+1}      (GAE)
+return_t = A_t + V(s_t)                            (target for critic)
 ```
 
-### Loss
+Advantages are z-scored batch-wide before the PPO update. Returns are kept in the original reward scale so the critic can be calibrated correctly.
+
+### PPO loss
 
 ```
-actor_loss  = -mean(log_pi(a|s) * A)
-critic_loss = MSE(V(s), return)
-entropy     = -sum(pi * log(pi))
-total_loss  = actor_loss + critic_loss - entropy_coeff * entropy
+ratio    = pi_new(a|s) / pi_old(a|s)
+L_actor  = -mean( min(ratio * A,  clip(ratio, 1-eps, 1+eps) * A) )
+L_critic = MSE(V(s), return)
+L_total  = L_actor + L_critic - entropy_coeff * H
 ```
+
+An epoch is stopped early when the per-minibatch approximate KL exceeds `KL_TARGET = 0.015`.
+
+### Reward shaping
+
+Raw environment rewards are augmented with potential-based shaping before being stored:
+
+```python
+shaped_r = r + gamma * phi(s_next) - phi(s)
+phi(s)   = SHAPING_C * (my_bases - opp_bases)   # SHAPING_C = 0.05
+```
+
+This fires a positive pulse on gaining a base and a negative pulse on losing one without distorting the optimal policy.
+
+---
 
 ## Opponent sampling
 
-Each episode, each player is independently assigned as:
-- **Policy-controlled** (gradient tracked)
-- **Random** (no gradient, uniform over valid actions)
+`OpponentPool` (`src/services/opponent_pool.py`) provides three opponent types with configurable weights:
 
-This gives four combinations:
-- Both random → no update
-- One policy, one random → single-player loss update
-- Both policy → averaged loss from both players
+| Type | Description |
+|---|---|
+| `random` | Uniform over valid actions |
+| `greedy` | BFS toward nearest unclaimed or enemy base (30% random handicap) |
+| `pool` | Frozen snapshot of the policy from a past batch (rolling window of 20) |
 
-The 30 % random probability is hard-coded and encourages robustness.
+### Finetune phase
+
+After each eval block, pool weights are set automatically:
+
+- If eval WR vs random ≥ `wr_random_finetune_threshold` (0.90) → switch to finetune weights (random removed from training)
+- Otherwise → restore initial weights
+
+This raises the training bar automatically as the policy matures, without any one-way flag.
+
+| Phase | `p_random` | `p_greedy` | `p_pool` |
+|---|---|---|---|
+| Initial | 0.40 | 0.20 | 0.40 |
+| Finetune | 0.00 | 0.40 | 0.60 |
+
+---
 
 ## Hyperparameters
 
 | Parameter | Value | Effect |
 |---|---|---|
-| `n_training_episodes` | 3000 | Total training games |
+| `n_batches` | 300 | Total batch updates |
+| `collect_episodes` | 16 | Episodes collected per batch before update |
 | `max_t` | 1000 | Hard cap on steps per episode |
-| `max_actions` (env) | 500 | Env truncation limit |
-| `gamma` | 0.9 | Discount factor |
-| `lambda` | 0.95 | GAE trace decay |
-| `lr` | 5e-3 | Adam learning rate |
+| `ppo_epochs` | 1 | Inner gradient epochs per batch (KL early stop active) |
+| `ppo_eps` | 0.2 | PPO clip parameter |
+| `KL_TARGET` | 0.015 | Approx-KL threshold for early stopping an epoch |
+| `gamma` | 0.99 | Discount factor |
+| `lam` | 0.95 | GAE trace decay |
+| `lr_actor` | 3e-4 | Adam LR for encoder + actor head |
+| `lr_critic` | 3e-4 | Adam LR for critic |
 | `hidden_dim` | 64 | Network width |
-| Entropy coeff | 0.1 → 0.01 | Scheduled at 75 % of training |
+| `ENTROPY_COEFF` | 0.001 | Entropy bonus coefficient |
+| `SHAPING_C` | 0.05 | Potential-shaping scale factor |
+| Pool `max_size` | 20 | Rolling snapshot window length |
+| `eval_every` | 10 | Evaluate every N batches |
+| `eval_episodes` | 20 | Episodes per evaluation block |
+| `wr_random_finetune_threshold` | 0.90 | WR vs random that triggers finetune phase |
+
+---
 
 ## W&B metrics logged
 
+### Per batch (logged by `_log_batch`)
+
 | Metric | Description |
 |---|---|
-| `loss_bot1` | Total loss for policy player |
-| `score_bot1/2` | Cumulative episode reward per player |
-| `winrate_bot1` | Win rate in self-play episodes |
-| `winrate_against_random` | Win rate vs random opponent |
-| `entropy_bonus` | Mean policy entropy |
-| `avg_log_prob_bot1` | Mean log-probability of chosen actions |
-| `grad_norm` | Total gradient norm before clipping |
-| `episode_time` | Wall-clock seconds per episode |
-| `last_turn` | Number of turns until termination |
+| `score_main` | Rolling mean episode reward (main actor) |
+| `wr_vs_pool_train` | Win rate vs pool opponents (rolling 100 training episodes) |
+| `wr_vs_greedy_train` | Win rate vs greedy opponent (rolling 100 training episodes) |
+| `actor_loss` | Mean PPO actor loss averaged over minibatch updates |
+| `critic_loss` | Mean critic MSE loss averaged over minibatch updates |
+| `approx_kl` | Approximate KL divergence from old to new policy |
+| `entropy` | Mean policy entropy |
+| `grad_norm_actor` | Post-clip gradient norm, actor-side parameters |
+| `grad_norm_critic` | Post-clip gradient norm, critic parameters |
+| `clip_frac` | Fraction of timesteps where PPO ratio was clipped |
+| `critic_mae` | Mean absolute error of critic predictions vs actual returns |
+| `critic_mean` | Mean predicted state value across the batch |
+| `critic_std` | Std of predicted state values across the batch |
+| `advantage_std` | Std of raw (pre-normalised) advantages |
+| `return_mean` | Mean of raw GAE returns |
+| `return_std` | Std of raw GAE returns |
+| `avg_turns` | Mean episode length in the batch |
+
+### Per eval block (logged by `_maybe_eval`, every `eval_every` batches)
+
+| Metric | Description |
+|---|---|
+| `wr_vs_random_eval` | Win rate vs RandomBot over `eval_episodes` games |
+| `wr_vs_greedy_eval` | Win rate vs GreedyBot over `eval_episodes` games |
+| `elo_policy` | Elo rating of the current policy |
+| `elo_greedy` | Elo rating of GreedyBot |
+
+---
 
 ## Evaluation
 
-```bash
-python test.py
+The eval block (every `eval_every` batches) always plays both opponents:
+
+```python
+for _ in range(eval_episodes):
+    play vs GreedyBot    → record win/lose/draw → update Elo
+    play vs RandomBot    → record win/lose/draw → update Elo
 ```
 
-Loads the latest checkpoint from `data/`, evaluates against 10 random opponents, prints win/draw/loss counts, then replays one AI-vs-AI game interactively.
+After eval, pool weights are updated unconditionally based on `wr_vs_random_eval`.
+
+---
 
 ## Cloud training (Docker + W&B Agents)
 

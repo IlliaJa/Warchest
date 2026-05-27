@@ -65,7 +65,15 @@ Effect:
 | Condition | Outcome |
 |---|---|
 | Player controls 6 bases | That player wins (`WIN_REWARD = +1.0`) |
-| Total actions reach 200 | Truncation; both players receive `LOSS_REWARD = −1.0` |
+| Total actions reach 200 | Truncation; main actor receives a terminal reward based on base lead (0.0 / −0.5 / −1.0) |
+
+The truncation terminal reward for the main actor (added to the last step in the rollout buffer):
+
+| Base position at truncation | Terminal reward |
+|---|---|
+| More bases than opponent | 0.0 |
+| Tied | −0.5 |
+| Fewer bases than opponent | −1.0 |
 
 ## Rewards
 

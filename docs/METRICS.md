@@ -1,131 +1,160 @@
 # PPO Training Metrics Reference
 
 Metrics logged every batch to W&B and to the run log file.
-All values are averages over the minibatch updates performed in that batch.
+All update-related values are averages over the minibatch steps performed in that batch.
 
 ---
 
-## `clip_frac` — PPO clip fraction
+## Win-rate metrics
+
+### `wr_vs_pool_train` / `wr_vs_greedy_train` — training win rates
+
+Rolling win rates (last 100 training episodes) split by opponent type. These reflect in-training performance on whatever opponent mix is currently active.
+
+**Trend:** `wr_vs_greedy_train` is the harder signal; expect it to climb slowly. `wr_vs_pool_train` can be misleading early when the pool holds near-random snapshots.
+
+---
+
+### `wr_vs_random_eval` / `wr_vs_greedy_eval` — evaluation win rates
+
+Win rates measured every `eval_every` batches against fixed opponents (RandomBot and GreedyBot) over `eval_episodes` games each. Not rolling — fresh each eval block.
+
+**Trend:** `wr_vs_random_eval` should reach > 0.9 quickly; once it does, training pool switches to finetune weights (random removed). `wr_vs_greedy_eval` is the main long-term quality signal.
+
+---
+
+## Elo metrics
+
+### `elo_policy` / `elo_greedy` — Elo ratings
+
+Elo ratings updated after each eval block. `elo_greedy` is a fixed reference point (it does not train, so its Elo reflects only how the policy has historically performed against it).
+
+**Trend:** `elo_policy` should rise steadily. A widening gap `elo_policy − elo_greedy` means the policy is consistently outplaying the greedy bot.
+
+---
+
+## PPO update metrics
+
+### `clip_frac` — PPO clip fraction
 
 **What it measures:** fraction of timesteps in a minibatch where the probability
 ratio `r = π_new / π_old` fell outside `[1−ε, 1+ε]` (ε = 0.2 by default),
-meaning the surrogate objective was clipped by the PPO clamp.
+meaning the surrogate objective was clipped.
 
 **Ideal range:** `0.05 – 0.25`
 
 | Value | Interpretation |
 |---|---|
-| < 0.05 | Policy updates are too small; clip never activates. Equivalent to doing one tiny gradient step. LR may be too low or `ppo_eps` too large. |
+| < 0.05 | Updates too small; clip never activates. LR may be too low. |
 | 0.05 – 0.25 | Healthy — meaningful learning without overstepping. |
-| > 0.4 | Policy changes too aggressively per update. Expect instability. Lower LR or raise `ppo_eps`. |
+| > 0.4 | Policy changes too aggressively. Lower LR or increase `ppo_eps`. |
 
-**Trend:** roughly flat once training stabilises. Temporary spikes when a harder
-opponent is introduced.
+**Trend:** roughly flat once training stabilises. Temporary spikes when training switches to finetune phase.
 
 ---
 
-## `ppo_kl` — per-minibatch KL divergence
+### `approx_kl` — per-minibatch KL divergence
 
 **What it measures:** average `E[log π_old(a|s) − log π_new(a|s)]` across a
 minibatch. Measures how much the policy drifted from the version that collected
-the data. A separate approximation (`(r−1) − log r`) is used for early stopping
-inside the epoch loop; the logged value is the direct log-ratio mean.
+the data. Epoch terminates early when this exceeds `KL_TARGET = 0.015`.
 
 **Ideal range:** `0.003 – 0.012` per minibatch average
 
 | Value | Interpretation |
 |---|---|
-| Near 0 with low clip_frac | Updates are doing almost nothing. |
+| Near 0 with low `clip_frac` | Updates are doing almost nothing. |
 | 0.003 – 0.012 | Healthy drift — the policy is learning without destabilising. |
-| Consistently hitting `kl_target` (0.015) | Epochs terminate early; policy wants to move faster than the KL budget allows. Reduce `ppo_epochs` or LR. |
-| > 0.02 | Large distribution shift; old trajectories are stale. Likely to cause training instability. |
+| Consistently hitting `KL_TARGET` | Epochs terminate early every batch. Reduce LR. |
+| > 0.02 | Large distribution shift; old trajectories are stale. |
 
 **Trend:** roughly stable or slightly decreasing as the policy converges.
 
 ---
 
-## `ret_mean` — mean of raw returns
+### `actor_loss` / `critic_loss` — component losses
 
-**What it measures:** average discounted cumulative reward across all timesteps
-in the batch. Returns include shaped rewards (base-difference term) plus terminal
-signals (win = +1, loss = −1, truncation = −0.5 or 0 depending on base lead).
+`actor_loss`: mean PPO surrogate loss (negative, so improvements show as rising values).
+`critic_loss`: mean MSE between predicted values and GAE returns.
 
-**Ideal behaviour:** should **increase over time**, trending from negative toward
-positive.
-
-| Phase | Typical value | Why |
-|---|---|---|
-| Early (near-random) | −0.5 to −1.0 | Policy loses often and truncates; dominated by −1 / −0.5 terminals. |
-| Mid training | −0.2 to 0.0 | Fewer losses, more draws/truncations with a base lead. |
-| Strong policy | > 0 | Policy wins more often than it loses against its training mix. |
-
-**Trend: monotonically increasing** (with noise). This is the clearest top-level
-learning signal — a flat or falling `ret_mean` means no improvement.
+**Trend:** `critic_loss` should fall over time as the critic calibrates. `actor_loss` oscillates more; its absolute magnitude matters less than whether it stays non-zero (a flat-zero actor loss means advantages are not informative).
 
 ---
 
-## `ret_std` — standard deviation of raw returns
+### `entropy` — policy entropy
 
-**What it measures:** spread of returns within a batch. High std = outcomes vary
-widely (some wins, some losses, some truncations). Low std = outcomes are
-consistent.
+**What it measures:** mean `−Σ p log p` over the action distribution. For 14 actions, maximum entropy ≈ 2.64.
 
-**Ideal behaviour:** should **decrease over time** as the policy becomes more
-consistent, but with caveats.
-
-| Phase | Expected std | Why |
-|---|---|---|
-| Early (near-random) | 0.5 – 1.0 | Outcomes are a coin flip. |
-| Mid training | decreasing gradually | Policy wins more consistently. |
-| After adding a harder opponent | temporary spike | Greedy episodes introduce reliable losses initially. |
-| Converged | 0.2 – 0.5 | Still some variance; game is non-deterministic. |
-
-**Warning:** if `ret_std` collapses toward 0 but `ret_mean` is still negative,
-the policy has converged to consistently losing — stable but broken. Also watch
-for near-zero `ret_std` causing NaN advantages during return normalisation.
+**Trend:** should start high (near-uniform policy) and decrease as the policy becomes more decisive. A collapse to near 0 early in training means premature convergence — the entropy coefficient is too low.
 
 ---
 
-## `critic_mae` — critic mean absolute error
+## Gradient metrics
 
-**What it measures:** `mean(|V(s) − R|)` — how accurately the critic predicts
-actual returns. Since returns are in roughly [−1, +1], this is directly
-interpretable in reward units.
+### `grad_norm_actor` / `grad_norm_critic`
 
-**Ideal behaviour:** should **decrease** from a high starting value and
-**stabilise** at a low level.
+Post-clip gradient norms for the actor-side parameters (board encoder + unit encoder + actor head) and critic parameters separately. Both are clipped at max_norm = 1.0.
+
+**Ideal:** comfortably below 1.0 most steps. Consistently hitting 1.0 means gradients are large and clipping is doing heavy lifting — consider lowering LR.
+
+---
+
+## Critic quality metrics
+
+### `critic_mae` — mean absolute error
+
+**What it measures:** `mean(|V(s) − R|)` — how accurately the critic predicts actual returns. Since returns are in roughly [−1, +1], this is directly interpretable in reward units.
+
+**Trend:** falls from ~0.5–1.0 early and stabilises at a lower level. Spikes after opponent pool changes are normal.
 
 | Value | Interpretation |
 |---|---|
 | 0.5 – 1.0 (early) | Critic is guessing. Expected. |
-| Steadily decreasing | Critic is learning; advantages become a better signal for the actor. |
-| < 0.15 (late) | Critic has good accuracy. |
-| Stays high after many batches | Critic LR too low, or shared encoder not expressive enough. |
-| Spikes after being low | Distribution shift from a new opponent or a sudden policy jump. |
-
-**Trend:** decreases and stabilises. Spikes are a warning sign.
+| Steadily decreasing | Critic is learning. |
+| < 0.15 (late) | Good accuracy. |
+| Stays high after many batches | Critic LR too low or network not expressive enough. |
 
 ---
 
-## `critic_mean` — mean predicted value
+### `critic_mean` — mean predicted value
 
-**What it measures:** average `V(s)` the critic predicts across all states in
-the batch. Represents the critic's estimate of expected return from a typical
-game state seen during training.
-
-**Ideal behaviour:** should **track `ret_mean` closely** once the critic has
-learned. Early in training they will diverge (critic is random); as `critic_mae`
-falls, `critic_mean` should converge toward `ret_mean`.
+**What it measures:** average `V(s)` across all states in the batch. Should track `return_mean` once the critic has learned.
 
 | Condition | Interpretation |
 |---|---|
-| `critic_mean` ≈ `ret_mean` | Critic is calibrated. Advantages are centered correctly. |
-| `critic_mean` << `ret_mean` | Critic is pessimistic — underestimates policy quality. Advantages will be positively biased, pushing the actor toward all actions equally. |
-| `critic_mean` >> `ret_mean` | Critic is optimistic — advantages will be negatively biased, suppressing learning. |
-| `critic_mean` drifts upward while `ret_mean` is flat | Value estimates are diverging; check for gradient issues or LR imbalance between actor and critic. |
+| `critic_mean` ≈ `return_mean` | Critic is calibrated. |
+| `critic_mean` << `return_mean` | Critic is pessimistic — advantages positively biased. |
+| `critic_mean` >> `return_mean` | Critic is optimistic — advantages negatively biased. |
 
-**Trend:** starts anywhere (random init), converges toward `ret_mean`, then
-rises together with `ret_mean` as the policy improves.
+---
+
+### `critic_std` — std of predicted values
+
+Spread of the critic's predictions across states. A near-zero std means the critic predicts the same value for every state — it has not learned to differentiate positions. Should be non-trivial (> 0.1) once the critic is useful.
+
+---
+
+## Return and advantage metrics
+
+### `return_mean` / `return_std` — GAE return statistics
+
+Raw (un-normalised) GAE returns across all timesteps in the batch. Includes shaped rewards and terminal signals.
+
+**`return_mean` trend:** should **increase over time**, trending from negative toward positive. This is the clearest top-level learning signal — a flat or falling `return_mean` means no improvement.
+
+| Phase | Typical `return_mean` | Why |
+|---|---|---|
+| Early (near-random) | −0.5 to −1.0 | Dominated by losses and truncation penalties |
+| Mid training | −0.2 to 0.0 | Fewer losses, more draws with base lead |
+| Strong policy | > 0 | Wins more often than loses against training mix |
+
+**`return_std` trend:** should **decrease** as play becomes more consistent. A temporary spike is expected when the finetune phase introduces harder opponents.
+
+---
+
+### `advantage_std` — raw advantage spread
+
+Std of GAE advantages before normalisation. Should be non-zero (> 0.05) — near-zero means all actions look equally good to the critic, which zeros out the actor gradient regardless of normalisation.
 
 ---
 
@@ -134,8 +163,13 @@ rises together with `ret_mean` as the policy improves.
 | Metric | Early training | Healthy mid | Target late | Bad signs |
 |---|---|---|---|---|
 | `clip_frac` | any | 0.10 – 0.20 | 0.05 – 0.25 | < 0.02 or > 0.45 |
-| `ppo_kl` | any | 0.005 – 0.010 | stable | hitting kl_target every batch |
-| `ret_mean` | −0.5 to −1.0 | rising | > 0 | flat or falling |
-| `ret_std` | 0.5 – 1.0 | decreasing | 0.2 – 0.5 | collapses to 0 |
+| `approx_kl` | any | 0.005 – 0.010 | stable | hitting KL_TARGET every batch |
+| `return_mean` | −0.5 to −1.0 | rising | > 0 | flat or falling |
+| `return_std` | 0.5 – 1.0 | decreasing | 0.2 – 0.5 | collapses to 0 |
 | `critic_mae` | 0.5 – 1.0 | decreasing | < 0.15 | plateau or spike |
-| `critic_mean` | noisy | converging to ret_mean | ≈ ret_mean | diverging from ret_mean |
+| `critic_mean` | noisy | converging to `return_mean` | ≈ `return_mean` | diverging from `return_mean` |
+| `critic_std` | near 0 | rising | > 0.1 | stays near 0 |
+| `advantage_std` | any | > 0.05 | > 0.1 | near 0 (actor gradient dies) |
+| `entropy` | ~2.5 | decreasing | 0.5 – 1.5 | collapses to 0 early |
+| `wr_vs_random_eval` | 0 | rising | > 0.90 | not rising by batch 50 |
+| `wr_vs_greedy_eval` | 0 | rising | > 0.60 | flat after finetune phase |

@@ -96,7 +96,6 @@ class PPOTrainer:
         self._greedy_bot = GreedyBot()
         self._elo = EloTracker()
         self._score_deque = deque(maxlen=self._print_every * self._collect_episodes)
-        self._wr_vs_random = deque(maxlen=100)
         self._wr_vs_pool = deque(maxlen=100)
         self._wr_vs_greedy = deque(maxlen=100)
 
@@ -370,14 +369,13 @@ class PPOTrainer:
             f'[eval] batch={batch_num} '
             f'wr_greedy={greedy_wins / self._eval_episodes:.3f} '
             f'wr_random={wr_random_eval:.3f} '
-            f'elo_policy={elo_pol:.0f} elo_greedy={elo_grdy:.0f} elo_random={elo_rnd:.0f}'
+            f'elo_policy={elo_pol:.0f} elo_greedy={elo_grdy:.0f}'
         )
         if use_wandb:
             wandb.log({
                 'elo_policy': elo_pol,
                 'elo_greedy': elo_grdy,
-                'elo_random': elo_rnd,
-                'wr_vs_greedy': greedy_wins / self._eval_episodes,
+                'wr_vs_greedy_eval': greedy_wins / self._eval_episodes,
                 'wr_vs_random_eval': wr_random_eval,
             })
 
@@ -407,14 +405,11 @@ class PPOTrainer:
     def _log_batch(self, batch_num: int, update_stats: dict):
         for ep in self._batch_eps:
             self._score_deque.append(ep['main_score'])
-            if ep['opp_type'] == 'random':
-                self._wr_vs_random.append(int(ep['outcome'] == 'win'))
-            elif ep['opp_type'] == 'greedy':
+            if ep['opp_type'] == 'greedy':
                 self._wr_vs_greedy.append(int(ep['outcome'] == 'win'))
-            else:
+            elif ep['opp_type'] == 'pool':
                 self._wr_vs_pool.append(int(ep['outcome'] == 'win'))
 
-        wr_rnd = float(np.mean(self._wr_vs_random)) if self._wr_vs_random else 0.0
         wr_pool = float(np.mean(self._wr_vs_pool)) if self._wr_vs_pool else 0.0
         wr_greedy = float(np.mean(self._wr_vs_greedy)) if self._wr_vs_greedy else 0.0
 
@@ -435,7 +430,7 @@ class PPOTrainer:
         logger.info(
             f'batch={batch_num}/{self._n_batches} [{outcomes_str}] '
             f'score={np.mean(self._score_deque):.2f} '
-            f'wr_rnd={wr_rnd:.3f} wr_pool={wr_pool:.3f} wr_greedy={wr_greedy:.3f} '
+            f'wr_pool={wr_pool:.3f} wr_greedy={wr_greedy:.3f} '
             f'actor={s["avg_actor"]:.3e} critic={s["avg_critic"]:.4f} '
             f'kl={s["avg_kl"]:.4f} ent={s["avg_entropy"]:.3f} '
             f'grad_a={s["last_actor_grad"]:.3f} grad_c={s["last_critic_grad"]:.3f} '
@@ -446,12 +441,11 @@ class PPOTrainer:
         if use_wandb:
             wandb.log({
                 'score_main': float(np.mean(self._score_deque)),
-                'winrate_vs_random': wr_rnd,
-                'winrate_vs_pool': wr_pool,
-                'winrate_vs_greedy_train': wr_greedy,
+                'wr_vs_pool_train': wr_pool,
+                'wr_vs_greedy_train': wr_greedy,
                 'actor_loss': s['avg_actor'],
                 'critic_loss': s['avg_critic'],
-                'ppo_kl': s['avg_kl'],
+                'approx_kl': s['avg_kl'],
                 'entropy': s['avg_entropy'],
                 'grad_norm_actor': s['last_actor_grad'],
                 'grad_norm_critic': s['last_critic_grad'],
@@ -459,9 +453,9 @@ class PPOTrainer:
                 'critic_mae': s['avg_critic_mae'],
                 'critic_mean': s['avg_critic_mean'],
                 'critic_std': s['avg_critic_std'],
-                'adv_std': self._buffer.raw_adv_std,
-                'ret_mean': self._buffer.raw_ret_mean,
-                'ret_std': self._buffer.raw_ret_std,
+                'advantage_std': self._buffer.raw_adv_std,
+                'return_mean': self._buffer.raw_ret_mean,
+                'return_std': self._buffer.raw_ret_std,
                 'avg_turns': avg_turns,
             })
 

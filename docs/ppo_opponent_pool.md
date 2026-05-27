@@ -2,60 +2,72 @@
 
 ## Entry point
 
-`ppo.py` is the new training entry point. Run it the same way as `reinforce.py`:
-
 ```bash
-python ppo.py
+python -m src.app.ppo
 ```
 
-It replaces the per-episode REINFORCE update with two mechanisms:
+`PPOTrainer` (in `src/app/ppo.py`) replaces the per-episode REINFORCE update with two mechanisms:
 
-1. **PPO (Proximal Policy Optimization)** — collects a batch of N episodes before updating, then runs K gradient steps per batch using a clipped surrogate loss.
-2. **Opponent pool** — the main actor trains against either a random bot or a frozen past snapshot of the policy, preventing self-play cycling and strategy forgetting.
+1. **PPO** — collects a batch of N episodes before updating, then runs K inner epochs with a clipped surrogate loss.
+2. **Opponent pool** — the main actor trains against a weighted mixture of random, greedy, and frozen past policy snapshots.
 
 ---
 
 ## Main actor concept
 
-`reinforce.py` tracked metrics per player id (player 1 or player 2), which made scores and win rates ambiguous when the policy randomly ended up in either slot.
-
-`ppo.py` tracks everything relative to the **main actor** — the policy being trained. At episode start, `main_pid = random.choice([1, 2])` picks which player slot the main actor occupies. The other slot (`opp_pid = 3 - main_pid`) is the opponent. All scores, win rates, and loss metrics belong to the main actor regardless of which player position it holds.
+Everything is tracked relative to the **main actor** — the policy being trained. At episode start, `main_pid = random.choice([1, 2])` picks which player slot the main actor occupies. All scores, win rates, and transitions belong to the main actor regardless of player position.
 
 ---
 
 ## Opponent pool
 
-`OpponentPool` (in `opponent_pool.py`) maintains a rolling window of frozen policy snapshots.
+`OpponentPool` (`src/services/opponent_pool.py`) samples from three opponent types according to internal weights.
 
+```python
+pool = OpponentPool(
+    max_size=20,
+    snapshot_every=1,
+    p_random=0.40,
+    p_greedy=0.20,
+    p_pool=0.40,
+)
 ```
-pool = OpponentPool(max_size=20, snapshot_every=1)
+
+### Three opponent types
+
+| Type | Description |
+|---|---|
+| `random` | `RandomBot` — uniform over valid actions |
+| `greedy` | `GreedyBot` — BFS toward nearest unclaimed/enemy base; 30% random handicap |
+| `pool` | Frozen `Policy` snapshot drawn uniformly from the rolling window |
+
+When the pool is empty (start of training), only random and greedy are used and their weights are renormalised.
+
+### Snapshots
+
+After each batch update, `pool.maybe_snapshot(policy)` copies the current policy weights into a `deque(maxlen=20)`. The oldest snapshot is evicted automatically when full. The rolling window always spans the most recent `max_size × collect_episodes` episodes of training.
+
+### Finetune phase
+
+After every eval block, `PPOTrainer` unconditionally calls `pool.set_weights()` based on the current eval WR vs random:
+
+```python
+if wr_random_eval >= wr_random_finetune_threshold:  # default 0.90
+    pool.set_weights(p_random=0.00, p_greedy=0.40, p_pool=0.60)
+else:
+    pool.set_weights(p_random=0.40, p_greedy=0.20, p_pool=0.40)
 ```
 
-### How it works
+This is recalculated every eval — if WR later drops below the threshold the initial weights are restored automatically.
 
-- After each batch update, `pool.maybe_snapshot(policy)` copies the current policy weights into the deque.
-- When the deque is full (20 entries), adding a new snapshot evicts the oldest one automatically.
-- At episode start, `pool.sample(policy_constructor, device, p_random=0.4)` returns either:
-  - `(None, 'random')` — 40% of the time, or when the pool is empty
-  - `(frozen_policy, 'pool')` — 60% of the time, drawn uniformly from the 20 stored snapshots
+### Pool vs PPO's π_old
 
-### Why a rolling window
-
-The pool always holds the **last 20 policy states**. This means:
-- Early, near-random snapshots are evicted as training progresses — opponents stay competitive.
-- The pool naturally spans roughly `20 × collect_episodes = 160` episodes of policy history, which is enough diversity to prevent cycling without being so stale that the opponents are trivially weak.
-- No tuning of a separate "snapshot interval" parameter is needed.
-
-### Two pools, two purposes
-
-The opponent pool is **completely separate** from PPO's importance sampling:
-
-| Concept | What it is | Relationship to current policy |
+| Concept | What it is | Staleness |
 |---|---|---|
-| Opponent pool | Who the main actor plays against | Past snapshots, can be old |
-| PPO's `π_old` | Frozen reference for computing importance ratio `r_t` | Always the current policy at batch start, very close |
+| Opponent pool | Who the main actor plays against | Can be 20 batches old |
+| PPO's `log_probs_old` | Frozen reference for importance ratio `r_t` | Always from the batch just collected |
 
-`π_old` is implicit in `ppo.py` — the `log_probs_old` stored during data collection serve this role. The opponent pool is a separate object entirely.
+These are completely independent.
 
 ---
 
@@ -63,59 +75,84 @@ The opponent pool is **completely separate** from PPO's importance sampling:
 
 ### Batch collection
 
-Each batch collects `collect_episodes` (default 8) full game episodes before any gradient update. Main-actor transitions are stored in a `RolloutBuffer`:
+Each batch collects `collect_episodes` (default 16) full game episodes. Main-actor transitions stored per step:
 
 ```
 (obs_before, action, log_prob_old, shaped_reward, value)
 ```
 
-Opponent transitions are discarded — only the main actor's trajectory is trained on.
+Opponent transitions are discarded.
+
+### Reward shaping
+
+Shaped reward applied before storage:
+
+```python
+shaped_r = r + gamma * phi(s_next) - phi(s)
+phi(s)   = SHAPING_C * (my_bases - opp_bases)    # SHAPING_C = 0.05
+```
 
 ### GAE computation
 
-After all episodes are collected, `buffer.compute_gae()` computes advantages and returns for the full batch using the same GAE formula as `reinforce.py`:
+After all episodes are collected, `buffer.compute_gae()` computes advantages and returns respecting episode boundaries:
 
 ```
 delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)
 A_t     = delta_t + gamma * lambda * A_{t+1}
 ```
 
-Episode boundaries are respected — GAE does not bleed across episode ends.
+Advantages are z-scored batch-wide. Returns stay in the original reward scale.
 
 ### Inner loop
 
-The buffer is then iterated `ppo_epochs` (default 4) times in random order. Each step:
-
 ```
-r_t      = exp(log_pi_new(a|s) - log_pi_old(a|s))   # importance ratio
-L_actor  = -min(r_t * A_t,  clip(r_t, 1-eps, 1+eps) * A_t)
-L_critic = MSE(V(s), return)
-L_total  = L_actor + L_critic - entropy_coeff * entropy
+for epoch in range(ppo_epochs):                   # default 1
+    for minibatch in buffer (size 64):
+        ratio    = exp(log_pi_new - log_pi_old)
+        L_actor  = -min(ratio*A, clip(ratio, 1-eps, 1+eps)*A)
+        L_critic = MSE(V(s), return)
+        L_total  = L_actor + L_critic - entropy_coeff * H
+        clip gradients separately: actor-side and critic (max_norm=1.0)
+        optimizer.step()
+        if approx_kl > KL_TARGET: break epoch early
 ```
 
-Gradients accumulate across all steps before a single `optimizer.step()` per epoch (gradient accumulation pattern — avoids holding the full computation graph in memory).
-
-### KL divergence monitoring
-
-`ppo_kl` (approximate KL: `mean(log_pi_old - log_pi_new)`) is logged to W&B. Values above ~0.05 suggest the clip is not constraining enough; values near 0 after several batches suggest the policy has stopped changing.
+`approx_kl = mean((ratio − 1) − (log_pi_new − log_pi_old))` is the early-stop signal, not the logged metric. The logged `approx_kl` is `mean(log_pi_old − log_pi_new)`.
 
 ---
 
 ## W&B metrics
 
+### Per batch
+
 | Metric | Description |
 |---|---|
-| `score_main` | Rolling average of main-actor episode reward |
-| `winrate_vs_random` | Win rate when opponent was random (rolling 100) |
-| `winrate_vs_pool` | Win rate when opponent was from pool (rolling 100) |
-| `win_rate` | Overall win rate across all opponent types (rolling 100) |
-| `lose_rate` | Overall lose rate (rolling 100); truncate = 1 - win - lose |
-| `actor_loss` | Mean PPO actor loss per inner step, averaged over epochs |
-| `critic_loss` | Mean critic MSE loss per inner step, averaged over epochs |
-| `ppo_kl` | Approximate KL divergence from old to new policy |
-| `grad_norm` | Pre-clip gradient norm (last epoch of each batch) |
-| `pool_size` | Number of snapshots currently in the opponent pool |
-| `avg_turns` | Mean episode length across batch episodes |
+| `score_main` | Rolling mean episode reward (main actor) |
+| `wr_vs_pool_train` | Win rate vs pool opponents (rolling 100 training episodes) |
+| `wr_vs_greedy_train` | Win rate vs greedy opponent (rolling 100 training episodes) |
+| `actor_loss` | Mean PPO actor loss per update |
+| `critic_loss` | Mean critic MSE loss per update |
+| `approx_kl` | Mean `log_pi_old − log_pi_new` per update |
+| `entropy` | Mean policy entropy |
+| `grad_norm_actor` | Post-clip norm, actor-side params |
+| `grad_norm_critic` | Post-clip norm, critic params |
+| `clip_frac` | Fraction of timesteps where PPO ratio was clipped |
+| `critic_mae` | Mean absolute error of critic predictions |
+| `critic_mean` | Mean predicted state value |
+| `critic_std` | Std of predicted state values |
+| `advantage_std` | Std of raw advantages |
+| `return_mean` | Mean of raw GAE returns |
+| `return_std` | Std of raw GAE returns |
+| `avg_turns` | Mean episode length |
+
+### Per eval block
+
+| Metric | Description |
+|---|---|
+| `wr_vs_random_eval` | Eval win rate vs RandomBot |
+| `wr_vs_greedy_eval` | Eval win rate vs GreedyBot |
+| `elo_policy` | Policy Elo rating |
+| `elo_greedy` | GreedyBot Elo rating |
 
 ---
 
@@ -123,14 +160,19 @@ Gradients accumulate across all steps before a single `optimizer.step()` per epo
 
 | Parameter | Default | Effect |
 |---|---|---|
-| `n_batches` | 400 | Total batch updates (= 3200 total episodes with collect_episodes=8) |
-| `collect_episodes` | 8 | Episodes collected per batch before update |
-| `ppo_epochs` | 4 | Inner gradient steps per batch |
+| `n_batches` | 300 | Total batch updates |
+| `collect_episodes` | 16 | Episodes collected per batch |
+| `ppo_epochs` | 1 | Inner epochs per batch (KL early stop active) |
 | `ppo_eps` | 0.2 | PPO clip parameter |
+| `KL_TARGET` | 0.015 | Approx-KL epoch early-stop threshold |
+| `ENTROPY_COEFF` | 0.001 | Entropy bonus coefficient |
 | `gamma` | 0.99 | Discount factor |
 | `lam` | 0.95 | GAE trace decay |
-| `lr_actor` | 1e-4 | Adam LR for encoder + actor head |
-| `lr_critic` | 5e-4 | Adam LR for critic head |
+| `lr_actor` | 3e-4 | Adam LR for encoder + actor head |
+| `lr_critic` | 3e-4 | Adam LR for critic |
 | `hidden_dim` | 64 | Network width |
-| Pool `max_size` | 20 | Rolling window length |
-| Pool `p_random` | 0.4 | Probability of choosing random over pool opponent |
+| Pool `max_size` | 20 | Rolling snapshot window |
+| `snapshot_every` | 1 | Snapshot after every N batch updates |
+| `eval_every` | 10 | Eval every N batches |
+| `eval_episodes` | 20 | Games per eval block |
+| `wr_random_finetune_threshold` | 0.90 | WR vs random to trigger finetune weights |

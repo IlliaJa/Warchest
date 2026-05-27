@@ -7,28 +7,43 @@
 | Event | Reward |
 |---|---|
 | Win (6 bases controlled) | +1.0 |
-| Claim unclaimed base | +0.15 |
-| Truncation (draw, 200 actions) | −1.0 |
+| Claim base | 0.0 |
+| Truncation — base lead | 0.0 |
+| Truncation — tied bases | −0.5 |
+| Truncation — base deficit | −1.0 |
 | Invalid action attempt | −0.02 |
 | Move onto unclaimed base | +0.005 |
 | Move adjacent to unclaimed base | +0.001 |
 | Each action taken | −0.002 |
 
-Constants are defined at the top of `environment/warchest_env.py`. Raw reward values are passed unchanged to GAE; the training loop normalizes advantages with z-scoring and normalizes returns with a running mean/std tracker (`RunningMeanStd` in `reinforce.py`).
+Constants are defined at the top of `src/services/environment/warchest_env.py`. Raw environment rewards are augmented with potential-based shaping in `src/app/ppo.py` before being stored in the rollout buffer.
+
+### Potential-based reward shaping
+
+Applied by the training loop, not the environment:
+
+```python
+shaped_r = r + gamma * phi(s_next) - phi(s)
+phi(s)   = SHAPING_C * (my_bases - opp_bases)    # SHAPING_C = 0.05
+```
+
+This fires a positive pulse when gaining a base and a negative pulse when losing one. Advantages are z-scored batch-wide; returns are kept in the original reward scale.
 
 ### Implementation notes
 
-- Base approach rewards (`MOVE_ON_BASE_REWARD`, `MOVE_NEAR_BASE_REWARD`) fire on every qualifying move throughout the episode — there is no per-base once-only flag.
+- Base approach rewards (`MOVE_ON_BASE_REWARD`, `MOVE_NEAR_BASE_REWARD`) fire on every qualifying move throughout the episode.
 - An exploration bonus (0.1 × (5 − visit_count) per cell, clamped to 0) is implemented but commented out in `perform_move_action`.
-- Claiming an enemy base is treated identically to claiming an unclaimed base (+0.15). The player who loses the base receives no reward signal.
+- `CLAIM_BASE_REWARD` is 0.0. A non-zero direct claim reward caused a circular-claiming exploit: the policy learned to claim bases back and forth with pool opponents, accumulating reward (up to ~5.0) far in excess of `WIN_REWARD = 1.0`. Potential shaping already handles base value correctly, so the direct reward is not needed.
 
-### Problem: reward sparsity
+### Truncation reward
 
-With near-random play, ~99 % of episodes hit the 200-action truncation limit. The dominant training signal is the flat −1.0 truncation penalty, not any signal about strategic progress. Consequences:
+When the episode truncates (`action_count >= max_actions = 200`), a terminal reward is added to the last main-actor step based on the base lead:
 
-- The actor gradient is near-zero for most of training because advantages are nearly identical across all actions.
-- The policy has no incentive to differentiate *how* it plays — only *whether* it avoids truncation.
-- Base claiming, which is the core mechanic, is rewarded sporadically and only at the rare moment of capture.
+```python
+if my_bases > opp_bases:   trunc_reward = 0.0   # drew from a strong position
+elif my_bases == opp_bases: trunc_reward = -0.5  # true draw
+else:                       trunc_reward = -1.0  # drew from a losing position
+```
 
 ---
 
@@ -40,19 +55,13 @@ With near-random play, ~99 % of episodes hit the 200-action truncation limit. Th
 base_lead_reward = k * (my_bases - starting_bases)  # e.g. k = 0.01
 ```
 
-Added to the reward every step. Positive when holding more than the starting 2 bases, zero at parity, negative if losing ground.
-
-**Ruled out**: idea 3 covers the same intent with better theoretical properties and without the passive-holding distortion (see idea 3 for details).
+**Ruled out**: idea 3 covers the same intent with better theoretical properties.
 
 ---
 
 ### ~~2. Opponent-loss penalty (symmetric claiming)~~ *(ruled out — attribution problem)*
 
-Idea: when the opponent claims a base, give the defender an explicit negative reward.
-
-**Ruled out**: the penalty would appear in the defender's trajectory at a timestep causally unrelated to the base loss — the defender wasn't even acting when the claim happened. GAE would attribute it to whatever action the defender happened to take next, which is wrong. For bases near the opponent's start the defender couldn't have prevented it regardless.
-
-Idea 3 already covers this correctly: when the opponent claims a base, `phi_before` drops on the defender's next turn, the critic sees a less valuable state, and GAE propagates the disadvantage backwards to the actions that *actually* caused it (e.g., failing to contest that base earlier). Increase `SHAPING_C` if the signal feels too weak.
+**Ruled out**: the penalty would appear in the defender's trajectory at a timestep causally unrelated to the base loss. Idea 3 already covers this correctly via the potential term.
 
 ---
 
@@ -61,7 +70,7 @@ Idea 3 already covers this correctly: when the opponent claims a base, `phi_befo
 A theoretically clean way to add dense rewards without changing the optimal policy (Ng et al. 1999). Define a potential:
 
 ```python
-phi(s) = c * (my_bases - opp_bases)  # e.g. c = 0.05
+phi(s) = c * (my_bases - opp_bases)  # c = 0.05
 ```
 
 Shaped reward at each step:
@@ -70,9 +79,7 @@ Shaped reward at each step:
 r_shaped = r + gamma * phi(s_next) - phi(s)
 ```
 
-This fires a positive pulse when you gain a base and a negative pulse when you lose one, automatically scaled by the discount factor.
-
-"Same optimal policy" means the shaping doesn't redirect the agent toward a different goal — it just makes the path to winning less sparse. The original win/loss signal still defines what good play is. The shaped rewards cannot make a losing strategy look better than a winning one in the long run, because the `gamma * phi(s') - phi(s)` terms telescope and nearly cancel out over a full trajectory, leaving only boundary terms.
+The `gamma * phi(s') - phi(s)` terms telescope and nearly cancel over a full trajectory, leaving only boundary terms. The shaped rewards cannot make a losing strategy look better than a winning one in the long run.
 
 ---
 
@@ -85,9 +92,7 @@ delta_dist = prev_min_dist_to_target - new_min_dist_to_target
 proximity_reward = k * delta_dist  # positive when closing in
 ```
 
-Guides units toward objectives from the start of the episode rather than waiting for them to stumble onto a base. Requires computing BFS distance on the hex grid — manageable per step.
-
-**Trade-off**: can create reward-hacking if the agent oscillates near a base without claiming it; requires a small claiming bonus to remain dominant.
+Requires BFS distance on the hex grid per step. Can create reward-hacking if the agent oscillates near a base without claiming.
 
 ---
 
@@ -100,8 +105,6 @@ min_dist = min(hex_distance(unit_loc, base) for base in unclaimed_bases)
 proximity_reward = k / (1 + min_dist)  # e.g. k = 0.005
 ```
 
-Gives a stronger signal the closer the unit is, rather than a step function at distance 0 and 1.
-
 ---
 
 ### 6. Re-enable exploration reward
@@ -113,7 +116,7 @@ explore_multiplier = MOVE_EXPLORE_REWARD_MAX_TURN - visit_count[end]
 explore_reward = max(0, MOVE_EXPLORE_REWARD_PER_TURN * explore_multiplier)
 ```
 
-This decays to zero after 5 visits, so it fires mostly in the early game and does not create permanent incentives to wander. Useful for breaking the initial frozen-position failure mode.
+Decays to zero after 5 visits, so it fires mostly in the early game.
 
 ---
 
@@ -125,21 +128,17 @@ Scale the terminal win reward by how quickly the game ends:
 win_reward = WIN_REWARD + speed_bonus * (max_actions - action_count) / max_actions
 ```
 
-Encourages decisive play. Keeps the max reward at `WIN_REWARD + speed_bonus` for an instant win and asymptotes to `WIN_REWARD` for a slow win.
-
 ---
 
 ### 8. Base-capture sequence reward
 
-Small incremental bonuses for the full capture sequence — adjacent → on → claim — to encourage following through:
+Small incremental bonuses for the full capture sequence — adjacent → on → claim:
 
 ```python
-MOVE_ADJACENT_TO_UNCLAIMED = +0.002   # currently MOVE_NEAR_BASE_REWARD
-MOVE_ONTO_UNCLAIMED        = +0.008   # currently MOVE_ON_BASE_REWARD
-CLAIM_UNCLAIMED            = +0.15    # unchanged
+MOVE_ADJACENT_TO_UNCLAIMED = +0.002
+MOVE_ONTO_UNCLAIMED        = +0.008
+CLAIM_UNCLAIMED            = +0.15   # if direct claim reward is restored
 ```
-
-These are additive across steps of the sequence, so the total reward for a full capture is `0.002 + 0.008 + 0.15 = 0.16` compared to the current `0.001 + 0.005 + 0.15 = 0.156` — structurally similar but more differentiating at the approach steps.
 
 ---
 
@@ -154,4 +153,4 @@ These are additive across steps of the sequence, so the total reward for a full 
 | Graduated distance reward (5) | Medium | Medium | Replaces current binary approach |
 | Distance-to-objective (4) | Medium | Medium | Requires BFS per step |
 | Win-speed bonus (7) | Low | Low | Polish after policy learns basics |
-| Sequence reward (8) | Low | Low | Marginal improvement on current design |
+| Sequence reward (8) | Low | Low | Only relevant if direct claim reward is restored |

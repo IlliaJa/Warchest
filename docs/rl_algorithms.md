@@ -1,6 +1,6 @@
 # RL Algorithm Comparison
 
-Reference for choosing the next training algorithm for Warchest. Current setup is REINFORCE + GAE.
+Reference for RL algorithm choices in Warchest. Current trainer: **PPO** (`src/app/ppo.py`). The legacy REINFORCE+GAE trainer is kept at `src/app/reinforce.py`.
 
 ---
 
@@ -122,9 +122,9 @@ Replaces rollouts with Monte Carlo Tree Search guided by a learned policy and va
 
 ---
 
-## Decision (2026-05-23)
+## Decision (2026-05-23) — PPO implemented
 
-**PPO is the chosen next step.** The other candidates were ruled out:
+**PPO is the active training algorithm.** The other candidates were ruled out:
 
 **DQN — ruled out.** DQN represents state-action value as `Q(s, a)` with one output per action. Today there are 14 actions, but the plan is to add more unit types, each with their own move and claim actions. The action space will grow with each unit type added, requiring the Q-network output layer to be rebuilt and retrained from scratch every time. A policy network outputs a distribution over whatever actions exist — it scales transparently. DQN also loses the natural stochasticity of a policy, which matters for self-play diversity. Off-policy replay would be a benefit, but not worth the scaling cost.
 
@@ -134,13 +134,13 @@ Replaces rollouts with Monte Carlo Tree Search guided by a learned policy and va
 
 **Note from log analysis (run_20260523-101428, 665 episodes):** PPO alone will not unblock training. The current actor gradient is structurally zero — the critic converged to a constant (predicting truncation time penalty for every state), advantages are all near-zero, and advantage normalization kills the sparse win signal. PPO makes better use of signal; it cannot create signal from nothing. The prerequisite fixes are dense reward shaping and weaker advantage normalization. PPO comes after those.
 
-## Recommended Path
+## Implemented path
 
-| Step | Change | Expected gain |
+| Step | Change | Status |
 |---|---|---|
-| 1 | Dense reward shaping | Give critic real signal to predict; break actor_loss=0 |
-| 2 | Weaken advantage normalization | Let win-episode signal propagate instead of being zeroed |
-| 3 | Reduce entropy coefficient | Stop entropy bonus dominating the (near-zero) actor loss |
-| 4 | Add episode batching (4–8 eps per update) | Lower gradient noise, ~same wall-clock |
-| 5 | Migrate to PPO | 4–10× sample efficiency once signal exists |
-| 6 | Add opponent pool (past policy snapshots) | Prevent self-play cycling and strategy forgetting |
+| 1 | Dense reward shaping (potential-based) | ✅ Done |
+| 2 | Z-score advantage normalisation | ✅ Done |
+| 3 | Low entropy coefficient (0.001) | ✅ Done |
+| 4 | Episode batching (16 eps per batch) | ✅ Done |
+| 5 | PPO with clipped surrogate | ✅ Done |
+| 6 | Opponent pool (random + greedy + snapshots) | ✅ Done |
