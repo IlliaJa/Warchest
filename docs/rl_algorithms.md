@@ -66,27 +66,38 @@ When the new policy drifts too far from the one that collected the data (`r_t` l
 
 ## DQN (Deep Q-Network)
 
-DQN learns a Q-function `Q(s, a)` — the expected discounted return from taking action `a` in state `s` and playing optimally afterwards. The policy is implicit: always pick `argmax_a Q(s, a)`.
-
-Uses a **replay buffer**: transitions `(s, a, r, s')` are stored and sampled randomly for training, breaking temporal correlations. A **target network** (frozen copy of Q updated every N steps) stabilises the TD targets:
+DQN learns a Q-function `Q(s, a)` — the expected discounted return from taking action `a` in state `s` and playing optimally afterwards. The policy is implicit: always pick `argmax_a Q(s, a)`. Transitions `(s, a, r, s')` are stored in a **replay buffer** and sampled randomly for training, and a frozen **target network** (Q updated every N steps) stabilises the TD targets:
 
 ```
 L = E[ (r + gamma * max_a' Q_target(s', a') - Q(s, a))^2 ]
 ```
 
-**Benefits for Warchest:**
-- Off-policy: every transition is reused many times — orders of magnitude more sample efficient than REINFORCE for environments where experience is expensive to collect
-- Replay buffer directly addresses the "forgetting good strategies" concern: past transitions remain in the buffer and continue to shape the Q-function
-- 14 discrete actions is tiny — DQN is well-suited to small discrete action spaces
-- No need for the GAE advantage computation; the critic (Q-network) trains directly on TD error
-- Can train on a mix of self-play and random-opponent data without bias (off-policy handles it naturally)
+### Verdict
 
-**Drawbacks:**
-- Requires a separate network architecture: a single head outputting Q-values for all 14 actions, rather than actor + critic heads
-- Action masking requires care: invalid actions must be masked in the `argmax` and set to `-inf` in the target — doable but needs explicit handling
-- Q-learning in two-player zero-sum games is theoretically less clean than policy gradient: opponent behaviour changes the Q-values, creating a non-stationary target. Mitigated by the target network and the opponent pool
-- No built-in entropy regularisation — exploration requires epsilon-greedy or separate mechanisms
-- Credit assignment over 100-turn episodes is harder for TD(1) Q-learning than for GAE with `lambda=0.95`
+**DQN is fine for the current 2-unit / 14-action prototype. For the full Warchest (4 units, attack + ability actions, coin mechanics) PPO is the better choice. If sample efficiency later becomes the bottleneck, the right escalation is SAC-discrete or MuZero — not vanilla DQN.**
+
+### Why DQN works for the current prototype
+
+- 14 discrete actions is tiny and dense in valid choices — Q-learning has no problem here
+- Off-policy replay is genuinely valuable: every transition is reused many times, which matters when self-play episodes are expensive
+- Action masking is mechanical: set invalid actions to `-inf` in both the `argmax` and the TD target
+- Replay buffer doubles as protection against "forgetting good strategies" when the opponent pool shifts: past transitions stay in the buffer and keep shaping Q
+
+### Why PPO wins for the full game
+
+1. **Action space is large and factored, not flat.** Full Warchest has roughly 4 units × (6 move + 6 attack + ~3 ability) + coin actions (recruit / bolster / deploy with sub-targets). That lands somewhere between 80 and 200 flat discrete actions. DQN can output that many heads, but the actions have natural structure (unit × verb × direction / target). Actor-critic expresses this cleanly with factored policy heads. DQN forces either a flat output (loses the structure) or an Action Branching architecture (fiddlier, less standard, harder to debug).
+
+2. **Stochastic policy matters in hidden-information self-play.** Warchest has hidden state (opponent hand, bag, future draws). Optimal play in such games is often a *mixed* strategy, and the opponent pool means there are opponents actively learning to exploit predictable behaviour. PPO's stochastic policy expresses mixed strategies natively; DQN's `argmax` is deterministic and exploitable. Boltzmann action selection patches this but is not standard DQN and reintroduces the temperature-tuning problem PPO solves with entropy bonus.
+
+3. **Self-play stability.** Policy-gradient methods with opponent pools (which we already have) are much better studied for self-play than DQN. DQN self-play is known to oscillate — the Q-function is a moving target against a moving opponent, and the target network only partially absorbs that.
+
+4. **Sparse / delayed rewards.** GAE gives smooth credit assignment over long horizons via the `lambda` knob. DQN's 1-step TD bootstrapping under sparse rewards is unstable unless paired with n-step returns and most of the Rainbow stack (prioritised replay, distributional Q, dueling heads). At that point DQN is no longer simple.
+
+5. **Sample efficiency is DQN's only real win — and there are better answers.** Replay reuse is real, but if simulation throughput becomes the bottleneck, **SAC-discrete** (replay + stochastic policy + entropy regularisation) or **MuZero / AlphaZero-style** (learns from search-improved policies) both dominate vanilla DQN for this setting.
+
+### Practical implication
+
+If PPO feels unstable on the current prototype, the right move is to debug PPO (reward shaping, advantage normalisation, entropy schedule) rather than swap algorithm families. Switching costs compound once coin mechanics land — the factored action heads and self-play machinery built around PPO do not transfer to DQN.
 
 ---
 
@@ -126,7 +137,7 @@ Replaces rollouts with Monte Carlo Tree Search guided by a learned policy and va
 
 **PPO is the active training algorithm.** The other candidates were ruled out:
 
-**DQN — ruled out.** DQN represents state-action value as `Q(s, a)` with one output per action. Today there are 14 actions, but the plan is to add more unit types, each with their own move and claim actions. The action space will grow with each unit type added, requiring the Q-network output layer to be rebuilt and retrained from scratch every time. A policy network outputs a distribution over whatever actions exist — it scales transparently. DQN also loses the natural stochasticity of a policy, which matters for self-play diversity. Off-policy replay would be a benefit, but not worth the scaling cost.
+**DQN — ruled out.** See the "Why PPO wins for the full game" subsection above for the full reasoning. Summary: the full action space (~80–200 actions) is factored as unit × verb × direction/target and is much cleaner under a multi-head policy than under a flat Q-head; `argmax` removes the stochasticity that mixed strategies need in a hidden-information self-play setting; and DQN self-play is known to oscillate against an opponent pool. Off-policy replay would be a benefit, but the better answers to "we need replay" are SAC-discrete or MuZero — not vanilla DQN.
 
 **SAC-Discrete — ruled out.** More complex than PPO with no clear advantage for this setup. The entropy regularization it provides is already available in the current actor-critic via the entropy bonus term.
 

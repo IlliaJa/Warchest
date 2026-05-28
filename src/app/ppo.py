@@ -167,11 +167,16 @@ class PPOTrainer:
                 base_diff = my_bases - opp_bases
                 phi_before = SHAPING_C * base_diff
                 holding_reward = self._holding_reward_rate * base_diff
-                state, reward, terminated, truncated, step_info = self._env.step(action)
+                env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
+                logger.debug(
+                    f'turn={turn} main_pid={main_pid} acting_pid={acting_pid} '
+                    f'action={action} env_action={env_action}'
+                )
+                state, reward, terminated, truncated, step_info = self._env.step(env_action)
 
                 if not step_info['action'].is_valid:
                     invalid_count += 1
-                    logger.warning(f'turn={turn} main_pid={main_pid} invalid_action={action}')
+                    logger.warning(f'turn={turn} main_pid={main_pid} invalid_action={action} env_action={env_action}')
                     state, reward, terminated, truncated, step_info = self._env.make_random_step()
                     log_prob = torch.tensor(0.0).to(self._device)
                     value = torch.tensor(0.0).to(self._device)
@@ -190,7 +195,12 @@ class PPOTrainer:
             else:
                 with torch.no_grad():
                     action, _, _ = opp.act(state)
-                state, _, terminated, truncated, step_info = self._env.step(action)
+                env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
+                logger.debug(
+                    f'turn={turn} opp acting_pid={acting_pid} '
+                    f'action={action} env_action={env_action}'
+                )
+                state, _, terminated, truncated, step_info = self._env.step(env_action)
                 if not step_info['action'].is_valid:
                     state, _, terminated, truncated, step_info = self._env.make_random_step()
 
@@ -435,7 +445,8 @@ class PPOTrainer:
                     action, _, _ = self._policy.act(state)
                 else:
                     action, _, _ = opp.act(state)
-            state, _, terminated, truncated, step_info = self._env.step(action)
+            env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
+            state, _, terminated, truncated, step_info = self._env.step(env_action)
             if not step_info['action'].is_valid:
                 state, _, terminated, truncated, step_info = self._env.make_random_step()
             if terminated:

@@ -43,6 +43,28 @@ class WarChestEnv(gym.Env):
     winning_base_count = 6
     max_rewardable_moving_action = 30
 
+    # Under 180° rotation offset i maps to its opposite: 0↔3, 1↔4, 2↔5.
+    # Self-inverse: _OFFSET_FLIP[_OFFSET_FLIP[i]] == i for all i.
+    _OFFSET_FLIP = [3, 4, 5, 0, 1, 2]
+
+    @staticmethod
+    def remap_action(action_id: int) -> int:
+        """Translate between rotated-observation action space and env action space.
+
+        When active_player==2 the observation is rotated 180° and the action
+        mask is remapped so direction semantics are consistent with the rotated
+        view.  Any action the policy (or a bot) returns from that observation
+        must be passed through this function before env.step(), and vice-versa.
+        Self-inverse: remap_action(remap_action(a)) == a.
+        Claim actions (>= MAX_UNITS_PER_PLAYER*6) are unchanged.
+        """
+        n_move = MAX_UNITS_PER_PLAYER * 6
+        if action_id < n_move:
+            unit_id = action_id // 6
+            offset_id = action_id % 6
+            return unit_id * 6 + WarChestEnv._OFFSET_FLIP[offset_id]
+        return action_id
+
     def __init__(self, save_game_history: bool = False, debug_mode: bool = False):
         super().__init__()
         self.debug_mode = debug_mode
@@ -231,12 +253,37 @@ class WarChestEnv(gym.Env):
             opp_bases / self.winning_base_count,
         ], dtype=np.float32)
 
-        valid_action_mask = np.zeros(self.total_actions)
         valid_action_ids = self.get_possible_actions()
-        valid_action_mask[valid_action_ids] = 1
+
+        if active == 2:
+            s = self.board.board_size - 1
+            board_obs = np.rot90(self.board.board, 2).copy()
+            expl_obs = np.rot90(self.exploration_map_dict[active], 2).copy()
+            for slot in range(NUM_PLAYERS):
+                for i in range(MAX_UNITS_PER_PLAYER):
+                    r, c = units_obs[slot, i]
+                    units_obs[slot, i] = [s - r, s - c]
+            valid_action_mask = np.zeros(self.total_actions)
+            for a in valid_action_ids:
+                valid_action_mask[self.remap_action(a)] = 1
+            if self.debug_mode:
+                orig_corner = self.board.board[0, 0]
+                rot_corner = board_obs[0, 0]
+                print(
+                    f'[obs_rotate] P2 active: board[0,0]={rot_corner} (was board[{s},{s}]={orig_corner}) '
+                    f'unit0={units_obs[0,0].tolist()} '
+                    f'valid_orig={sorted(valid_action_ids)} '
+                    f'valid_rot={sorted(int(a) for a in np.where(valid_action_mask)[0])}'
+                )
+        else:
+            board_obs = self.board.board
+            expl_obs = self.exploration_map_dict[active]
+            valid_action_mask = np.zeros(self.total_actions)
+            valid_action_mask[valid_action_ids] = 1
+
         return {
-            'board': self.board.board,
-            'exploration_map': self.exploration_map_dict[active],
+            'board': board_obs,
+            'exploration_map': expl_obs,
             'units': units_obs,
             'global': global_feats,
             'valid_action_mask': valid_action_mask,

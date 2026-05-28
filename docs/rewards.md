@@ -1,5 +1,9 @@
 # Reward Design
 
+See [experiments.md](experiments.md) for the full training run history.
+
+---
+
 ## Current implementation
 
 ### Reward table
