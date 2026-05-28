@@ -12,9 +12,9 @@
 | Truncation — tied bases | −0.5 |
 | Truncation — base deficit | −1.0 |
 | Invalid action attempt | −0.02 |
-| Move onto unclaimed base | +0.005 |
-| Move adjacent to unclaimed base | +0.001 |
-| Each action taken | −0.002 |
+| Move onto neutral base (UNCONTROLLED_BASE_CELL_ID) | +0.005 |
+| Move adjacent to neutral base | +0.001 |
+| Any other move (no base approach) | −0.002 |
 
 Constants are defined at the top of `src/services/environment/warchest_env.py`. Raw environment rewards are augmented with potential-based shaping in `src/app/ppo.py` before being stored in the rollout buffer.
 
@@ -31,8 +31,9 @@ This fires a positive pulse when gaining a base and a negative pulse when losing
 
 ### Implementation notes
 
-- Base approach rewards (`MOVE_ON_BASE_REWARD`, `MOVE_NEAR_BASE_REWARD`) fire on every qualifying move throughout the episode.
-- An exploration bonus (0.1 × (5 − visit_count) per cell, clamped to 0) is implemented but commented out in `perform_move_action`.
+- The three move rewards are **mutually exclusive** per step. The code: `reward = neg_reward if base_approach_reward == 0 else base_approach_reward`. When a unit steps onto or adjacent to a neutral base, the `-0.002` step penalty is dropped, not added.
+- `MOVE_ON_BASE_REWARD` and `MOVE_NEAR_BASE_REWARD` only fire for `UNCONTROLLED_BASE_CELL_ID` (neutral bases). Moving onto an **enemy-controlled** base is treated as a regular move and receives `MOVE_NEG_REWARD_PER_TURN = -0.002`. This means stealing a base is momentarily penalised until the potential-shaping pulse arrives on the following step.
+- An exploration bonus (`MOVE_EXPLORE_REWARD_MAX_TURN = 5`, `MOVE_EXPLORE_REWARD_PER_TURN = 0.1`) is defined as constants but is not wired into `perform_move_action`. The exploration map is updated every step for use in the observation, but no reward is computed from it.
 - `CLAIM_BASE_REWARD` is 0.0. A non-zero direct claim reward caused a circular-claiming exploit: the policy learned to claim bases back and forth with pool opponents, accumulating reward (up to ~5.0) far in excess of `WIN_REWARD = 1.0`. Potential shaping already handles base value correctly, so the direct reward is not needed.
 
 ### Truncation reward

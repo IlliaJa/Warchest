@@ -211,7 +211,7 @@ class WarChestEnv(gym.Env):
         return gym.spaces.Dict({
             "board": gym.spaces.Box(low=-1, high=3, shape=(board_channels, self.board.board_size, self.board.board_size), dtype=np.int32),
             "units": gym.spaces.Box(low=0, high=7, shape=(NUM_PLAYERS, MAX_UNITS_PER_PLAYER, unit_features), dtype=np.int32),
-            "global": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(global_features,), dtype=np.float32),
+            "global": gym.spaces.Box(low=0.0, high=1.0, shape=(global_features,), dtype=np.float32),
             "active_player": gym.spaces.Discrete(2),
         })
 
@@ -227,7 +227,11 @@ class WarChestEnv(gym.Env):
 
         my_bases = len(self.board.get_controlled_bases(active))
         opp_bases = len(self.board.get_controlled_bases(opponent))
-        global_feats = np.array([self.action_count // 2, my_bases, opp_bases], dtype=np.float32)
+        global_feats = np.array([
+            self.action_count / self.max_actions,
+            my_bases / self.winning_base_count,
+            opp_bases / self.winning_base_count,
+        ], dtype=np.float32)
 
         valid_action_mask = np.zeros(self.total_actions)
         valid_action_ids = self.get_possible_actions()

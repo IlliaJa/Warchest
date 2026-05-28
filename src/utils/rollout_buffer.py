@@ -121,6 +121,7 @@ class RolloutBuffer:
         perm = np.random.permutation(N)
         obs = self._obs
         lp_old = torch.stack(self._log_probs_old)
+        vals_old = torch.stack(self._values)
 
         for start in range(0, N, batch_size):
             idx = perm[start:start + batch_size]
@@ -142,6 +143,7 @@ class RolloutBuffer:
                     [self._actions[i] for i in idx], dtype=torch.long
                 ).to(device),
                 'log_probs_old': lp_old[idx].to(device),
+                'values_old': vals_old[idx].to(device),
                 'advantages': self.advantages[idx],
                 'returns': self.returns[idx],
             }

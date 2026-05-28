@@ -49,14 +49,15 @@ class PPOTrainer:
     """PPO training loop for Warchest."""
 
     KL_TARGET = 0.015  # stop PPO epoch early if per-minibatch approx-KL exceeds this
-    ENTROPY_COEFF = 0.001
+    ENTROPY_COEFF = 0.005
 
-    def __init__(self, env, policy, critic, optimizer, policy_constructor, hp, device):
+    def __init__(self, env, policy, critic, actor_optimizer, critic_optimizer, policy_constructor, hp, device):
         # environment and models
         self._env = env
         self._policy = policy
         self._critic = critic
-        self._optimizer = optimizer
+        self._actor_optimizer = actor_optimizer
+        self._critic_optimizer = critic_optimizer
         self._policy_constructor = policy_constructor
         self._device = device
 
@@ -227,52 +228,50 @@ class PPOTrainer:
     # ------------------------------------------------------------------
 
     def _run_ppo_update(self, batch_num: int) -> dict:
-        """Run PPO inner epochs over the current buffer. Returns averaged update stats."""
+        """Run actor and critic updates independently over the current buffer."""
+        actor_stats = self._update_actor(batch_num)
+        critic_stats = self._update_critic(batch_num)
+        return {**actor_stats, **critic_stats}
+
+    def _encode_batch(self, batch: dict) -> None:
+        encoded = Policy.encode_board_batch(
+            batch['boards'], batch['exploration_maps'], batch['active_players']
+        )
+        batch['board'] = torch.tensor(encoded, dtype=torch.float32).to(self._device)
+
+    def _update_actor(self, batch_num: int) -> dict:
         kl_accum = 0.0
         actor_accum = 0.0
-        critic_accum = 0.0
         entropy_accum = 0.0
         clip_frac_accum = 0.0
-        critic_mae_accum = 0.0
-        critic_mean_accum = 0.0
-        critic_std_accum = 0.0
         last_actor_grad = 0.0
-        last_critic_grad = 0.0
-        n_updates = 0
-        early_stopped = False
+        n_actor_updates = 0
+        done = False
 
         for epoch in range(self._ppo_epochs):
-            if early_stopped:
+            if done:
                 break
             for batch in self._buffer.iter_minibatches(self._minibatch_size, self._device):
-                encoded = Policy.encode_board_batch(
-                    batch['boards'], batch['exploration_maps'], batch['active_players']
-                )
-                batch['board'] = torch.tensor(encoded, dtype=torch.float32).to(self._device)
+                self._encode_batch(batch)
 
                 lp_new, ent = self._policy.evaluate_actions_batch(batch)
-                val = self._critic.value_batch(batch)
-
                 lp_old = batch['log_probs_old']
-                adv = batch['advantages']
-                ret = batch['returns']
-
                 ratio = (lp_new - lp_old).exp()
                 approx_kl = ((ratio - 1) - (lp_new - lp_old)).detach().mean().item()
                 if approx_kl > self.KL_TARGET:
                     logger.debug(
                         f'batch={batch_num} epoch={epoch} '
-                        f'early stop approx_kl={approx_kl:.4f}'
+                        f'actor early stop approx_kl={approx_kl:.4f}'
                     )
-                    early_stopped = True
+                    done = True
                     break
 
+                adv = batch['advantages']
                 clipped_ratio = ratio.clamp(1 - self._ppo_eps, 1 + self._ppo_eps)
                 actor_loss = -torch.min(ratio * adv, clipped_ratio * adv).mean()
-                critic_loss = F.mse_loss(val, ret)
-                loss = actor_loss + critic_loss - self.ENTROPY_COEFF * ent.mean()
+                loss = actor_loss - self.ENTROPY_COEFF * ent.mean()
 
-                self._optimizer.zero_grad()
+                self._actor_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
                 has_nan = any(
@@ -282,40 +281,85 @@ class PPOTrainer:
                 last_actor_grad = torch.nn.utils.clip_grad_norm_(
                     self._actor_side_params, max_norm=1.0
                 ).item()
-                last_critic_grad = torch.nn.utils.clip_grad_norm_(
-                    self._critic.parameters(), max_norm=1.0
-                ).item()
                 if not has_nan:
-                    self._optimizer.step()
+                    self._actor_optimizer.step()
                 else:
                     logger.error(
-                        f'batch={batch_num} epoch={epoch} NaN gradient, skipping step'
+                        f'batch={batch_num} epoch={epoch} actor NaN gradient, skipping step'
                     )
 
                 kl_accum += (lp_old - lp_new).detach().mean().item()
                 actor_accum += actor_loss.item()
-                critic_accum += critic_loss.item()
                 entropy_accum += ent.detach().mean().item()
                 clip_frac_accum += ((ratio - 1.0).abs() > self._ppo_eps).float().mean().item()
+                n_actor_updates += 1
+
+        denom = max(n_actor_updates, 1)
+        return {
+            'avg_kl': kl_accum / denom,
+            'avg_actor': actor_accum / denom,
+            'avg_entropy': entropy_accum / denom,
+            'avg_clip_frac': clip_frac_accum / denom,
+            'last_actor_grad': last_actor_grad,
+            'n_actor_updates': n_actor_updates,
+        }
+
+    def _update_critic(self, batch_num: int) -> dict:
+        critic_accum = 0.0
+        critic_mae_accum = 0.0
+        critic_mean_accum = 0.0
+        critic_std_accum = 0.0
+        last_critic_grad = 0.0
+        n_critic_updates = 0
+        done = False
+
+        for epoch in range(self._ppo_epochs):
+            if done:
+                break
+            for batch in self._buffer.iter_minibatches(self._minibatch_size, self._device):
+                self._encode_batch(batch)
+
+                ret = batch['returns']
+                val = self._critic.value_batch(batch)
+                v_old = batch['values_old']
+                v_clipped = v_old + (val - v_old).clamp(-self._ppo_eps, self._ppo_eps)
+                critic_loss = 0.5 * torch.max(
+                    (val - ret) ** 2,
+                    (v_clipped - ret) ** 2,
+                ).mean()
+
+                self._critic_optimizer.zero_grad(set_to_none=True)
+                critic_loss.backward()
+
+                has_nan = any(
+                    torch.isnan(p.grad).any()
+                    for p in self._critic.parameters() if p.grad is not None
+                )
+                last_critic_grad = torch.nn.utils.clip_grad_norm_(
+                    self._critic.parameters(), max_norm=1.0
+                ).item()
+                if not has_nan:
+                    self._critic_optimizer.step()
+                else:
+                    logger.error(
+                        f'batch={batch_num} epoch={epoch} critic NaN gradient, skipping step'
+                    )
+
+                critic_accum += critic_loss.item()
                 val_det = val.detach()
                 critic_mae_accum += (val_det - ret).abs().mean().item()
                 critic_mean_accum += val_det.mean().item()
                 critic_std_accum += val_det.std().item()
-                n_updates += 1
+                n_critic_updates += 1
 
-        denom = max(n_updates, 1)
+        denom = max(n_critic_updates, 1)
         return {
-            'avg_kl': kl_accum / denom,
-            'avg_actor': actor_accum / denom,
             'avg_critic': critic_accum / denom,
-            'avg_entropy': entropy_accum / denom,
-            'avg_clip_frac': clip_frac_accum / denom,
             'avg_critic_mae': critic_mae_accum / denom,
             'avg_critic_mean': critic_mean_accum / denom,
             'avg_critic_std': critic_std_accum / denom,
-            'last_actor_grad': last_actor_grad,
             'last_critic_grad': last_critic_grad,
-            'n_updates': n_updates,
+            'n_critic_updates': n_critic_updates,
         }
 
     # ------------------------------------------------------------------
@@ -421,7 +465,7 @@ class PPOTrainer:
         )
 
         logger.debug(
-            f'batch={batch_num} n_updates={s["n_updates"]} '
+            f'batch={batch_num} n_actor={s["n_actor_updates"]} n_critic={s["n_critic_updates"]} '
             f'adv mean={self._buffer.raw_adv_mean:.4f} std={self._buffer.raw_adv_std:.4f} '
             f'ret mean={self._buffer.raw_ret_mean:.4f} std={self._buffer.raw_ret_std:.4f} '
             f'critic mean={s["avg_critic_mean"]:.4f} std={s["avg_critic_std"]:.4f} '
@@ -479,10 +523,10 @@ if __name__ == '__main__':
         'max_t': 1000,
         'gamma': 0.99,
         'lam': 0.95,
-        'ppo_epochs': 1,
+        'ppo_epochs': 4,
         'ppo_eps': 0.2,
         'minibatch_size': 64,
-        'lr_actor': 3e-4,
+        'lr_actor': 1e-4,
         'lr_critic': 3e-4,
         'action_space': environment.action_space.n,
         'hidden_dim': 64,
@@ -527,18 +571,20 @@ if __name__ == '__main__':
 
     warchest_policy = policy_constructor().to(device)
     warchest_critic = Critic(device=device, hidden_dim=hp['hidden_dim']).to(device)
-    warchest_optimizer = optim.Adam([
-        {'params': warchest_policy.board_encoder.parameters(), 'lr': hp['lr_actor']},
-        {'params': warchest_policy.unit_encoder.parameters(), 'lr': hp['lr_actor']},
-        {'params': warchest_policy.actor_head.parameters(), 'lr': hp['lr_actor']},
-        {'params': warchest_critic.parameters(), 'lr': hp['lr_critic']},
-    ])
+    actor_optimizer = optim.Adam(
+        list(warchest_policy.board_encoder.parameters())
+        + list(warchest_policy.unit_encoder.parameters())
+        + list(warchest_policy.actor_head.parameters()),
+        lr=hp['lr_actor'],
+    )
+    critic_optimizer = optim.Adam(warchest_critic.parameters(), lr=hp['lr_critic'])
 
     trainer = PPOTrainer(
         environment,
         warchest_policy,
         warchest_critic,
-        warchest_optimizer,
+        actor_optimizer,
+        critic_optimizer,
         policy_constructor,
         hp,
         device,
