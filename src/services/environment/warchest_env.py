@@ -28,8 +28,6 @@ MOVE_ACTION = 'move'
 
 MOVE_EXPLORE_REWARD_MAX_TURN = 5
 MOVE_EXPLORE_REWARD_PER_TURN = 0.1
-MOVE_ON_BASE_REWARD = 0.005
-MOVE_NEAR_BASE_REWARD = 0.001
 MOVE_NEG_REWARD_PER_TURN = -0.002
 INVALID_ACTION_REWARD = -0.02
 CLAIM_BASE_REWARD = 0.0  # direct claim reward removed; potential shaping handles base value
@@ -307,22 +305,8 @@ class WarChestEnv(gym.Env):
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False, txt_result=wrong_move_reason, is_valid=False)
         moving_unit.move(loc=end)
 
-        neg_reward = MOVE_NEG_REWARD_PER_TURN
         self.exploration_map_dict[self.active_player][end] += 1
-
-        base_approach_reward = 0
-        rows, cols = np.where(self.board.board == UNCONTROLLED_BASE_CELL_ID)
-        unclaimed_bases = list(zip(rows.tolist(), cols.tolist()))
-        if end in unclaimed_bases:
-            base_approach_reward = MOVE_ON_BASE_REWARD
-        else:
-            free_adjacent = self.board.get_free_adjacent_cells(*end)
-            for base_loc in unclaimed_bases:
-                if base_loc in free_adjacent:
-                    base_approach_reward = MOVE_NEAR_BASE_REWARD
-                    break
-        reward = neg_reward if base_approach_reward == 0 else base_approach_reward
-        return Action(reward=reward, finishes_game=False, txt_result='Move successful', is_valid=True)
+        return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False, txt_result='Move successful', is_valid=True)
 
     def get_move_action_id(self, start, end):
         unit_id = [u.loc for u in self.get_active_player_units()].index(start)

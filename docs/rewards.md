@@ -12,11 +12,9 @@
 | Truncation — tied bases | −0.5 |
 | Truncation — base deficit | −1.0 |
 | Invalid action attempt | −0.02 |
-| Move onto neutral base (UNCONTROLLED_BASE_CELL_ID) | +0.005 |
-| Move adjacent to neutral base | +0.001 |
-| Any other move (no base approach) | −0.002 |
+| Any move | −0.002 |
 
-Constants are defined at the top of `src/services/environment/warchest_env.py`. Raw environment rewards are augmented with potential-based shaping in `src/app/ppo.py` before being stored in the rollout buffer.
+Constants are defined at the top of `src/services/environment/warchest_env.py`. Raw environment rewards are augmented with potential-based shaping and a holding reward in `src/app/ppo.py` before being stored in the rollout buffer. Every move costs the same step penalty regardless of destination — directional pull toward bases is handled entirely by shaping and the holding reward.
 
 ### Potential-based reward shaping
 
@@ -27,21 +25,34 @@ shaped_r = r + gamma * phi(s_next) - phi(s)
 phi(s)   = SHAPING_C * (my_bases - opp_bases)    # SHAPING_C = 0.05
 ```
 
-This fires a positive pulse when gaining a base and a negative pulse when losing one. Advantages are z-scored batch-wide; returns are kept in the original reward scale.
+Fires a positive pulse (~+0.05) when the agent claims a neutral base and (~+0.10) when stealing an enemy base. Fires a negative pulse when the opponent claims. Advantages are z-scored batch-wide; returns are kept in the original reward scale.
+
+### Per-turn holding reward
+
+Applied by the training loop alongside shaping:
+
+```python
+holding_reward = holding_reward_rate * (my_bases - opp_bases)
+holding_reward_rate = WIN_REWARD / ((winning_base_count - 1) * (max_actions // 2)) * 0.8
+                    = 1.0 / (5 * 100) * 0.8 = 0.0016
+```
+
+Fires every agent turn proportional to the current base lead. Incentivises defending claimed bases and breaks the base-flip exploit (two policies claiming the same bases in a loop), where potential shaping alone produces near-zero net reward per cycle. The 0.8 factor is a safety margin ensuring worst-case accumulated holding (`0.0016 * 5 * 100 = 0.8`) never exceeds `WIN_REWARD = 1.0`. `holding_reward_rate` is derived from env constants at script startup so it stays valid if `max_actions` or `winning_base_count` change.
+
+Shaping and holding are complementary: shaping delivers an immediate, one-step credit signal at the claim action; holding creates persistent per-turn pressure that requires no bootstrapping.
 
 ### Implementation notes
 
-- The three move rewards are **mutually exclusive** per step. The code: `reward = neg_reward if base_approach_reward == 0 else base_approach_reward`. When a unit steps onto or adjacent to a neutral base, the `-0.002` step penalty is dropped, not added.
-- `MOVE_ON_BASE_REWARD` and `MOVE_NEAR_BASE_REWARD` only fire for `UNCONTROLLED_BASE_CELL_ID` (neutral bases). Moving onto an **enemy-controlled** base is treated as a regular move and receives `MOVE_NEG_REWARD_PER_TURN = -0.002`. This means stealing a base is momentarily penalised until the potential-shaping pulse arrives on the following step.
+- Every move returns `MOVE_NEG_REWARD_PER_TURN = -0.002` regardless of destination. The binary approach rewards (`MOVE_ON_BASE_REWARD`, `MOVE_NEAR_BASE_REWARD`) were removed: they created a bias toward neutral bases over enemy bases (which are strategically more valuable), and the holding reward + shaping now provide all directional pull needed.
 - An exploration bonus (`MOVE_EXPLORE_REWARD_MAX_TURN = 5`, `MOVE_EXPLORE_REWARD_PER_TURN = 0.1`) is defined as constants but is not wired into `perform_move_action`. The exploration map is updated every step for use in the observation, but no reward is computed from it.
-- `CLAIM_BASE_REWARD` is 0.0. A non-zero direct claim reward caused a circular-claiming exploit: the policy learned to claim bases back and forth with pool opponents, accumulating reward (up to ~5.0) far in excess of `WIN_REWARD = 1.0`. Potential shaping already handles base value correctly, so the direct reward is not needed.
+- `CLAIM_BASE_REWARD` is 0.0. A non-zero direct claim reward caused a circular-claiming exploit: the policy learned to claim bases back and forth with pool opponents, accumulating reward far in excess of `WIN_REWARD = 1.0`. Potential shaping and the holding reward handle base value correctly without this risk.
 
 ### Truncation reward
 
 When the episode truncates (`action_count >= max_actions = 200`), a terminal reward is added to the last main-actor step based on the base lead:
 
 ```python
-if my_bases > opp_bases:   trunc_reward = 0.0   # drew from a strong position
+if my_bases > opp_bases:    trunc_reward = 0.0   # drew from a strong position
 elif my_bases == opp_bases: trunc_reward = -0.5  # true draw
 else:                       trunc_reward = -1.0  # drew from a losing position
 ```
@@ -50,108 +61,86 @@ else:                       trunc_reward = -1.0  # drew from a losing position
 
 ## Ideas for denser rewards
 
-### ~~1. Per-turn base-lead bonus~~ *(ruled out — superseded by idea 3)*
+### ~~1. Per-turn base-lead bonus~~ ✅ implemented as holding reward
 
 ```python
-base_lead_reward = k * (my_bases - starting_bases)  # e.g. k = 0.01
+base_lead_reward = k * (my_bases - starting_bases)  # original formulation
 ```
 
-**Ruled out**: idea 3 covers the same intent with better theoretical properties.
+Implemented as `holding_reward_rate * (my_bases - opp_bases)` with a derived coefficient — see holding reward section above.
 
 ---
 
-### ~~2. Opponent-loss penalty (symmetric claiming)~~ *(ruled out — attribution problem)*
+### ~~2. Opponent-loss penalty (symmetric claiming)~~ *(ruled out — covered by holding reward)*
 
-**Ruled out**: the penalty would appear in the defender's trajectory at a timestep causally unrelated to the base loss. Idea 3 already covers this correctly via the potential term.
+**Ruled out**: the holding reward already penalises losing a base (reduces per-turn income). An explicit penalty at the opponent's action step would create attribution problems since the defender had no direct control over that timestep.
 
 ---
 
 ### 3. Potential-based reward shaping ✅ implemented
 
-A theoretically clean way to add dense rewards without changing the optimal policy (Ng et al. 1999). Define a potential:
-
-```python
-phi(s) = c * (my_bases - opp_bases)  # c = 0.05
-```
-
-Shaped reward at each step:
-
-```python
-r_shaped = r + gamma * phi(s_next) - phi(s)
-```
-
-The `gamma * phi(s') - phi(s)` terms telescope and nearly cancel over a full trajectory, leaving only boundary terms. The shaped rewards cannot make a losing strategy look better than a winning one in the long run.
+A theoretically clean way to add dense rewards without changing the optimal policy (Ng et al. 1999). The `gamma * phi(s') - phi(s)` terms telescope and nearly cancel over a full trajectory, leaving only boundary terms.
 
 ---
 
-### 4. Distance-to-objective shaping
-
-Reward units for reducing their distance to the nearest unclaimed or enemy base:
+### ~~4. Distance-to-objective shaping~~ *(not worth implementing — approach rewards removed)*
 
 ```python
 delta_dist = prev_min_dist_to_target - new_min_dist_to_target
-proximity_reward = k * delta_dist  # positive when closing in
+proximity_reward = k * delta_dist
 ```
 
-Requires BFS distance on the hex grid per step. Can create reward-hacking if the agent oscillates near a base without claiming.
+**Not worth it**: requires BFS on the hex grid every agent step (non-trivial cost on CPU). More importantly, `MOVE_ON_BASE_REWARD` and `MOVE_NEAR_BASE_REWARD` already provide a coarser version of this signal, and the holding reward creates pull toward bases via future value. The oscillation exploit risk (agent bouncing near a base to farm the reward) is real. Better to improve the critic so it bootstraps the holding reward correctly.
 
 ---
 
-### 5. Graduated distance reward (replaces binary near/on)
+### ~~5. Graduated distance reward~~ *(superseded — approach rewards removed)*
 
-Replace the current binary `MOVE_ON_BASE_REWARD` / `MOVE_NEAR_BASE_REWARD` with a smooth gradient:
+Was a proposed replacement for the binary `MOVE_ON_BASE_REWARD` / `MOVE_NEAR_BASE_REWARD`. Both the binary approach and this graduated version were removed in favour of letting the holding reward and shaping handle all directional pull. Avoids the neutral-vs-enemy base bias entirely.
+
+---
+
+### ~~6. Re-enable exploration reward~~ *(not worth implementing)*
 
 ```python
-min_dist = min(hex_distance(unit_loc, base) for base in unclaimed_bases)
-proximity_reward = k / (1 + min_dist)  # e.g. k = 0.005
+explore_reward = max(0, MOVE_EXPLORE_REWARD_PER_TURN * (MOVE_EXPLORE_REWARD_MAX_TURN - visit_count[end]))
 ```
+
+**Not worth it**: the board is small (7×7 hex, ~37 valid cells) and the policy needs to focus on objectives, not coverage. With only 2 units per player, coverage is not a bottleneck. An exploration bonus would distract from the objective-focused rewards already in place.
 
 ---
 
-### 6. Re-enable exploration reward
-
-The commented-out code in `perform_move_action` gives a bonus for visiting new cells:
-
-```python
-explore_multiplier = MOVE_EXPLORE_REWARD_MAX_TURN - visit_count[end]
-explore_reward = max(0, MOVE_EXPLORE_REWARD_PER_TURN * explore_multiplier)
-```
-
-Decays to zero after 5 visits, so it fires mostly in the early game.
-
----
-
-### 7. Win-speed bonus
-
-Scale the terminal win reward by how quickly the game ends:
+### ~~7. Win-speed bonus~~ *(not needed)*
 
 ```python
 win_reward = WIN_REWARD + speed_bonus * (max_actions - action_count) / max_actions
 ```
 
+**Not needed**: γ=0.99 discounting already makes winning sooner better than accumulating future holding rewards. The step penalty (`-0.002` per move) adds further pressure. Verified: winning at turn 70 gives `1.0` vs holding 65 more agent turns then winning gives `≈0.83` net present value.
+
 ---
 
-### 8. Base-capture sequence reward
-
-Small incremental bonuses for the full capture sequence — adjacent → on → claim:
+### ~~8. Base-capture sequence reward~~ *(not worth implementing)*
 
 ```python
 MOVE_ADJACENT_TO_UNCLAIMED = +0.002
 MOVE_ONTO_UNCLAIMED        = +0.008
-CLAIM_UNCLAIMED            = +0.15   # if direct claim reward is restored
+CLAIM_UNCLAIMED            = +0.15
 ```
+
+**Not worth it**: restoring a non-zero `CLAIM_BASE_REWARD` risks the circular-claiming exploit. The potential shaping and holding reward already incentivise the full capture sequence without the exploit risk.
 
 ---
 
 ## Implementation priority
 
-| Idea | Difficulty | Expected impact | Notes |
-|---|---|---|---|
-| ~~Per-turn base-lead bonus (1)~~ | — | — | Ruled out; superseded by idea 3 |
-| Potential-based shaping (3) | Low | High | ✅ Implemented |
-| ~~Opponent-loss penalty (2)~~ | — | — | Ruled out; attribution problem, covered by idea 3 |
-| Re-enable exploration (6) | Low | Medium | Already implemented, just uncomment |
-| Graduated distance reward (5) | Medium | Medium | Replaces current binary approach |
-| Distance-to-objective (4) | Medium | Medium | Requires BFS per step |
-| Win-speed bonus (7) | Low | Low | Polish after policy learns basics |
-| Sequence reward (8) | Low | Low | Only relevant if direct claim reward is restored |
+| Idea | Status | Notes |
+|---|---|---|
+| Per-turn base-lead bonus (1) | ✅ Implemented | As holding reward |
+| Potential-based shaping (3) | ✅ Implemented | |
+| Opponent-loss penalty (2) | Ruled out | Covered by holding reward |
+| Graduated distance reward (5) | Superseded | Approach rewards removed entirely |
+| Distance-to-objective (4) | Not worth it | BFS cost + oscillation risk, approach rewards removed |
+| Re-enable exploration (6) | Not worth it | Board too small, distracts from objectives |
+| Win-speed bonus (7) | Not needed | Covered by γ discounting + step penalty |
+| Sequence reward (8) | Not worth it | Exploit risk, covered by shaping + holding |

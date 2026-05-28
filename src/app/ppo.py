@@ -49,7 +49,6 @@ class PPOTrainer:
     """PPO training loop for Warchest."""
 
     KL_TARGET = 0.015  # stop PPO epoch early if per-minibatch approx-KL exceeds this
-    ENTROPY_COEFF = 0.005
 
     def __init__(self, env, policy, critic, actor_optimizer, critic_optimizer, policy_constructor, hp, device):
         # environment and models
@@ -69,6 +68,8 @@ class PPOTrainer:
         self._lam = hp['lam']
         self._ppo_epochs = hp['ppo_epochs']
         self._ppo_eps = hp['ppo_eps']
+        self._entropy_coeff = hp['entropy_coeff']
+        self._holding_reward_rate = hp['holding_reward_rate']
         self._minibatch_size = hp['minibatch_size']
         self._print_every = hp['print_every']
         self._eval_every = hp.get('eval_every', 10)
@@ -88,7 +89,7 @@ class PPOTrainer:
         # training-lifetime state (persists across batches)
         self._pool = OpponentPool(
             max_size=20,
-            snapshot_every=1,
+            snapshot_every=3,
             p_random=hp['p_random_initial'],
             p_greedy=hp['p_greedy_initial'],
             p_pool=hp['p_pool_initial'],
@@ -161,10 +162,11 @@ class PPOTrainer:
                 with torch.no_grad():
                     value = self._critic.value_single(obs_before)
 
-                phi_before = SHAPING_C * (
-                    len(self._env.board.get_controlled_bases(main_pid))
-                    - len(self._env.board.get_controlled_bases(3 - main_pid))
-                )
+                my_bases = len(self._env.board.get_controlled_bases(main_pid))
+                opp_bases = len(self._env.board.get_controlled_bases(3 - main_pid))
+                base_diff = my_bases - opp_bases
+                phi_before = SHAPING_C * base_diff
+                holding_reward = self._holding_reward_rate * base_diff
                 state, reward, terminated, truncated, step_info = self._env.step(action)
 
                 if not step_info['action'].is_valid:
@@ -178,7 +180,7 @@ class PPOTrainer:
                     len(self._env.board.get_controlled_bases(main_pid))
                     - len(self._env.board.get_controlled_bases(3 - main_pid))
                 )
-                shaped_reward = reward + self._gamma * phi_after - phi_before
+                shaped_reward = reward + self._gamma * phi_after - phi_before + holding_reward
                 main_score += shaped_reward
 
                 if step_info['action'].type == CLAIM_BASE_ACTION and step_info['action'].is_valid:
@@ -269,7 +271,7 @@ class PPOTrainer:
                 adv = batch['advantages']
                 clipped_ratio = ratio.clamp(1 - self._ppo_eps, 1 + self._ppo_eps)
                 actor_loss = -torch.min(ratio * adv, clipped_ratio * adv).mean()
-                loss = actor_loss - self.ENTROPY_COEFF * ent.mean()
+                loss = actor_loss - self._entropy_coeff * ent.mean()
 
                 self._actor_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -517,6 +519,12 @@ if __name__ == '__main__':
 
     environment = WarChestEnv(save_game_history=False, debug_mode=False)
 
+    holding_reward_rate = (
+        WIN_REWARD
+        / ((environment.winning_base_count - 1) * (environment.max_actions // 2))
+        * 0.8  # 0.8 is a safety margin so worst-case holding never exceeds WIN_REWARD
+    )
+
     hp = {
         'n_batches': 300,
         'collect_episodes': 16,
@@ -525,6 +533,8 @@ if __name__ == '__main__':
         'lam': 0.95,
         'ppo_epochs': 4,
         'ppo_eps': 0.2,
+        'entropy_coeff': 0.025,
+        'holding_reward_rate': holding_reward_rate,
         'minibatch_size': 64,
         'lr_actor': 1e-4,
         'lr_critic': 3e-4,
