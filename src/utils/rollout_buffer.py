@@ -15,16 +15,18 @@ class RolloutBuffer:
         self._log_probs_old = []
         self._rewards = []
         self._values = []
+        self._opp_onehots = []
         self._episode_ends = []
         self.advantages = None
         self.returns = None
 
-    def add_step(self, obs, action, log_prob, reward, value):
+    def add_step(self, obs, action, log_prob, reward, value, opp_onehot):
         self._obs.append(obs)
         self._actions.append(action)
         self._log_probs_old.append(log_prob.detach().cpu())
         self._rewards.append(float(reward))
         self._values.append(value.detach().cpu())
+        self._opp_onehots.append(opp_onehot)
 
     def end_episode(self):
         """Mark the end of the current episode for GAE boundary tracking."""
@@ -102,6 +104,9 @@ class RolloutBuffer:
                 np.stack([obs[i]['valid_action_mask'].astype(bool) for i in perm]),
                 dtype=torch.bool,
             ).to(device),
+            'opp_onehot': torch.tensor(
+                np.stack([self._opp_onehots[i] for i in perm]), dtype=torch.float32
+            ).to(device),
             'actions': torch.tensor(
                 [self._actions[i] for i in perm], dtype=torch.long
             ).to(device),
@@ -139,6 +144,9 @@ class RolloutBuffer:
                     np.stack([obs[i]['valid_action_mask'].astype(bool) for i in idx]),
                     dtype=torch.bool,
                 ).to(device),
+                'opp_onehot': torch.tensor(
+                    np.stack([self._opp_onehots[i] for i in idx]), dtype=torch.float32
+                ).to(device),
                 'actions': torch.tensor(
                     [self._actions[i] for i in idx], dtype=torch.long
                 ).to(device),
@@ -161,7 +169,15 @@ class RolloutBuffer:
             )
 
     def clear(self):
-        self.__init__()
+        self._obs.clear()
+        self._actions.clear()
+        self._log_probs_old.clear()
+        self._rewards.clear()
+        self._values.clear()
+        self._opp_onehots.clear()
+        self._episode_ends.clear()
+        self.advantages = None
+        self.returns = None
 
     def __len__(self):
         return len(self._obs)

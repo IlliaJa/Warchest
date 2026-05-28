@@ -1,3 +1,6 @@
+import argparse
+import glob
+import os
 import numpy as np
 
 import torch
@@ -62,10 +65,11 @@ def play_ai_vs_ai(_env, policy):
     rewards = []
     while True:
         action, _, _ = policy.act(_state)
-        _state, reward, terminated, truncated, info = _env.step(action)
+        env_action = WarChestEnv.remap_action(action) if _env.active_player == 2 else action
+        _state, reward, terminated, truncated, info = _env.step(env_action)
         rewards.append(reward)
         if not info['action'].is_valid:
-            raise ValueError('Invalid action taken by the agent')
+            _state, reward, terminated, truncated, info = _env.make_random_step()
 
         if terminated or truncated:
             print('AI vs AI game is finished')
@@ -73,22 +77,34 @@ def play_ai_vs_ai(_env, policy):
     return _env, rewards
 
 
+def _find_latest_model() -> str:
+    candidates = sorted(glob.glob('data/warchest_ppo_*.pth'))
+    if not candidates:
+        raise FileNotFoundError('No models found in data/warchest_ppo_*.pth')
+    return candidates[-1]
+
+
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Evaluate a saved Warchest policy.')
+    parser.add_argument('--model-path', type=str, default=None,
+                        help='Path to .pth file. Defaults to the latest data/warchest_ppo_*.pth.')
+    args = parser.parse_args()
+
+    model_path = args.model_path or _find_latest_model()
+    print(f'Loading model: {model_path}')
+
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print('Using device:', device)
 
     env = WarChestEnv(save_game_history=True, debug_mode=False)
     state, _ = env.reset()
 
-    training_hyperparameters = {
-        'hidden_dim': 64
-    }
-
     warchest_policy = Policy(
         action_dim=env.action_space.n,
         device=device,
-        hidden_dim=training_hyperparameters["hidden_dim"]).to(device)
-    warchest_policy.load_state_dict(torch.load('data/warchest_ppo_20260528-1116.pth'))
+        hidden_dim=64,
+    ).to(device)
+    warchest_policy.load_state_dict(torch.load(model_path, map_location=device))
     warchest_policy.eval()
 
     # Evaluate the agent

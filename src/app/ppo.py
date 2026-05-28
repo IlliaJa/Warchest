@@ -20,7 +20,41 @@ from src.utils.elo import EloTracker
 SHAPING_C = 0.05
 use_wandb = False
 
+OPP_TYPE_IDX = {'random': 0, 'greedy': 1, 'pool': 2}
+
 logger = logging.getLogger('warchest')
+
+
+class ReturnNormalizer:
+    """Exponential moving average of return mean/std for critic target whitening (A2).
+
+    The critic is trained on normalised returns so its loss scale stays stable as the
+    return distribution shifts. At rollout time the critic output is denormalised before
+    being stored as V in the buffer, keeping GAE in the original reward scale.
+    """
+
+    def __init__(self, alpha=0.1):
+        self._alpha = alpha
+        self._mean = 0.0
+        self._std = 1.0
+        self._initialised = False
+
+    def update(self, returns_tensor):
+        m = returns_tensor.mean().item()
+        s = max(returns_tensor.std().item(), 1e-6)
+        if not self._initialised:
+            self._mean = m
+            self._std = s
+            self._initialised = True
+        else:
+            self._mean = (1 - self._alpha) * self._mean + self._alpha * m
+            self._std = max((1 - self._alpha) * self._std + self._alpha * s, 1e-6)
+
+    def normalize(self, x):
+        return (x - self._mean) / self._std
+
+    def denormalize(self, x):
+        return x * self._std + self._mean
 
 
 def setup_run_logger(run_id: str) -> None:
@@ -108,6 +142,8 @@ class PPOTrainer:
             + list(self._policy.actor_head.parameters())
         )
 
+        self._ret_normalizer = ReturnNormalizer()
+
         # batch-temporary; written by _collect_batch, read by _log_batch
         self._batch_eps: list = []
         self._batch_start: float = 0.0
@@ -138,12 +174,12 @@ class PPOTrainer:
         for _ in range(self._collect_episodes):
             main_pid = np.random.choice([1, 2])
             opp, opp_type = self._pool.sample(self._policy_constructor, self._device)
-            ep = self._collect_episode(opp, main_pid)
-            ep['opp_type'] = opp_type
+            ep = self._collect_episode(opp, main_pid, opp_type)
             self._batch_eps.append(ep)
         self._buffer.compute_gae(self._gamma, self._lam, self._device)
+        self._ret_normalizer.update(self._buffer.returns)
 
-    def _collect_episode(self, opp, main_pid) -> dict:
+    def _collect_episode(self, opp, main_pid, opp_type) -> dict:
         """Run one episode; append main-actor steps to the buffer."""
         state, _ = self._env.reset()
         outcome = 'truncated'
@@ -151,6 +187,10 @@ class PPOTrainer:
         claims = 0
         main_score = 0.0
         turns = 0
+
+        opp_onehot = np.zeros(len(OPP_TYPE_IDX), dtype=np.float32)
+        opp_onehot[OPP_TYPE_IDX[opp_type]] = 1.0
+        opp_onehot_t = torch.tensor(opp_onehot, dtype=torch.float32).unsqueeze(0).to(self._device)
 
         for turn in range(self._max_t):
             acting_pid = self._env.active_player
@@ -160,7 +200,11 @@ class PPOTrainer:
                 obs_before = copy_obs(state)
                 action, log_prob, _ = self._policy.act(obs_before)
                 with torch.no_grad():
-                    value = self._critic.value_single(obs_before)
+                    value_norm = self._critic.value_single(obs_before, opp_onehot_t)
+                    value = torch.tensor(
+                        self._ret_normalizer.denormalize(value_norm.item()),
+                        dtype=torch.float32,
+                    ).to(self._device)
 
                 my_bases = len(self._env.board.get_controlled_bases(main_pid))
                 opp_bases = len(self._env.board.get_controlled_bases(3 - main_pid))
@@ -191,7 +235,7 @@ class PPOTrainer:
                 if step_info['action'].type == CLAIM_BASE_ACTION and step_info['action'].is_valid:
                     claims += 1
 
-                self._buffer.add_step(obs_before, action, log_prob, shaped_reward, value)
+                self._buffer.add_step(obs_before, action, log_prob, shaped_reward, value, opp_onehot)
             else:
                 with torch.no_grad():
                     action, _, _ = opp.act(state)
@@ -233,6 +277,7 @@ class PPOTrainer:
             'claims': claims,
             'main_score': main_score,
             'main_pid': main_pid,
+            'opp_type': opp_type,
         }
 
     # ------------------------------------------------------------------
@@ -332,12 +377,14 @@ class PPOTrainer:
                 self._encode_batch(batch)
 
                 ret = batch['returns']
-                val = self._critic.value_batch(batch)
-                v_old = batch['values_old']
-                v_clipped = v_old + (val - v_old).clamp(-self._ppo_eps, self._ppo_eps)
+                ret_n = self._ret_normalizer.normalize(ret)
+                v_old_n = self._ret_normalizer.normalize(batch['values_old'])
+
+                val_n = self._critic.value_batch(batch)
+                v_clipped_n = v_old_n + (val_n - v_old_n).clamp(-self._ppo_eps, self._ppo_eps)
                 critic_loss = 0.5 * torch.max(
-                    (val - ret) ** 2,
-                    (v_clipped - ret) ** 2,
+                    (val_n - ret_n) ** 2,
+                    (v_clipped_n - ret_n) ** 2,
                 ).mean()
 
                 self._critic_optimizer.zero_grad(set_to_none=True)
@@ -358,10 +405,11 @@ class PPOTrainer:
                     )
 
                 critic_accum += critic_loss.item()
-                val_det = val.detach()
-                critic_mae_accum += (val_det - ret).abs().mean().item()
-                critic_mean_accum += val_det.mean().item()
-                critic_std_accum += val_det.std().item()
+                # MAE and stats logged in raw return scale for comparability across runs
+                val_raw = self._ret_normalizer.denormalize(val_n.detach())
+                critic_mae_accum += (val_raw - ret).abs().mean().item()
+                critic_mean_accum += val_raw.mean().item()
+                critic_std_accum += val_raw.std().item()
                 n_critic_updates += 1
 
         denom = max(n_critic_updates, 1)
@@ -430,7 +478,6 @@ class PPOTrainer:
         if use_wandb:
             wandb.log({
                 'elo_policy': elo_pol,
-                'elo_greedy': elo_grdy,
                 'wr_vs_greedy_eval': greedy_wins / self._eval_episodes,
                 'wr_vs_random_eval': wr_random_eval,
             })
@@ -508,11 +555,7 @@ class PPOTrainer:
                 'grad_norm_critic': s['last_critic_grad'],
                 'clip_frac': s['avg_clip_frac'],
                 'critic_mae': s['avg_critic_mae'],
-                'critic_mean': s['avg_critic_mean'],
-                'critic_std': s['avg_critic_std'],
                 'advantage_std': self._buffer.raw_adv_std,
-                'return_mean': self._buffer.raw_ret_mean,
-                'return_std': self._buffer.raw_ret_std,
                 'avg_turns': avg_turns,
             })
 

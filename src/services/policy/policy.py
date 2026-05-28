@@ -146,9 +146,12 @@ class Policy(nn.Module):
 class Critic(nn.Module):
     """Separate value network with its own spatial and unit encoders.
 
-    Independent encoders let the critic develop value-optimized representations
-    without conflicting with the actor's policy gradient.
+    Privileged at training time: receives a 3-d opponent one-hot (random/greedy/pool)
+    that the policy never sees. This eliminates ~0.2 of irreducible MAE that comes from
+    the critic averaging over opponents with different return distributions.
     """
+
+    OPP_DIM = 3  # random / greedy / pool
 
     def __init__(self, device, hidden_dim=128):
         super().__init__()
@@ -165,33 +168,38 @@ class Critic(nn.Module):
             nn.ReLU(),
             nn.Linear(16, 32),
         )
+        head_in = hidden_dim + 3 + 64 + self.OPP_DIM
         self.head = nn.Sequential(
-            nn.Linear(hidden_dim + 3 + 64, hidden_dim),
+            nn.Linear(head_in, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
         )
         self.device = device
 
-    def _forward(self, board_enc, global_feats, units):
+    def _forward(self, board_enc, global_feats, units, opp_onehot):
         N = units.shape[0]
         board_features = self.board_encoder(board_enc)
         encoded = self.unit_encoder(units.view(N * 4, 2)).view(N, 2, 2, -1)
         unit_features = torch.cat([encoded[:, 0].mean(1), encoded[:, 1].mean(1)], dim=-1)
         return self.head(
-            torch.cat([board_features, global_feats, unit_features], dim=-1)
+            torch.cat([board_features, global_feats, unit_features, opp_onehot], dim=-1)
         ).squeeze(-1)
 
-    def value_single(self, obs):
-        """V(s) for one raw observation dict (used during rollout collection)."""
+    def value_single(self, obs, opp_onehot):
+        """V(s) for one raw observation dict. opp_onehot: (1, OPP_DIM) tensor on device."""
         board = Policy.encode_board(obs['board'], obs['exploration_map'], obs['active_player'])
         board_t = torch.tensor(board, dtype=torch.float32).unsqueeze(0).to(self.device)
         global_t = torch.tensor(obs['global'].astype(float), dtype=torch.float32).unsqueeze(0).to(self.device)
         units_t = torch.tensor(obs['units'], dtype=torch.float32).unsqueeze(0).to(self.device)
-        return self._forward(board_t, global_t, units_t).squeeze(0)
+        return self._forward(board_t, global_t, units_t, opp_onehot).squeeze(0)
 
     def value_batch(self, batch):
         """V(s) for a pre-encoded batch (used during PPO update).
 
-        Expects batch['board'] (N,6,7,7), batch['global'] (N,3), batch['units'] (N,2,2,2).
+        Expects batch keys: board (N,6,7,7), global (N,3), units (N,2,2,2), opp_onehot (N,3).
         """
-        return self._forward(batch['board'], batch['global'], batch['units'])
+        return self._forward(batch['board'], batch['global'], batch['units'], batch['opp_onehot'])

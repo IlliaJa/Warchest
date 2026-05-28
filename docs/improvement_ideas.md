@@ -26,7 +26,7 @@ The fixes below are ordered by **impact-per-effort**, not by safety. The top six
 | Entropy collapses fast | C1 (only 1 epoch but full minibatch sweep), C7 (entropy coeff too low for the amount of clipping happening), C6 (board not mirror-encoded → policy collapses to one perspective faster) |
 | Gradient norms not descending / large spikes | C4 (advantages noisy → loss noisy), C5 (no value clipping), C8 (no LR decay) |
 | WR vs random oscillates 0.7–0.95 (never reliably >= 0.9) | C6 (no board mirroring → each perspective half-trained), C3 (pool overwrites old snapshots, fine-tune never triggers) |
-| WR vs greedy plateaus at 0.05–0.15 | C9 (no mid-game shaping signal for stealing enemy bases), C1 (PPO underused), C10 (no greedy-specific curriculum) |
+| WR vs greedy plateaus at 0.05–0.15 | C9 (no mid-game shaping signal for stealing enemy bases), C1 (PPO underused) |
 | Two `critic_std=nan` events (batches 133, 143) | C5 (no value clipping + occasional outlier return) |
 | Score regresses after batch 130 | C3 + C2 + C1 stacked: small noisy gradient + drifting opponent pool + drifting `action_count` input |
 
@@ -129,7 +129,7 @@ This is the same class of bug previously fixed for the units / global features (
 
 ## Tier 2 — important tuning
 
-### C7. **Entropy coefficient too low for how aggressively the masked softmax pushes entropy down.**
+### C7. ✅ **Entropy coefficient too low for how aggressively the masked softmax pushes entropy down.**
 
 **Evidence.** Entropy goes 2.18 → ~0.78 by batch 188. Effective action space (masked) is typically 5–8, so max-entropy bound is `ln(8) ≈ 2.08`. Final entropy of 0.78 means the policy has roughly 2 effective actions per state — that's premature commitment given WR vs greedy is only 0.10. With `ENTROPY_COEFF=0.005` and `ent ≈ 1.0`, the entropy bonus is 0.005 in loss-units, while actor loss magnitude is `1e-3` to `5e-2`. The bonus is meaningful at the start but quickly outscaled by the actor loss; if you increase `ppo_epochs` (C1), the entropy will collapse even faster.
 
@@ -161,23 +161,32 @@ This is the same class of bug previously fixed for the units / global features (
 
 ---
 
-### C10. **Critic and actor encoders are not shared.**
+### C10. ~~**Critic and actor encoders are not shared.**~~ **— OBSOLETE**
 
-**Evidence.** `Policy` has its own `board_encoder` + `unit_encoder`; `Critic` has independent copies. The docstring justifies it ("Independent encoders let the critic develop value-optimized representations"), but in practice:
-- the actor encoder *never* sees value gradients (only policy gradients, which are small) → its features are slow to converge;
-- the critic encoder *never* sees policy gradients → it can't focus on what matters for action selection;
-- each encoder has ~200K params (Linear(3136, 64)); training two of them on a small dataset doubles the data needed.
+**Status (2026-05-28): superseded.** This recommendation predates the current design and would actively interact badly with it. See `docs/rl_algorithms.md` → *Architecture: shared vs separate actor-critic encoders* for the full analysis. Summary of why sharing is no longer the right call:
 
-Standard PPO shares a trunk and forks at the last layer. This is also what MOST AlphaZero-style work does (a single trunk feeding two heads).
+- the critic now takes a privileged `opp_onehot` input the actor must not see — a shared encoder leaks opponent-conditional features into the actor;
+- `lr_actor=1e-4` vs `lr_critic=3e-4` cannot both be honoured on a shared trunk;
+- the actor has an independent KL early-stop (`KL_TARGET=0.015`) which the critic does not — a combined loss cannot stop one without the other;
+- two disjoint `Adam` instances over disjoint param sets make the partition typecheck-visible; the previous shared-trunk version with a single optimiser had several failure modes around which params actually get stepped.
 
-**Fix.** Share `board_encoder + unit_encoder` between Policy and Critic. Add a `value_head` to Policy (or have Critic accept already-encoded features). Re-tune `lr` slightly because the trunk now sees a sum of two gradient sources.
+The ~30% sample-efficiency claim below assumed a setup this codebase no longer has. Original analysis preserved for context:
 
-**Implementation difficulty.** Medium — refactor Policy/Critic class boundary, but maybe 50 lines of code. Will need to verify training stability.
-**Expected effect.** Faster convergence (~30% fewer batches to reach the same WR), better critic accuracy. This is the single architectural change most likely to lift the WR ceiling vs greedy.
+> **Evidence.** `Policy` has its own `board_encoder` + `unit_encoder`; `Critic` has independent copies. The docstring justifies it ("Independent encoders let the critic develop value-optimized representations"), but in practice:
+> - the actor encoder *never* sees value gradients (only policy gradients, which are small) → its features are slow to converge;
+> - the critic encoder *never* sees policy gradients → it can't focus on what matters for action selection;
+> - each encoder has ~200K params (Linear(3136, 64)); training two of them on a small dataset doubles the data needed.
+>
+> Standard PPO shares a trunk and forks at the last layer. This is also what MOST AlphaZero-style work does (a single trunk feeding two heads).
+>
+> **Fix.** Share `board_encoder + unit_encoder` between Policy and Critic. Add a `value_head` to Policy (or have Critic accept already-encoded features). Re-tune `lr` slightly because the trunk now sees a sum of two gradient sources.
+>
+> **Implementation difficulty.** Medium — refactor Policy/Critic class boundary, but maybe 50 lines of code. Will need to verify training stability.
+> **Expected effect.** Faster convergence (~30% fewer batches to reach the same WR), better critic accuracy. This is the single architectural change most likely to lift the WR ceiling vs greedy.
 
 ---
 
-### C11. **Hidden dim 64 is small for a 7×7 board with 14 actions.**
+### C11. ✅ **Hidden dim 64 is small for a 7×7 board with 14 actions.**
 
 **Evidence.** `hidden_dim=64`. Board encoder projects `64*7*7 = 3136 → 64`, a 49× compression. That's a hard bottleneck. The actor head then expands back to 128 before predicting 14 logits.
 
@@ -253,9 +262,9 @@ If you only do four things, do these (in this order):
 3. **C3 — fix opponent pool diversity + fine-tune phase trigger** *(2 hours)*. Stabilises the return distribution so the critic can actually converge, and forces more greedy exposure in training.
 4. **C6 — board mirror equivariance** *(2 hours)*. Doubles data efficiency for every state.
 
-After those: C5, C7, C10. Then re-measure and decide whether you need C13–C15.
+After those: C5, C7, C11. Then re-measure and decide whether you need C13–C15. (C10 is superseded — see header.)
 
-If after C1+C2+C3+C6 you are still under 30% WR vs greedy at the *end* of a 300-batch run, the bottleneck is most likely architectural — go to C10 (shared trunk) and C11 (hidden_dim=128).
+If after C1+C2+C3+C6 you are still under 30% WR vs greedy at the *end* of a 300-batch run, the bottleneck is most likely architectural — go to C11 (hidden_dim=128) and C13 (hex-aware encoder). Do **not** revisit shared encoders — see `docs/rl_algorithms.md` → *Architecture: shared vs separate actor-critic encoders*.
 
 If you want a step-change rather than incremental improvements, skip to C14 (DQN) or C15 (MCTS) — but only after the foundational fixes, because both reuse the encoder.
 
