@@ -6,15 +6,51 @@ from torch.distributions import Categorical
 from ..environment.cell_ids import *
 
 
+class HexConv2d(nn.Module):
+    """Topology-correct convolution for hex grids stored in a 2D axial array.
+
+    Equivalent to a 3×3 conv with padding=1, except the receptive field is the
+    6 hex neighbours plus center (7 cells) instead of all 9 grid cells. Two
+    anti-diagonal positions — (-1, +1) and (+1, -1) in (Δr, Δq) — are not
+    hex-adjacent under the axial convention in Board.offsets, so they are
+    excluded from the kernel.
+
+    Window index map for the 3×3 patch returned by F.unfold (row-major):
+        0: (-1,-1)  hex       3: ( 0,-1)  hex       6: (+1,-1)  excluded
+        1: (-1, 0)  hex       4: ( 0, 0)  center    7: (+1, 0)  hex
+        2: (-1,+1)  excluded  5: ( 0,+1)  hex       8: (+1,+1)  hex
+    """
+
+    HEX_INDICES = (0, 1, 3, 4, 5, 7, 8)
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.proj = nn.Conv2d(in_channels * 7, out_channels, kernel_size=1)
+        self.register_buffer(
+            '_hex_idx',
+            torch.tensor(self.HEX_INDICES, dtype=torch.long),
+            persistent=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        n, c, h, w = x.shape
+        unfolded = F.unfold(x, kernel_size=3, padding=1).view(n, c, 9, h, w)
+        hex_window = unfolded.index_select(dim=2, index=self._hex_idx)
+        hex_window = hex_window.reshape(n, c * 7, h, w)
+        return self.proj(hex_window)
+
+
 class Policy(nn.Module):
     def __init__(self, action_dim, device, hidden_dim=128):
         super(Policy, self).__init__()
 
-        # Board encoder (CNN for spatial data)
+        # Board encoder (hex-correct CNN for spatial data)
         self.board_encoder = nn.Sequential(
-            nn.Conv2d(in_channels=6, out_channels=32, kernel_size=3, padding=1),
+            HexConv2d(in_channels=6, out_channels=32),
             nn.ReLU(),
-            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
+            HexConv2d(in_channels=32, out_channels=64),
             nn.ReLU(),
             nn.Flatten(),
             nn.Linear(64 * 7 * 7, hidden_dim)
@@ -156,9 +192,9 @@ class Critic(nn.Module):
     def __init__(self, device, hidden_dim=128):
         super().__init__()
         self.board_encoder = nn.Sequential(
-            nn.Conv2d(6, 32, 3, padding=1),
+            HexConv2d(6, 32),
             nn.ReLU(),
-            nn.Conv2d(32, 64, 3, padding=1),
+            HexConv2d(32, 64),
             nn.ReLU(),
             nn.Flatten(),
             nn.Linear(64 * 7 * 7, hidden_dim),

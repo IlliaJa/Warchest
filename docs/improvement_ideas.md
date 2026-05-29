@@ -210,7 +210,7 @@ The ~30% sample-efficiency claim below assumed a setup this codebase no longer h
 
 ## Tier 3 — bigger restructuring (optional, high-payoff)
 
-### C13. **Switch to a hex-aware encoder (or just a flat MLP).**
+### C13. ✅ **Switch to a hex-aware encoder (or just a flat MLP).** *(Done 2026-05-28 via `HexConv2d` in `src/services/policy/policy.py`; see `docs/decision.md`.)*
 
 **Evidence.** `Policy.board_encoder` uses 3×3 2D convolutions on a hex grid stored in a square array. The 3×3 kernel sees diagonals that aren't hex neighbours and misses one hex neighbour. For 7×7 = 49 cells × 6 channels = 294 inputs, even a flat MLP with one hidden layer of 256 has ~75K params — quite trainable, and topology-correct by definition.
 

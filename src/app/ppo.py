@@ -580,7 +580,7 @@ if __name__ == '__main__':
     )
 
     hp = {
-        'n_batches': 300,
+        'n_batches': 600,
         'collect_episodes': 16,
         'max_t': 1000,
         'gamma': 0.99,
