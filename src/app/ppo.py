@@ -12,6 +12,7 @@ import wandb
 
 from src.services.policy.policy import Policy, Critic
 from src.services.environment.warchest_env import WarChestEnv, WIN_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION, DEPLOY_ACTION
+from src.services.environment.game_state import DECK
 from src.services.opponent_pool import OpponentPool
 from src.utils.rollout_buffer import RolloutBuffer
 from src.services.bots import GreedyBot, RandomBot
@@ -573,9 +574,11 @@ if __name__ == '__main__':
 
     environment = WarChestEnv(save_game_history=False, debug_mode=False)
 
+    # The main player empties its full hand each round, so its lifetime action count
+    # is about max_rounds * coins-per-round.
     holding_reward_rate = (
         WIN_REWARD
-        / ((environment.winning_base_count - 1) * (environment.max_actions // 2))
+        / ((environment.winning_base_count - 1) * (environment.max_rounds * len(DECK)))
         * 0.8  # 0.8 is a safety margin so worst-case holding never exceeds WIN_REWARD
     )
 

@@ -3,7 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from ..environment.warchest_env import N_VERBS, BOARD_DIM, ACTION_SPACE_SIZE, GLOBAL_DIM
+from ..environment.warchest_env import (
+    N_VERBS, BOARD_DIM, ACTION_SPACE_SIZE, GLOBAL_DIM,
+    BOARD_CHANNELS, SPATIAL_SIZE, FACEDOWN_SIZE,
+)
 
 
 class HexConv2d(nn.Module):
@@ -43,26 +46,29 @@ class HexConv2d(nn.Module):
 
 
 class Policy(nn.Module):
-    """Actor network with a spatial cell-keyed convolutional head.
+    """Actor network with a spatial cell-keyed convolutional head plus a small
+    non-spatial head for the coin-only (face-down) actions.
 
-    Board trunk: HexConv2d stack on 8 input planes → [B, Cf, 7, 7] feature map.
+    Board trunk: HexConv2d stack on BOARD_CHANNELS input planes → [B, Cf, 7, 7].
     Global features are broadcast as extra planes (tiled over the grid) and
-    concatenated with the trunk output before the policy head.
-    Policy head: 1×1 Conv2d → [B, N_VERBS, 7, 7] logit map, flattened to
-    [B, 686], masked, softmax.
+    concatenated with the trunk output before the spatial head.
+    Spatial head: 1×1 Conv2d → [B, N_VERBS, 7, 7] logit map, flattened to
+    [B, SPATIAL_SIZE]. Face-down head: a Linear over (pooled trunk ++ globals)
+    → [B, FACEDOWN_SIZE]. The two are concatenated into the [B, ACTION_SPACE_SIZE]
+    flat logit vector, masked, softmax.
 
-    Action encoding: id = verb * 49 + r * 7 + q.
-    Input planes (8 channels, ego-centric):
+    Action encoding: spatial id = verb * 49 + r * 7 + q; face-down ids follow.
+    Input planes (BOARD_CHANNELS, ego-centric):
         0: invalid  1: empty  2: uncontrolled base
         3: own base  4: opp base  5: exploration
-        6: own units  7: opp units
+        6: own sword  7: own knight  8: opp sword  9: opp knight
     """
 
     def __init__(self, device, hidden_dim=64):
         super().__init__()
 
         self.board_encoder = nn.Sequential(
-            HexConv2d(in_channels=8, out_channels=32),
+            HexConv2d(in_channels=BOARD_CHANNELS, out_channels=32),
             nn.ReLU(),
             HexConv2d(in_channels=32, out_channels=hidden_dim),
             nn.ReLU(),
@@ -70,16 +76,21 @@ class Policy(nn.Module):
 
         # 1×1 conv maps (hidden_dim + GLOBAL_DIM) planes → N_VERBS logit planes
         self.policy_head = nn.Conv2d(hidden_dim + GLOBAL_DIM, N_VERBS, kernel_size=1)
+        # Non-spatial head for the face-down actions (claim_initiative / pass).
+        self.facedown_head = nn.Linear(hidden_dim + GLOBAL_DIM, FACEDOWN_SIZE)
 
         self.device = device
 
     def _logits(self, board: torch.Tensor, global_feats: torch.Tensor) -> torch.Tensor:
-        """board: [B,8,7,7], global_feats: [B,G] → logits [B, N_VERBS*49]"""
+        """board: [B,C,7,7], global_feats: [B,G] → logits [B, ACTION_SPACE_SIZE]"""
         B = board.shape[0]
         feat = self.board_encoder(board)  # [B, hidden_dim, 7, 7]
         g = global_feats.view(B, GLOBAL_DIM, 1, 1).expand(B, GLOBAL_DIM, BOARD_DIM, BOARD_DIM)
         combined = torch.cat([feat, g], dim=1)  # [B, hidden_dim+G, 7, 7]
-        return self.policy_head(combined).flatten(1)  # [B, 686]
+        spatial = self.policy_head(combined).flatten(1)  # [B, SPATIAL_SIZE]
+        pooled = feat.mean(dim=(-2, -1))  # [B, hidden_dim]
+        facedown = self.facedown_head(torch.cat([pooled, global_feats], dim=-1))  # [B, FACEDOWN_SIZE]
+        return torch.cat([spatial, facedown], dim=1)  # [B, ACTION_SPACE_SIZE]
 
     def forward(self, obs):
         board = torch.tensor(obs['board'], dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -133,7 +144,7 @@ class Critic(nn.Module):
     def __init__(self, device, hidden_dim=64):
         super().__init__()
         self.board_encoder = nn.Sequential(
-            HexConv2d(8, 32),
+            HexConv2d(BOARD_CHANNELS, 32),
             nn.ReLU(),
             HexConv2d(32, hidden_dim),
             nn.ReLU(),

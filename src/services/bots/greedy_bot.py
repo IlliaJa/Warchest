@@ -3,55 +3,64 @@ from collections import deque
 import numpy as np
 
 from .base import Bot
-from ..environment.warchest_env import (
-    N_VERBS, BOARD_DIM, WarChestEnv,
-    MOVE_ACTION, ATTACK_ACTION, CLAIM_BASE_ACTION, DEPLOY_ACTION,
-)
+from ..environment.warchest_env import BOARD_DIM, SPATIAL_SIZE
 
 # Verb ranges in the spatial action scheme
 _VERB_MOVE_END = 5
 _VERB_ATTACK_START = 6
 _VERB_ATTACK_END = 11
 _VERB_CONTROL = 12
-_VERB_DEPLOY = 13
+_VERB_DEPLOY_START = 13
+_VERB_DEPLOY_END = 14
+
+# Face-down block layout (offsets from SPATIAL_SIZE): 0-2 claim_initiative, 3-5 pass.
+_PASS_OFFSET = 3
+_ROYAL_IDX = 2  # royal coin is the last entry of DECK
 
 OFFSETS = [(-1, -1), (-1, 0), (0, 1), (1, 1), (1, 0), (0, -1)]
 
 
 class GreedyBot(Bot):
-    """Priority: attack → control → move toward nearest base → random.
+    """Priority: attack → control → move toward nearest base → deploy → pass.
 
     Operates entirely in the ego-centric (rotated) observation frame it receives.
-    Block boundaries are derived from N_VERBS/BOARD_DIM constants, not hardcoded
-    action IDs, so they remain valid across action-space changes.
+    Face-down actions are a last resort; when forced to discard it prefers to pass
+    with the Royal coin so unit coins are not wasted.
     """
 
     RANDOM_ACTION_PROB = 0.30
 
     def act(self, obs: dict) -> tuple[int, None, None]:
         valid = list(np.where(obs['valid_action_mask'] == 1)[0])
-        board = obs['board']  # [8, 7, 7] ego-centric encoded
+        board = obs['board']  # [C, 7, 7] ego-centric encoded
 
         if np.random.random() < self.RANDOM_ACTION_PROB:
             return int(np.random.choice(valid)), None, None
 
-        # Attack: verb 6-11
-        attacks = [a for a in valid if _VERB_ATTACK_START <= self._verb(a) <= _VERB_ATTACK_END]
+        spatial = [a for a in valid if a < SPATIAL_SIZE]
+
+        attacks = [a for a in spatial if _VERB_ATTACK_START <= self._verb(a) <= _VERB_ATTACK_END]
         if attacks:
             return int(attacks[0]), None, None
 
-        # Control (claim): verb 12
-        controls = [a for a in valid if self._verb(a) == _VERB_CONTROL]
+        controls = [a for a in spatial if self._verb(a) == _VERB_CONTROL]
         if controls:
             return int(controls[0]), None, None
 
-        # Move toward nearest target base (uncontrolled ch2 or opponent ch4)
-        moves = [a for a in valid if self._verb(a) <= _VERB_MOVE_END]
+        moves = [a for a in spatial if self._verb(a) <= _VERB_MOVE_END]
         if moves:
             best = self._best_move_toward_base(moves, board)
             if best is not None:
                 return int(best), None, None
 
+        deploys = [a for a in spatial if _VERB_DEPLOY_START <= self._verb(a) <= _VERB_DEPLOY_END]
+        if deploys:
+            return int(deploys[0]), None, None
+
+        # Only face-down actions remain — prefer passing the Royal coin.
+        royal_pass = SPATIAL_SIZE + _PASS_OFFSET + _ROYAL_IDX
+        if royal_pass in valid:
+            return int(royal_pass), None, None
         return int(np.random.choice(valid)), None, None
 
     @staticmethod

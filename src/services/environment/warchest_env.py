@@ -9,7 +9,7 @@ from .cell_ids import *
 from .game_renderer import GameRenderer
 from typing import Tuple, Dict
 from .action import Action
-from .game_state import GameState
+from .game_state import GameState, COIN_SWORD, COIN_KNIGHT, COIN_ROYAL, DECK
 from copy import deepcopy
 
 
@@ -28,18 +28,41 @@ MOVE_ACTION = 'move'
 ATTACK_ACTION = 'attack'
 CLAIM_BASE_ACTION = 'claim_base'
 DEPLOY_ACTION = 'deploy'
+CLAIM_INITIATIVE_ACTION = 'claim_initiative'
+PASS_ACTION = 'pass'
 
-# Spatial action constants
-# action_id = verb * BOARD_DIM^2 + r * BOARD_DIM + q
-# verb 0-5:  move in direction d
-# verb 6-11: attack in direction d
-# verb 12:   control (claim) current cell
-# verb 13:   deploy onto this cell
-N_VERBS = 14
+# ---------------------------------------------------------------------------
+# Action encoding (Phase 1a — temporary flat head)
+#
+# Spatial actions: id = verb * BOARD_DIM^2 + r * BOARD_DIM + q
+#   verb 0-5:   move in direction d
+#   verb 6-11:  attack in direction d
+#   verb 12:    control (claim) current cell
+#   verb 13:    deploy a Swordsman onto this cell
+#   verb 14:    deploy a Knight onto this cell
+# Face-down actions (no board cell): appended after the spatial block.
+#   SPATIAL_SIZE + 0..2: claim_initiative paying {sword, knight, royal}
+#   SPATIAL_SIZE + 3..5: pass paying {sword, knight, royal}
+# Deploy is per-type because an empty target cell does not determine the unit;
+# move/attack/control are not, because the occupied source cell does.
+# ---------------------------------------------------------------------------
+N_VERBS = 15
 BOARD_DIM = 7
-ACTION_SPACE_SIZE = N_VERBS * BOARD_DIM * BOARD_DIM  # 686
+SPATIAL_SIZE = N_VERBS * BOARD_DIM * BOARD_DIM  # 735
+FACEDOWN_KINDS = 2  # claim_initiative, pass
+FACEDOWN_SIZE = FACEDOWN_KINDS * len(DECK)  # 6
+ACTION_SPACE_SIZE = SPATIAL_SIZE + FACEDOWN_SIZE  # 741
 
-GLOBAL_DIM = 5  # [turn_frac, my_bases, opp_bases, my_deploys_left, opp_deploys_left]
+# Verbs that deploy, and which unit type each deploys.
+DEPLOY_VERBS = {13: COIN_SWORD, 14: COIN_KNIGHT}
+UNIT_CLASS_BY_COIN = {COIN_SWORD: Swordsman, COIN_KNIGHT: Knight}
+
+# Coin <-> contiguous index, used for the face-down action block and obs encoding.
+COIN_TO_IDX = {COIN_SWORD: 0, COIN_KNIGHT: 1, COIN_ROYAL: 2}
+IDX_TO_COIN = list(DECK)
+
+BOARD_CHANNELS = 10  # see Policy docstring for the channel map
+GLOBAL_DIM = 8  # [turn_frac, my_bases, opp_bases, hand_sword, hand_knight, hand_royal, my_initiative, opp_coins_left]
 
 MOVE_EXPLORE_REWARD_MAX_TURN = 5
 MOVE_EXPLORE_REWARD_PER_TURN = 0.1
@@ -51,12 +74,12 @@ WIN_REWARD = 1.0
 LOSS_REWARD = -1.0
 
 NUM_PLAYERS = 2
-MAX_UNITS_PER_PLAYER = 2
-MAX_DEPLOYS = 4  # lifetime deploy cap per player
+
+OBS_VERSION = 1
 
 
 class WarChestEnv(gym.Env):
-    max_actions = 200
+    max_rounds = 50  # a round = both players empty a hand (~6 coin-plays); truncate here
     winning_base_count = 6
     max_rewardable_moving_action = 30
 
@@ -70,11 +93,25 @@ class WarChestEnv(gym.Env):
 
     @staticmethod
     def decode_action(action_id: int) -> Tuple[int, int, int]:
+        """Decode a *spatial* action id into (verb, r, q). Spatial ids only."""
         verb = action_id // (BOARD_DIM * BOARD_DIM)
         cell = action_id % (BOARD_DIM * BOARD_DIM)
         r = cell // BOARD_DIM
         q = cell % BOARD_DIM
         return verb, r, q
+
+    @staticmethod
+    def encode_facedown(kind: int, coin: int) -> int:
+        """kind 0 = claim_initiative, 1 = pass."""
+        return SPATIAL_SIZE + kind * len(DECK) + COIN_TO_IDX[coin]
+
+    @staticmethod
+    def decode_facedown(action_id: int) -> Tuple[int, int]:
+        """Return (kind, coin) for a face-down action id."""
+        off = action_id - SPATIAL_SIZE
+        kind = off // len(DECK)
+        coin = IDX_TO_COIN[off % len(DECK)]
+        return kind, coin
 
     @staticmethod
     def remap_action(action_id: int) -> int:
@@ -85,10 +122,13 @@ class WarChestEnv(gym.Env):
         passed through this function before env.step(), and vice-versa.
         Self-inverse: remap_action(remap_action(a)) == a.
 
-        Cell rotation: (r,q) → (s-r, s-q) where s = BOARD_DIM - 1 = 6.
-        Direction flip: applied only to move (verb 0-5) and attack (verb 6-11).
-        Control (12) and deploy (13) rotate spatially only — no verb change.
+        Face-down actions are non-spatial and map to themselves. Cell rotation:
+        (r,q) → (s-r, s-q) where s = BOARD_DIM - 1 = 6. Direction flip applies only
+        to move (0-5) and attack (6-11); control (12) and deploy (13,14) rotate
+        spatially only — no verb change.
         """
+        if action_id >= SPATIAL_SIZE:
+            return action_id
         s = BOARD_DIM - 1
         verb, r, q = WarChestEnv.decode_action(action_id)
         r_rot = s - r
@@ -120,6 +160,8 @@ class WarChestEnv(gym.Env):
             ATTACK_ACTION: {'act_function': self.perform_attack_action},
             CLAIM_BASE_ACTION: {'act_function': self.perform_claim_base_action},
             DEPLOY_ACTION: {'act_function': self.perform_deploy_action},
+            CLAIM_INITIATIVE_ACTION: {'act_function': self.perform_claim_initiative_action},
+            PASS_ACTION: {'act_function': self.perform_pass_action},
         }
 
     def reset(self, seed=None, options=None):
@@ -128,10 +170,11 @@ class WarChestEnv(gym.Env):
         return self.generate_observation(), {}
 
     def set_init_state(self):
+        # Board starts with control markers on the starting locations but NO units;
+        # units are deployed from hand during play.
         board = Board()
         map_ = np.where(board.board == INVALID_CELL_ID, INVALID_CELL_ID, 0)
         self.exploration_map_dict = {1: map_.copy(), 2: map_.copy()}
-        self.place_default_units(board)
         self.state = GameState(board=board, active_player=1, action_count=0)
         if self.history is not None:
             self.history = [deepcopy(self.state)]
@@ -155,8 +198,34 @@ class WarChestEnv(gym.Env):
     def active_player(self):
         return self.state.active_player
 
-    def swap_active_player(self):
-        self.state.active_player = 1 if self.state.active_player == 2 else 2
+    # ------------------------------------------------------------------
+    # Round / turn controller
+    # ------------------------------------------------------------------
+
+    def _advance_turn(self):
+        """Pass the turn after a coin has been spent.
+
+        Players alternate one coin per turn; a player with an empty hand is skipped
+        while the other finishes. When both hands are empty the round ends: both
+        hands refresh and the initiative owner acts first.
+        """
+        active = self.state.active_player
+        other = 3 - active
+        if self.state.hands[other]:
+            self.state.active_player = other
+        elif self.state.hands[active]:
+            pass  # opponent is out of coins; keep playing
+        else:
+            self._start_new_round()
+
+    def _start_new_round(self):
+        self.state.hands = {1: set(DECK), 2: set(DECK)}
+        self.state.initiative_transferred_this_round = False
+        self.state.active_player = self.state.initiative_owner
+        self.state.round_number += 1
+
+    def _spend_coin(self, coin: int):
+        self.state.hands[self.active_player].discard(coin)
 
     def step(self, action_id):
         action_type, action_args = self.get_action_info(action_id)
@@ -168,15 +237,17 @@ class WarChestEnv(gym.Env):
 
         if action.is_valid:
             self.action_count += 1
-            self.swap_active_player()
+            if not action.finishes_game:
+                self._advance_turn()
             if self.history is not None:
                 self.history.append(deepcopy(self.state))
             # If the newly active player has no valid actions the previous mover wins.
+            # With pass always legal this is a safety net rather than a normal path.
             if not action.finishes_game and not self.get_possible_actions():
                 action.finishes_game = True
                 action.reward += WIN_REWARD
 
-        truncated = self.action_count >= self.max_actions
+        truncated = self.state.round_number >= self.max_rounds
         if self.debug_mode:
             print(f'Got action_id {action.id} type={action.type} args={action.additional_info}')
         return self.generate_observation(), action.reward, action.finishes_game, truncated, {'action': action}
@@ -214,9 +285,24 @@ class WarChestEnv(gym.Env):
 
         ax.set_aspect('equal')
         ax.autoscale_view()
+        ax.set_title(self._render_status_text(), fontsize=10)
         plt.margins(0)
         if created_ax:
             plt.show()
+
+    def _render_status_text(self) -> str:
+        coin_names = {COIN_SWORD: 'S', COIN_KNIGHT: 'K', COIN_ROYAL: 'R'}
+
+        def hand_str(pid):
+            return ''.join(coin_names[c] for c in DECK if c in self.state.hands[pid]) or '-'
+
+        return (
+            f'round={self.state.round_number} active=P{self.active_player} '
+            f'init=P{self.state.initiative_owner} | '
+            f'P1 hand=[{hand_str(1)}] P2 hand=[{hand_str(2)}] | '
+            f'P1 bases={len(self.board.get_controlled_bases(1))} '
+            f'P2 bases={len(self.board.get_controlled_bases(2))}'
+        )
 
     def render_game(self):
         if self.history is None:
@@ -230,21 +316,11 @@ class WarChestEnv(gym.Env):
         y = column - row / 2
         return x, y
 
-    def place_default_units(self, board):
-        default_units = [
-            (Swordsman(player_id=1, board=board), (1, 0)),
-            (Swordsman(player_id=1, board=board), (4, 1)),
-            (Swordsman(player_id=2, board=board), (2, 5)),
-            (Swordsman(player_id=2, board=board), (5, 6)),
-        ]
-        for _unit, loc in default_units:
-            board.deploy_unit(unit=_unit, place=loc)
-
     def get_observation_space(self):
         return gym.spaces.Dict({
             'board': gym.spaces.Box(
                 low=0.0, high=1.0,
-                shape=(8, BOARD_DIM, BOARD_DIM),
+                shape=(BOARD_CHANNELS, BOARD_DIM, BOARD_DIM),
                 dtype=np.float32,
             ),
             'global': gym.spaces.Box(low=0.0, high=1.0, shape=(GLOBAL_DIM,), dtype=np.float32),
@@ -265,8 +341,8 @@ class WarChestEnv(gym.Env):
             raw_board = np.rot90(raw_board, 2).copy()
             expl = np.rot90(expl, 2).copy()
 
-        # Build 8-channel encoded board (ego-centric, already rotated for P2)
-        board_enc = np.zeros((8, BOARD_DIM, BOARD_DIM), dtype=np.float32)
+        # Build encoded board (ego-centric, already rotated for P2).
+        board_enc = np.zeros((BOARD_CHANNELS, BOARD_DIM, BOARD_DIM), dtype=np.float32)
         board_enc[0] = (raw_board == INVALID_CELL_ID)
         board_enc[1] = (raw_board == EMPTY_CELL_ID)
         board_enc[2] = (raw_board == UNCONTROLLED_BASE_CELL_ID)
@@ -276,38 +352,37 @@ class WarChestEnv(gym.Env):
         board_enc[4] = (raw_board == opp_base_id)
         visits = np.clip(expl, 0, None).astype(np.float32)
         board_enc[5] = visits / (visits.max() + 1e-5)
-        # Unit planes: ego-centric. Rotate coords for P2.
+        # Unit planes: per type per owner, ego-centric. Channels:
+        #   6 own sword  7 own knight  8 opp sword  9 opp knight
+        type_plane = {COIN_SWORD: 0, COIN_KNIGHT: 1}
         for u in self.board.units:
             r, q = u.loc
             if active == 2:
                 r, q = s - r, s - q
-            if u.player_id == active:
-                board_enc[6, r, q] = 1.0
-            else:
-                board_enc[7, r, q] = 1.0
+            owner_offset = 6 if u.player_id == active else 8
+            board_enc[owner_offset + type_plane[u.id], r, q] = 1.0
 
-        # Global features [5]
+        # Global features [GLOBAL_DIM]
         my_bases = len(self.board.get_controlled_bases(active))
         opp_bases = len(self.board.get_controlled_bases(opponent))
+        hand = self.state.hands[active]
         global_feats = np.array([
-            self.action_count / self.max_actions,
+            min(self.state.round_number / self.max_rounds, 1.0),
             my_bases / self.winning_base_count,
             opp_bases / self.winning_base_count,
-            (MAX_DEPLOYS - self.state.deploys_used[active]) / MAX_DEPLOYS,
-            (MAX_DEPLOYS - self.state.deploys_used[opponent]) / MAX_DEPLOYS,
+            float(COIN_SWORD in hand),
+            float(COIN_KNIGHT in hand),
+            float(COIN_ROYAL in hand),
+            float(self.state.initiative_owner == active),
+            len(self.state.hands[opponent]) / len(DECK),
         ], dtype=np.float32)
 
-        # Valid action mask [686]
+        # Valid action mask [ACTION_SPACE_SIZE]
         valid_ids = self.get_possible_actions()
         mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
         if active == 2:
             for a in valid_ids:
                 mask[self.remap_action(a)] = 1.0
-            if self.debug_mode:
-                print(
-                    f'[obs_rotate] P2: valid_orig={sorted(valid_ids)[:5]} '
-                    f'valid_rot={sorted(int(a) for a in np.where(mask)[0])[:5]}'
-                )
         else:
             mask[valid_ids] = 1.0
 
@@ -319,37 +394,62 @@ class WarChestEnv(gym.Env):
         }
 
     def get_possible_actions(self):
-        """Return list of valid action IDs in absolute (non-rotated) frame."""
+        """Return valid action IDs in absolute (non-rotated) frame."""
         active = self.active_player
+        hand = self.state.hands[active]
         ids = []
 
-        for u in self.get_active_player_units():
+        units = self.get_active_player_units()
+        on_board_types = {u.id for u in units}
+
+        # Maneuvers: gated by holding a coin matching the unit's type.
+        for u in units:
+            if u.id not in hand:
+                continue
             r, q = u.loc
-            # Move: step into any free adjacent cell
             for d, (dr, dq) in enumerate(self.board.offsets):
                 target = (r + dr, q + dq)
                 if target in self.board.get_free_adjacent_cells(r, q):
                     ids.append(self.encode_action(d, r, q))
-            # Attack: adjacent enemy unit
             for d, (dr, dq) in enumerate(self.board.offsets):
                 target = (r + dr, q + dq)
                 enemy = self.board.get_unit_at(*target)
                 if enemy is not None and enemy.player_id != active:
                     ids.append(self.encode_action(6 + d, r, q))
-            # Control (claim)
             if self.board.is_valid_claim(active, (r, q)):
                 ids.append(self.encode_action(12, r, q))
 
-        # Deploy: onto any controlled empty location within budget
-        if (len(self.get_active_player_units()) < MAX_UNITS_PER_PLAYER
-                and self.state.deploys_used[active] < MAX_DEPLOYS):
-            for loc in self.board.get_controlled_bases(active):
-                if self.board.get_unit_at(*loc) is None:
-                    ids.append(self.encode_action(13, *loc))
+        # Deploy: a coin in hand whose unit type is not already on the board, onto
+        # any controlled empty location. (One unit of each type at a time.)
+        controlled_empty = [
+            loc for loc in self.board.get_controlled_bases(active)
+            if self.board.get_unit_at(*loc) is None
+        ]
+        for verb, coin in DEPLOY_VERBS.items():
+            if coin in hand and coin not in on_board_types and controlled_empty:
+                for loc in controlled_empty:
+                    ids.append(self.encode_action(verb, *loc))
+
+        # Face-down actions: any coin in hand may pass; claim_initiative needs the
+        # marker held by the opponent and untransferred this round.
+        can_claim = (
+            active != self.state.initiative_owner
+            and not self.state.initiative_transferred_this_round
+        )
+        for coin in hand:
+            ids.append(self.encode_facedown(1, coin))  # pass
+            if can_claim:
+                ids.append(self.encode_facedown(0, coin))  # claim_initiative
 
         return ids
 
     def get_action_info(self, action_id: int) -> Tuple[str, Tuple]:
+        if action_id >= SPATIAL_SIZE:
+            kind, coin = self.decode_facedown(action_id)
+            if kind == 0:
+                return CLAIM_INITIATIVE_ACTION, (coin,)
+            return PASS_ACTION, (coin,)
+
         verb, r, q = self.decode_action(action_id)
         if 0 <= verb <= 5:
             return MOVE_ACTION, (verb, r, q)
@@ -357,8 +457,8 @@ class WarChestEnv(gym.Env):
             return ATTACK_ACTION, (verb, r, q)
         elif verb == 12:
             return CLAIM_BASE_ACTION, (verb, r, q)
-        elif verb == 13:
-            return DEPLOY_ACTION, (verb, r, q)
+        elif verb in DEPLOY_VERBS:
+            return DEPLOY_ACTION, (DEPLOY_VERBS[verb], r, q)
         raise ValueError(f'Unknown verb {verb} in action_id {action_id}')
 
     def make_random_step(self):
@@ -390,12 +490,17 @@ class WarChestEnv(gym.Env):
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                           txt_result='No unit at source cell', is_valid=False)
 
+        if moving_unit.id not in self.state.hands[self.active_player]:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='No matching coin in hand', is_valid=False)
+
         if end not in self.board.get_free_adjacent_cells(r, q):
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                           txt_result='Target cell not free', is_valid=False)
 
         moving_unit.move(loc=end)
         self.exploration_map_dict[self.active_player][end] += 1
+        self._spend_coin(moving_unit.id)
         return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
                       txt_result='Move successful', is_valid=True)
 
@@ -406,10 +511,14 @@ class WarChestEnv(gym.Env):
         target = (r + offset[0], q + offset[1])
 
         try:
-            next(u for u in self.get_active_player_units() if u.loc == start)
+            attacker = next(u for u in self.get_active_player_units() if u.loc == start)
         except StopIteration:
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                           txt_result='No own unit at source cell', is_valid=False)
+
+        if attacker.id not in self.state.hands[self.active_player]:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='No matching coin in hand', is_valid=False)
 
         enemy = self.board.get_unit_at(*target)
         if enemy is None or enemy.player_id == self.active_player:
@@ -417,6 +526,7 @@ class WarChestEnv(gym.Env):
                           txt_result='No enemy unit at target cell', is_valid=False)
 
         self.board.remove_unit(enemy)
+        self._spend_coin(attacker.id)
         return Action(reward=ATTACK_REWARD, finishes_game=False,
                       txt_result='Attack successful', is_valid=True)
 
@@ -426,37 +536,65 @@ class WarChestEnv(gym.Env):
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                           txt_result='Invalid claim', is_valid=False)
 
+        unit = self.board.get_unit_at(r, q)
+        if unit is None or unit.id not in self.state.hands[self.active_player]:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='No matching coin in hand', is_valid=False)
+
         self.board.change_base_control(player_id=self.active_player, base_loc=base_loc)
+        self._spend_coin(unit.id)
         if len(self.board.get_controlled_bases(self.active_player)) < self.winning_base_count:
             return Action(reward=CLAIM_BASE_REWARD, finishes_game=False, is_valid=True,
                           txt_result='Claimed base')
         return Action(reward=WIN_REWARD, finishes_game=True, is_valid=True,
                       txt_result=f'Player {self.active_player} won')
 
-    def perform_deploy_action(self, verb: int, r: int, q: int) -> Action:
+    def perform_deploy_action(self, coin: int, r: int, q: int) -> Action:
         active = self.active_player
         target = (r, q)
 
-        if self.state.deploys_used[active] >= MAX_DEPLOYS:
+        if coin not in self.state.hands[active]:
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
-                          txt_result='Deploy cap reached', is_valid=False)
-        if len(self.get_active_player_units()) >= MAX_UNITS_PER_PLAYER:
+                          txt_result='No matching coin in hand', is_valid=False)
+        if any(u.id == coin for u in self.get_active_player_units()):
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
-                          txt_result='Max concurrent units reached', is_valid=False)
+                          txt_result='Unit of this type already on board', is_valid=False)
         if self.board.get_unit_at(*target) is not None:
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                           txt_result='Target cell occupied', is_valid=False)
 
         try:
-            new_unit = Swordsman(player_id=active, board=self.board)
+            new_unit = UNIT_CLASS_BY_COIN[coin](player_id=active, board=self.board)
             self.board.deploy_unit(unit=new_unit, place=target)
         except Exception as e:
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                           txt_result=f'Deploy failed: {e}', is_valid=False)
 
-        self.state.deploys_used[active] += 1
+        self._spend_coin(coin)
         return Action(reward=0.0, finishes_game=False, is_valid=True,
                       txt_result='Unit deployed')
+
+    def perform_claim_initiative_action(self, coin: int) -> Action:
+        active = self.active_player
+        if coin not in self.state.hands[active]:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='No matching coin in hand', is_valid=False)
+        if active == self.state.initiative_owner or self.state.initiative_transferred_this_round:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='Cannot claim initiative', is_valid=False)
+
+        self.state.initiative_owner = active
+        self.state.initiative_transferred_this_round = True
+        self._spend_coin(coin)
+        return Action(reward=0.0, finishes_game=False, is_valid=True,
+                      txt_result='Claimed initiative')
+
+    def perform_pass_action(self, coin: int) -> Action:
+        if coin not in self.state.hands[self.active_player]:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='No matching coin in hand', is_valid=False)
+        self._spend_coin(coin)
+        return Action(reward=0.0, finishes_game=False, is_valid=True, txt_result='Passed')
 
     def get_active_player_units(self):
         return [u for u in self.board.units if u.player_id == self.active_player]

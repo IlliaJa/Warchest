@@ -52,32 +52,12 @@ Once the action set grows (4+ units, coin mechanics), the flat `[A, 7, 7]` spati
 
 ---
 
-### C14. **DQN / Double DQN with prioritised replay.** *(optional)*
-
-Off-policy replay sidesteps the non-stationary opponent issue entirely. See `docs/rl_algorithms.md` → *DQN* for the verdict and why it is not the preferred path.
-
-**Relevance.** Lower now that C3 (pool diversity) is fixed. Revisit if PPO plateaus below 50% vs *true* greedy after C8+C9+C12.
-
-**Difficulty.** High (~300 lines new trainer).
-
----
-
-### C15. **MCTS + policy/value (AlphaZero-style).** *(long-term)*
-
-Tiny branching factor, deterministic transitions, perfect information — the ideal MCTS setting. AlphaZero-style methods routinely exceed 90% WR on similar-size games. See `docs/rl_algorithms.md` → *AlphaZero / MCTS*.
-
-**Relevance.** Unchanged. Long-term ceiling play. Prerequisite: a non-trivial PPO policy (which we now have at 49%).
-
-**Difficulty.** High (~500 lines).
-
----
-
 ### Tier 4 — small / cosmetic
 
 | # | Issue | Difficulty | Effect |
 |---|---|---|---|
 | C17 | `trunc_reward` is a step function (0/−0.5/−1); a base-diff-proportional value would reduce critic target variance | low | small |
-| C18 | `value_single` is called during `.train()` mode at rollout (line 199); harmless today but worth `.eval()` for future BN/dropout safety | trivial | none until BN/dropout |
+| C18 | `value_single` is called during `.train()` mode at rollout (line 199); harmless today (no BN/Dropout) but if either is added, Dropout would produce stochastic noisy values during GAE and BatchNorm would compute statistics from a single sample — both silent bugs. Fix: `self._critic.eval()` before the rollout loop, `self._critic.train()` before the update. | trivial | none until BN/dropout |
 | C20 | Eval runs 20 episodes — std error on a 0.49 WR estimate is ~5%. Bump to 50. | low | log readability |
 | C21 | `EloTracker` updates after every eval game — noisy; consider a running average | low | log readability |
 | C22 | `score_deque` reports batch-mean only; adding a 100-episode rolling mean would make regressions easier to spot | low | log readability |
@@ -95,44 +75,3 @@ Tiny branching factor, deterministic transitions, perfect information — the id
 3. **C12 — `collect_episodes=32`** *(5 min)*. After C8.
 4. Re-measure. If still under 50% vs *true* greedy after a 300-batch run, escalate to C15 (MCTS) or C14 (DQN benchmark).
 
----
-
-## REINFORCE era — archived
-
-*Analysis from logs `run_20260522-200919.log` (123 episodes). All items below are implemented — see `docs/history.md` Phase 1 and Phase 2.*
-
-### Observed symptoms
-
-- `actor_loss ≈ 0.0000` every episode — policy gradient produces no signal.
-- Entropy stuck at **2.2** (max ≈ 2.64) — policy stays near-uniform.
-- `wr_self` drops from 0.5–0.67 to 0.24 by ep123 — network actively learns something harmful.
-- `wr_rng` ends at **0.12** — trained policy loses to random more than it wins.
-- ~80% of episodes truncate at 99 turns.
-
-### Fixes (correctness bugs) — all ✅
-
-1. ✅ Egocentric observation — action IDs are relative, observation was absolute; contradictory gradients in self-play.
-2. ✅ `observation_space` shape mismatch (declared 3 features, emitted 4).
-3. ✅ Reward shaping reset — `MOVE_ON_BASE_REWARD` flags never reset between episodes; silent after first visit.
-4. ✅ `make_random_step` credit assignment — invalid-action fallback paired random reward with policy log-prob.
-5. ✅ Random player's GAE — ran full GAE for the random side, producing spurious `critic_loss≈0.038` every step.
-6. ✅ Sorted units mismatch — observation sorted by class name, actions used raw `board.units` order.
-
-### Small improvements — all ✅
-
-7. ✅ `gamma=0.99` (was 0.9 — win reward invisible for first 50 turns).
-8. ✅ Batch episodes before optimizer step → implemented as `collect_episodes` in PPO.
-9. ✅ Separate critic/actor LR + decouple backbones → done via separate `nn.Module` instances.
-10. ✅ Entropy bonus schedule → addressed by `entropy_coeff=0.025` (C7).
-11. ✅ `CLAIM_BASE_REWARD` balance — was 0.03 vs WIN_REWARD=1.0.
-12. ✅ Return normalisation for critic.
-
-### Architecture improvements — all ✅
-
-13. ✅ Separate actor and critic encoders.
-14. ✅ PPO migration (`src/app/ppo.py`).
-15. ✅ Hex-aware encoder (`HexConv2d`).
-16. ✅ Opponent pool (`src/services/opponent_pool.py`).
-17. ✅ Random-opponent mixing → folded into opponent pool weights.
-18. ✅ Terminal handling → `append_terminal_reward` in rollout buffer.
-19. MCTS — long-term; see C15 above.
