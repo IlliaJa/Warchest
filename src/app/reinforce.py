@@ -1,3 +1,22 @@
+"""
+DEPRECATED — use src/app/ppo.py instead.
+
+This script implements the legacy REINFORCE + GAE trainer and is no longer
+maintained. The Policy and Critic interfaces changed (spatial conv head, 8-channel
+board encoding, no unit_encoder) and this script has NOT been updated — it will
+crash on import or at runtime.
+
+Use PPO:
+    python -m src.app.ppo
+"""
+import warnings
+warnings.warn(
+    'reinforce.py is deprecated and incompatible with the current Policy/env '
+    'interfaces. Use src/app/ppo.py instead.',
+    DeprecationWarning,
+    stacklevel=1,
+)
+
 import logging
 import os
 import sys

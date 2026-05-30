@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from ..environment.cell_ids import *
+from ..environment.warchest_env import N_VERBS, BOARD_DIM, ACTION_SPACE_SIZE, GLOBAL_DIM
 
 
 class HexConv2d(nn.Module):
@@ -43,60 +43,52 @@ class HexConv2d(nn.Module):
 
 
 class Policy(nn.Module):
-    def __init__(self, action_dim, device, hidden_dim=128):
-        super(Policy, self).__init__()
+    """Actor network with a spatial cell-keyed convolutional head.
 
-        # Board encoder (hex-correct CNN for spatial data)
+    Board trunk: HexConv2d stack on 8 input planes → [B, Cf, 7, 7] feature map.
+    Global features are broadcast as extra planes (tiled over the grid) and
+    concatenated with the trunk output before the policy head.
+    Policy head: 1×1 Conv2d → [B, N_VERBS, 7, 7] logit map, flattened to
+    [B, 686], masked, softmax.
+
+    Action encoding: id = verb * 49 + r * 7 + q.
+    Input planes (8 channels, ego-centric):
+        0: invalid  1: empty  2: uncontrolled base
+        3: own base  4: opp base  5: exploration
+        6: own units  7: opp units
+    """
+
+    def __init__(self, device, hidden_dim=64):
+        super().__init__()
+
         self.board_encoder = nn.Sequential(
-            HexConv2d(in_channels=6, out_channels=32),
+            HexConv2d(in_channels=8, out_channels=32),
             nn.ReLU(),
-            HexConv2d(in_channels=32, out_channels=64),
+            HexConv2d(in_channels=32, out_channels=hidden_dim),
             nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(64 * 7 * 7, hidden_dim)
         )
 
-        # Unit encoder (flattened units data)
-        self.unit_encoder = nn.Sequential(
-            nn.Linear(2, 16),
-            nn.ReLU(),
-            nn.Linear(16, 32)
-        )
-
-        self.actor_head = nn.Sequential(
-            nn.Linear(hidden_dim + 3 + 64, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim)
-        )
+        # 1×1 conv maps (hidden_dim + GLOBAL_DIM) planes → N_VERBS logit planes
+        self.policy_head = nn.Conv2d(hidden_dim + GLOBAL_DIM, N_VERBS, kernel_size=1)
 
         self.device = device
 
+    def _logits(self, board: torch.Tensor, global_feats: torch.Tensor) -> torch.Tensor:
+        """board: [B,8,7,7], global_feats: [B,G] → logits [B, N_VERBS*49]"""
+        B = board.shape[0]
+        feat = self.board_encoder(board)  # [B, hidden_dim, 7, 7]
+        g = global_feats.view(B, GLOBAL_DIM, 1, 1).expand(B, GLOBAL_DIM, BOARD_DIM, BOARD_DIM)
+        combined = torch.cat([feat, g], dim=1)  # [B, hidden_dim+G, 7, 7]
+        return self.policy_head(combined).flatten(1)  # [B, 686]
+
     def forward(self, obs):
-        board = Policy.encode_board(obs['board'], obs['exploration_map'], obs['active_player']).astype(float)
-        board = torch.tensor(board, dtype=torch.float32).unsqueeze(0).to(self.device)
-        board_features = self.board_encoder(board)
+        board = torch.tensor(obs['board'], dtype=torch.float32).unsqueeze(0).to(self.device)
+        global_feats = torch.tensor(obs['global'], dtype=torch.float32).unsqueeze(0).to(self.device)
 
-        global_feats = torch.tensor(obs['global'].astype(float), dtype=torch.float32).unsqueeze(0).to(self.device)
+        logits = self._logits(board, global_feats)  # [1, 686]
 
-        unit_coords = torch.tensor(obs['units'], dtype=torch.float32).to(self.device)
-        unit_coords = unit_coords.view(2, 2, 2)
-        encoded_units = self.unit_encoder(unit_coords.view(-1, 2)).view(2, 2, -1)
-        my_unit_features = encoded_units[0].mean(dim=0, keepdim=True)
-        opp_unit_features = encoded_units[1].mean(dim=0, keepdim=True)
-        unit_features = torch.cat([my_unit_features, opp_unit_features], dim=-1)
-
-        combined = torch.cat([board_features, global_feats, unit_features], dim=-1)
-
-        logits = self.actor_head(combined)
-
-        action_mask = np.expand_dims(obs['valid_action_mask'].astype(bool), 0)
-        masked_logits = logits.clone()
-        masked_logits[~action_mask] = -1e9
-
-        probs = F.softmax(masked_logits, dim=-1)
-        return probs
+        mask = torch.tensor(obs['valid_action_mask'].astype(bool)).unsqueeze(0).to(self.device)
+        return F.softmax(logits.masked_fill(~mask, -1e9), dim=-1)
 
     def act(self, obs):
         probs = self.forward(obs)
@@ -113,98 +105,40 @@ class Policy(nn.Module):
         """Single forward pass over a full buffer batch.
 
         batch keys (all on device):
-            board   (N, 6, 7, 7) float — already encoded by encode_board_batch
-            global  (N, 3)       float
-            units   (N, 2, 2, 2) float
-            mask    (N, 14)      bool
-            actions (N,)         long
+            board   (N, 8, 7, 7) float
+            global  (N, GLOBAL_DIM) float
+            mask    (N, 686) bool
+            actions (N,) long
         Returns log_probs (N,), entropies (N,).
         """
-        N = batch['board'].shape[0]
-
-        board_features = self.board_encoder(batch['board'])
-
-        encoded = self.unit_encoder(batch['units'].view(N * 4, 2)).view(N, 2, 2, -1)
-        unit_features = torch.cat([
-            encoded[:, 0].mean(dim=1),
-            encoded[:, 1].mean(dim=1),
-        ], dim=-1)
-
-        combined = torch.cat([board_features, batch['global'], unit_features], dim=-1)
-
-        masked_logits = self.actor_head(combined).masked_fill(~batch['mask'], -1e9)
-        dist = Categorical(F.softmax(masked_logits, dim=-1))
-
+        logits = self._logits(batch['board'], batch['global'])  # [N, 686]
+        masked = logits.masked_fill(~batch['mask'], -1e9)
+        dist = Categorical(F.softmax(masked, dim=-1))
         return dist.log_prob(batch['actions']), dist.entropy()
-
-    @staticmethod
-    def encode_board_batch(boards, exploration_maps, active_players):
-        """Vectorized board encoding for a batch of observations.
-
-        boards          (N, 7, 7) int
-        exploration_maps (N, 7, 7) float
-        active_players  (N,) int  — 1 or 2
-        Returns (N, 6, 7, 7) float32.
-        """
-        N = len(boards)
-        enc = np.zeros((N, 6, 7, 7), dtype=np.float32)
-        enc[:, 0] = (boards == INVALID_CELL_ID)
-        enc[:, 1] = (boards == EMPTY_CELL_ID)
-        enc[:, 2] = (boards == UNCONTROLLED_BASE_CELL_ID)
-        p1 = (active_players == 1)[:, None, None]
-        enc[:, 3] = np.where(p1, boards == CONTROLLED_BASE_PLAYER_1_CELL_ID, boards == CONTROLLED_BASE_PLAYER_2_CELL_ID)
-        enc[:, 4] = np.where(p1, boards == CONTROLLED_BASE_PLAYER_2_CELL_ID, boards == CONTROLLED_BASE_PLAYER_1_CELL_ID)
-        visits = np.clip(exploration_maps, 0, None).astype(np.float32)
-        enc[:, 5] = visits / (visits.max(axis=(1, 2), keepdims=True) + 1e-5)
-        return enc
-
-    @staticmethod
-    def encode_board(board, exploration_map, active_player):
-        one_hot = np.zeros((6, 7, 7), dtype=np.float32)
-
-        one_hot[0] = (board == INVALID_CELL_ID)
-        one_hot[1] = (board == EMPTY_CELL_ID)
-        one_hot[2] = (board == UNCONTROLLED_BASE_CELL_ID)
-        if active_player == 1:
-            one_hot[3] = (board == CONTROLLED_BASE_PLAYER_1_CELL_ID)
-            one_hot[4] = (board == CONTROLLED_BASE_PLAYER_2_CELL_ID)
-        else:
-            one_hot[3] = (board == CONTROLLED_BASE_PLAYER_2_CELL_ID)
-            one_hot[4] = (board == CONTROLLED_BASE_PLAYER_1_CELL_ID)
-
-        visits = exploration_map.astype(np.float32)
-        visits[visits < 0] = 0
-        visits = visits / (visits.max() + 1e-5)
-        one_hot[5] = visits
-        return one_hot
 
 
 class Critic(nn.Module):
-    """Separate value network with its own spatial and unit encoders.
+    """Separate value network with its own spatial encoder.
 
     Privileged at training time: receives a 3-d opponent one-hot (random/greedy/pool)
-    that the policy never sees. This eliminates ~0.2 of irreducible MAE that comes from
-    the critic averaging over opponents with different return distributions.
+    that the policy never sees.
+
+    Board trunk: same HexConv2d stack as Policy → [B, Cf, 7, 7].
+    Global average pool → [B, Cf]. Concatenate with global features and opp_onehot
+    → scalar value.
     """
 
-    OPP_DIM = 3  # random / greedy / pool
+    OPP_DIM = 3
 
-    def __init__(self, device, hidden_dim=128):
+    def __init__(self, device, hidden_dim=64):
         super().__init__()
         self.board_encoder = nn.Sequential(
-            HexConv2d(6, 32),
+            HexConv2d(8, 32),
             nn.ReLU(),
-            HexConv2d(32, 64),
+            HexConv2d(32, hidden_dim),
             nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(64 * 7 * 7, hidden_dim),
         )
-        self.unit_encoder = nn.Sequential(
-            nn.Linear(2, 16),
-            nn.ReLU(),
-            nn.Linear(16, 32),
-        )
-        head_in = hidden_dim + 3 + 64 + self.OPP_DIM
+        head_in = hidden_dim + GLOBAL_DIM + self.OPP_DIM
         self.head = nn.Sequential(
             nn.Linear(head_in, hidden_dim),
             nn.ReLU(),
@@ -216,26 +150,20 @@ class Critic(nn.Module):
         )
         self.device = device
 
-    def _forward(self, board_enc, global_feats, units, opp_onehot):
-        N = units.shape[0]
-        board_features = self.board_encoder(board_enc)
-        encoded = self.unit_encoder(units.view(N * 4, 2)).view(N, 2, 2, -1)
-        unit_features = torch.cat([encoded[:, 0].mean(1), encoded[:, 1].mean(1)], dim=-1)
-        return self.head(
-            torch.cat([board_features, global_feats, unit_features, opp_onehot], dim=-1)
-        ).squeeze(-1)
+    def _forward(self, board_enc, global_feats, opp_onehot):
+        feat = self.board_encoder(board_enc)  # [B, hidden_dim, 7, 7]
+        pooled = feat.mean(dim=(-2, -1))  # global avg pool → [B, hidden_dim]
+        return self.head(torch.cat([pooled, global_feats, opp_onehot], dim=-1)).squeeze(-1)
 
     def value_single(self, obs, opp_onehot):
         """V(s) for one raw observation dict. opp_onehot: (1, OPP_DIM) tensor on device."""
-        board = Policy.encode_board(obs['board'], obs['exploration_map'], obs['active_player'])
-        board_t = torch.tensor(board, dtype=torch.float32).unsqueeze(0).to(self.device)
-        global_t = torch.tensor(obs['global'].astype(float), dtype=torch.float32).unsqueeze(0).to(self.device)
-        units_t = torch.tensor(obs['units'], dtype=torch.float32).unsqueeze(0).to(self.device)
-        return self._forward(board_t, global_t, units_t, opp_onehot).squeeze(0)
+        board_t = torch.tensor(obs['board'], dtype=torch.float32).unsqueeze(0).to(self.device)
+        global_t = torch.tensor(obs['global'], dtype=torch.float32).unsqueeze(0).to(self.device)
+        return self._forward(board_t, global_t, opp_onehot).squeeze(0)
 
     def value_batch(self, batch):
-        """V(s) for a pre-encoded batch (used during PPO update).
+        """V(s) for a pre-encoded batch.
 
-        Expects batch keys: board (N,6,7,7), global (N,3), units (N,2,2,2), opp_onehot (N,3).
+        Expects batch keys: board (N,8,7,7), global (N,GLOBAL_DIM), opp_onehot (N,3).
         """
-        return self._forward(batch['board'], batch['global'], batch['units'], batch['opp_onehot'])
+        return self._forward(batch['board'], batch['global'], batch['opp_onehot'])

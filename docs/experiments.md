@@ -27,3 +27,13 @@ Chronological record of training runs — what changed, when, and what the metri
 **Results:** `wr_vs_greedy_eval` climbed steadily through training, crossing **60% by ~step 300** and peaking at **80% around step 360 and again around step 580** over a ~650-batch run. From step ~300 onward the curve oscillates in the 0.4–0.8 range — variance is high (`eval_episodes=20` → std error ≈ 11pp on a 0.6 estimate) but the mean is clearly above the 60% target. This is the first run where the agent meaningfully exceeds greedy on the current rule set; the goal stated at the top of `improvement_ideas.md` is met.
 
 **Implication.** The prototype rule set (2 units, move-only, claim bases) is now solved well enough that further encoder / hyperparameter tuning would be optimising against a saturated target. Next focus shifts to expanding the rule set toward the original game — see `docs/decision.md` § *2026-05-29 — Focus shift: expand rule set toward original Warchest*.
+
+---
+
+## 2026-05-30 — Attack + deploy actions, spatial conv head (run: ~step 270)
+
+**Changes:** Added two new action types (`attack`: instant-kill adjacent enemy unit; `deploy`: place a new unit on a controlled empty base, capped at `MAX_DEPLOYS=4` lifetime uses). Simultaneously migrated the policy to a spatial cell-keyed action head: the board encoder now outputs a `[Cf, 7, 7]` feature map (no flatten), unit positions moved into board planes (channels 6–7), the separate `unit_encoder` MLP was removed (planes-only), and the actor head became a `Conv2d → [14, 7, 7]` logit map (`action_dim = 14×49 = 686`). P2 rotation now applies uniformly to the full spatial grid (no per-action-type remapping tables needed). Global features expanded from 3 → 5 dims to expose remaining deploy budgets to both policy and critic. GreedyBot rewritten with priority attack → control → move. See `docs/decision.md` § *2026-05-30* for the full rationale.
+
+**Results:** `wr_vs_greedy_train` climbed from near 0 to **~90% by step ~270**, well above the 80% peak of the previous run on the move-only game. The curve shows a consistent upward trend with no regression — the richer action set (attack pressure, deploy recovery) and the spatially-coherent head appear to make the learning problem structurally easier for the agent, not harder. Attack and deploy actions are both used by the trained policy.
+
+![wr_vs_greedy_train](../src/app/../.claude/image-cache/d6caddcd-b06a-442e-a19c-41da97c16ea1/2.png)

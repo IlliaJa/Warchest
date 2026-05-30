@@ -122,6 +122,94 @@ The only refactor in this direction that is still defensible is sharing **just**
 
 ---
 
+## Action head: flat spatial vs factored / autoregressive
+
+The current policy emits a single spatial softmax over an `[A, 7, 7]` head (`A*49` logits). That works for the toy env — Swordsman only, verbs move / attack / control, all of them anchored to a board cell. It stops working once the **full Warchest** action set lands, for a reason that is structural, not just a matter of width.
+
+### The split that forces the issue: spatial vs coin-only actions
+
+Real Warchest actions divide into two kinds. The first kind points at a board cell; the second kind has **no cell to point at**.
+
+| Verb | Needs a board cell? | Coin it spends |
+|---|---|---|
+| Move | yes (source + direction) | coin matching the moved unit |
+| Attack | yes (source + target) | coin matching the attacker |
+| Control | yes (source cell only) | coin matching the unit on the point |
+| Deploy | yes (a control point) | a hand coin of the deployed type |
+| Bolster | yes (an existing matching unit) | a hand coin of that type |
+| **Recruit** | **no** | any hand coin (discarded to pay) |
+| **Claim initiative** | **no** | any hand coin (discarded) |
+| **Pass** | **no** | none |
+
+A flat spatial grid head literally cannot represent "recruit a Swordsman" or "claim initiative" — there is no cell to attach them to. You would have to bolt on dummy cells or a second parallel head and hand-stitch the masks together. **This is the decisive argument for factoring in Warchest specifically**, independent of the action-space-width / sample-efficiency argument: the coin-only verbs need a first-class slot, and a top-level verb categorical gives them one.
+
+### Head tree
+
+```
+verb  ∈ {move, attack, control, deploy, bolster, recruit, initiative, pass}   # 8-way softmax
+
+├─ move / attack / control →
+│     source_cell ∈ my units I hold a matching coin for        # the [7,7] map (the existing head)
+│     ├─ move:    direction ∈ legal adjacent cells
+│     ├─ attack:  target    ∈ attackable enemy cells
+│     └─ control: (no further stage)
+│
+├─ deploy / bolster →
+│     hand_coin ∈ distinct unit-types currently in hand        # small categorical
+│     dest_cell ∈ control points (deploy) / matching units (bolster)   # the [7,7] map
+│
+├─ recruit →
+│     recruit_stack ∈ supply stacks still available            # small categorical, non-spatial
+│     [optional] pay_coin ∈ hand
+│
+├─ initiative →
+│     [optional] pay_coin ∈ hand                               # else verb alone is the whole action
+│
+└─ pass → (terminal, no sub-decision)
+```
+
+Joint log-prob is the sum of the stages actually traversed:
+
+```
+log pi(a) = log pi(verb) + sum_i log pi(stage_i | earlier stages)
+```
+
+PPO's ratio, clipping, and entropy bonus all operate unchanged on that sum (entropy = sum of per-stage entropies). Mask at **every** stage, and the masks are conditional — legal sources given the verb, legal targets given the source. This is tighter and simpler than one flat mask over the full joint space. The "source" / "dest" stages reuse the existing `[7,7]` spatial head, so the board encoder is preserved, not discarded — it becomes one conditional stage among several. This is the AlphaStar autoregressive-head shape: a sequence of conditional categoricals where earlier picks gate later masks.
+
+### The Warchest-specific wrinkle: the coin hand
+
+Actions are gated by which coins are in hand (typically 3 drawn from a bag), not by the board alone. Two consequences the verb/source/target picture does not capture by itself:
+
+1. **Masking depends on the hand, not just the board.** You can only move / attack / control a board unit if you currently hold a coin matching its type. So the `source_cell` mask for those verbs must be intersected with "do I hold a matching coin?" — which means **the hand must enter the observation** (it does not today). Add a hand encoding: counts per unit-type in hand, plus face-down / initiative state.
+
+2. **"Which coin to spend" is itself strategic for the coin-only verbs.** For move / attack / control the coin type is *determined* once the source cell is picked (it must match the unit). But recruit and initiative discard *any* coin, and which one you throw away shapes next round's hand. Two options:
+   - **First cut:** auto-pick the coin to discard with a heuristic (spend the least-useful coin), so verb alone fully specifies recruit / initiative. Fewer heads, faster to ship.
+   - **Full version:** add the optional `pay_coin` head so the agent learns coin economy. Worth it eventually — hand management is a large part of real Warchest skill.
+
+So the honest mapping is **verb → (coin selection) → (spatial placement) → (target)**, where the coin-selection stage is sometimes implicit (forced by the source cell) and sometimes an explicit head (recruit / initiative).
+
+### What this buys you
+
+- **Recruit / initiative / pass become representable at all** — the flat spatial head cannot hold them without kludges.
+- **The verb head gets gradient on every move**, so the policy keeps learning as unit types are added (Archer, Cavalry, …). The per-unit-type growth lands on the small `hand_coin` / `source_cell` masks, not on a multiplicative joint head — parameters and compute scale as the *sum* of stage sizes, not their product.
+- **Coin economy is modelable** once the `pay_coin` stage exists — something a flat head has no place for.
+
+### Sequencing
+
+Not worth building until the env actually has the bag / hand / recruit machinery. Order: (1) implement coin / hand state + recruit / initiative / pass in `warchest_env.py` and the observation; (2) *then* the factored head — its entire structure is dictated by the verb set and the hand masks, so it follows the env, not the other way around. At the current scale (~6 legal actions, Swordsman only) the flat head is already dense enough and factoring would add complexity for no gain.
+
+This composes with AlphaZero (C15) rather than competing with it: a factored head is a fine prior network *inside* an MCTS loop. "Factor the head" (network output structure) and "add MCTS" (decision-time search) live in different layers and are orthogonal choices.
+
+### Quick answers
+
+**How do I know sample efficiency has become the bottleneck?** When WR-vs-greedy plateaus *while the machinery looks healthy* — `clip_frac` in 0.05–0.20, `critic_mae` low and flat, entropy not collapsed, grad norms stable — **and** the action space has actually grown. The tell: training longer or feeding more games still moves the plateau up (sample-starved), versus more games changing nothing (capability- or credit-assignment-capped, a different problem). A concrete diagnostic: log per-logit visitation; if a large fraction of action logits are hit <~1% of the time, the flat head is too wide to learn from limited games. Do the `improvement_ideas.md` fundamentals (C1/C2/C3/C6) first — only suspect the head *after* those are clean and the action set has expanded.
+
+**Is "large-action PPO copes without MCTS" saying they're mutually exclusive?** No. They are two solutions at *different layers* to the same big-action-space problem: factoring restructures the **policy network's output** (pure learning, cheap at inference); MCTS adds a **decision-time search loop** (~500 lines, slower per move). The phrase only means you do not need the heavy search machinery merely to handle a wide action space — the cheap architectural trick suffices. They combine fine: a factored head makes a good prior network inside an AlphaZero loop.
+
+**What does factoring actually buy?** (1) Each softmax stays small → the verb head gets dense gradient every move regardless of unit count; (2) params/compute scale as the *sum* of stage sizes, not the product; (3) clean conditional masking per stage instead of one giant joint mask; (4) reuses the existing `[7,7]` board encoder as the source stage; (5) correct joint log-prob for free, so PPO's ratio/entropy are unchanged. It buys **nothing** at the current ~6-action scale and does not add search depth or opponent reasoning — that is MCTS territory. Strictly an "action set has grown" investment.
+
+---
+
 ## DQN (Deep Q-Network)
 
 DQN learns a Q-function `Q(s, a)` — the expected discounted return from taking action `a` in state `s` and playing optimally afterwards. The policy is implicit: always pick `argmax_a Q(s, a)`. Transitions `(s, a, r, s')` are stored in a **replay buffer** and sampled randomly for training, and a frozen **target network** (Q updated every N steps) stabilises the TD targets:
@@ -152,6 +240,23 @@ L = E[ (r + gamma * max_a' Q_target(s', a') - Q(s, a))^2 ]
 4. **Sparse / delayed rewards.** GAE gives smooth credit assignment over long horizons via the `lambda` knob. DQN's 1-step TD bootstrapping under sparse rewards is unstable unless paired with n-step returns and most of the Rainbow stack (prioritised replay, distributional Q, dueling heads). At that point DQN is no longer simple.
 
 5. **Sample efficiency is DQN's only real win — and there are better answers.** Replay reuse is real, but if simulation throughput becomes the bottleneck, **SAC-discrete** (replay + stochastic policy + entropy regularisation) or **MuZero / AlphaZero-style** (learns from search-improved policies) both dominate vanilla DQN for this setting.
+
+### Factored head under DQN (Action Branching)
+
+Can the factored head from the actor-critic section be reused with DQN? In theory yes, but it is strictly harder, and the reason is structural. A factored *policy* head works because probabilities factor via the chain rule — `log pi(a) = log pi(verb) + log pi(source|verb) + log pi(target|verb,source)`, an exact **sum** you can sample stage by stage. DQN has no distribution; it acts by `argmax_a Q(s,a)` and needs the joint argmax twice — to pick the greedy action and to compute the TD target `r + gamma * max_a' Q(s',a')`. The **max operator does not factor** the way a sum of log-probs does:
+
+```
+max_{verb,source,target} Q(...)  !=  max_verb(...) + max_source(...) + max_target(...)
+```
+
+The DQN-family answer is **Branching Dueling Q-Network** (BDQ, Tavakoli et al. 2018): shared trunk, one Q-branch per action dimension, dueling state-value plus per-branch advantages. Output grows as the *sum* of branch sizes, not the product — same combinatorial win as the factored head. It pays with two approximations:
+
+- **Independent per-branch argmax.** BDQ maxes within each branch independently, assuming the branches' optimal choices don't depend on each other. In Warchest they do (best target depends on chosen source/verb), so both the greedy action and the bootstrapped max are approximate and DQN's optimality argument weakens.
+- **Non-conditional branches.** Branches are computed in parallel from the shared state, not autoregressively, so a branched Q cannot natively express "value of this target *given* the chosen source" — exactly the conditional structure that makes the factored policy head correct, and exactly what conditional per-stage masking relies on.
+
+The "do it properly" route — autoregressive `Q(target|source,verb)` evaluated sequentially — restores the conditioning, but then `max_a' Q(s',a')` becomes a search over the action tree at every bootstrap step. That reintroduces search into DQN's inner loop, loses its cheap one-shot argmax, and lands most of the way toward MuZero/AlphaZero anyway.
+
+**Bottom line:** the factored structure is exact and free for a policy head (chain rule) and approximate-or-expensive for a value head (max doesn't factor). The conditional masking that is a clean win for the factored policy head is precisely what branched Q-networks struggle to express — which reinforces point 1 above: the factored action space is an argument *for* the actor-critic family, not a neutral feature both share.
 
 ### Practical implication
 

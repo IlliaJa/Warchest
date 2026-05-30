@@ -1,3 +1,17 @@
+"""
+DEPRECATED — no replacement.
+
+This script exported the policy graph to TensorBoard via torch.jit.trace and is
+no longer maintained. The Policy interface changed (spatial conv head, obs dict
+without 'units') and this script has NOT been updated.
+"""
+import warnings
+warnings.warn(
+    'policy_viz.py is deprecated with no replacement.',
+    DeprecationWarning,
+    stacklevel=1,
+)
+
 import torch
 from src.services.policy.policy import Policy
 from src.services.environment.warchest_env import WarChestEnv

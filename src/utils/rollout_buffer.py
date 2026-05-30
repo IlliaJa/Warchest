@@ -7,6 +7,7 @@ class RolloutBuffer:
 
     Episode boundaries are tracked so GAE is computed correctly within each episode.
     Observations are stored as copied dicts to prevent aliasing with the live env state.
+    obs['board'] is the pre-encoded [8,7,7] float32 array produced by generate_observation.
     """
 
     def __init__(self):
@@ -29,11 +30,9 @@ class RolloutBuffer:
         self._opp_onehots.append(opp_onehot)
 
     def end_episode(self):
-        """Mark the end of the current episode for GAE boundary tracking."""
         self._episode_ends.append(len(self._rewards))
 
     def append_terminal_reward(self, reward):
-        """Add a terminal reward to the last recorded step (opponent win or truncation)."""
         if self._rewards:
             self._rewards[-1] += reward
 
@@ -68,59 +67,15 @@ class RolloutBuffer:
         self.raw_ret_std = ret_t.std().item()
 
         adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
-        # returns stay in original reward scale — critic must predict V in the same scale
-        # as the rewards; normalizing here would create a scale mismatch in GAE's delta
 
         self.advantages = adv_t.to(device)
         self.returns = ret_t.to(device)
 
-    def get_batch(self, device):
-        """Return a randomly shuffled batch dict of all buffer steps as tensors.
-
-        Numpy arrays that still require policy-side encoding (board, exploration_map,
-        active_player) are returned as numpy; everything else lands on device as a tensor.
-        Call once per PPO epoch so each epoch sees a different shuffle.
-        """
-        N = len(self._obs)
-        perm = np.random.permutation(N)
-        obs = self._obs  # local alias to avoid repeated attribute lookup
-
-        boards = np.stack([obs[i]['board'] for i in perm])
-        exploration_maps = np.stack([obs[i]['exploration_map'] for i in perm])
-        active_players = np.array([obs[i]['active_player'] for i in perm])
-
-        lp_old = torch.stack(self._log_probs_old)
-        return {
-            'boards': boards,
-            'exploration_maps': exploration_maps,
-            'active_players': active_players,
-            'global': torch.tensor(
-                np.stack([obs[i]['global'] for i in perm]), dtype=torch.float32
-            ).to(device),
-            'units': torch.tensor(
-                np.stack([obs[i]['units'] for i in perm]), dtype=torch.float32
-            ).to(device),
-            'mask': torch.tensor(
-                np.stack([obs[i]['valid_action_mask'].astype(bool) for i in perm]),
-                dtype=torch.bool,
-            ).to(device),
-            'opp_onehot': torch.tensor(
-                np.stack([self._opp_onehots[i] for i in perm]), dtype=torch.float32
-            ).to(device),
-            'actions': torch.tensor(
-                [self._actions[i] for i in perm], dtype=torch.long
-            ).to(device),
-            'log_probs_old': lp_old[perm].to(device),
-            'advantages': self.advantages[perm],
-            'returns': self.returns[perm],
-        }
-
     def iter_minibatches(self, batch_size, device):
-        """Yield mini-batch dicts of size batch_size in random order.
+        """Yield mini-batch dicts in random order.
 
-        Advantages and returns are pre-normalized buffer-wide in compute_gae.
-        Boards/exploration_maps/active_players are returned as numpy for
-        policy-side encoding in the training loop.
+        obs['board'] is already a [8,7,7] float32 array; it is stacked directly
+        into the batch tensor without any further encoding.
         """
         N = len(self._obs)
         perm = np.random.permutation(N)
@@ -131,14 +86,11 @@ class RolloutBuffer:
         for start in range(0, N, batch_size):
             idx = perm[start:start + batch_size]
             yield {
-                'boards': np.stack([obs[i]['board'] for i in idx]),
-                'exploration_maps': np.stack([obs[i]['exploration_map'] for i in idx]),
-                'active_players': np.array([obs[i]['active_player'] for i in idx]),
+                'board': torch.tensor(
+                    np.stack([obs[i]['board'] for i in idx]), dtype=torch.float32
+                ).to(device),
                 'global': torch.tensor(
                     np.stack([obs[i]['global'] for i in idx]), dtype=torch.float32
-                ).to(device),
-                'units': torch.tensor(
-                    np.stack([obs[i]['units'] for i in idx]), dtype=torch.float32
                 ).to(device),
                 'mask': torch.tensor(
                     np.stack([obs[i]['valid_action_mask'].astype(bool) for i in idx]),

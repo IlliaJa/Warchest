@@ -67,46 +67,13 @@ topology governs unit-adjacency reasoning directly.
 
 ---
 
-## Future work: spatial unit channels
+## 2026-05-30 — Attack + deploy actions and spatial conv action head
 
-The board encoder currently sees terrain only. Its 6 channels are:
+**Decision.** Added `attack` (instant-kill adjacent enemy) and `deploy` (place a new unit on a controlled empty base, lifetime cap `MAX_DEPLOYS=4`) as new action types, and simultaneously migrated the policy to a **spatial, cell-keyed convolutional action head** — the architecture flagged in *Future work: spatial unit channels* below. Unit positions now occupy two dedicated board planes (channels 6–7 for own/opp units); the flat actor MLP and separate `unit_encoder` are replaced by a `Conv2d → [14, 7, 7]` logit map (`action_dim = 686`), with global features broadcast as extra planes. P2 rotation reduces to a single `rot90` + direction-channel flip with no per-action-type tables. See `docs/attack_deploy_plan.md` for the full design rationale and decision log, and `docs/experiments.md` § *2026-05-30* for results.
 
-```
-0: INVALID cells (corners that mask the hex into a square)
-1: EMPTY cells
-2: UNCONTROLLED bases
-3: MY controlled bases
-4: OPP controlled bases
-5: exploration map
-```
+**Why now.** Attack is the first action whose validity depends on a unit being adjacent to another unit — exactly the trigger stated in *Future work* below. Pulling in the spatial head at the same time avoids a double migration later, and the chess comparison (AlphaZero: 4672-dim spatial head, Leela: 1858) confirmed that head size is not the concern; translation-equivariant location logic is. The result validated the timing: `wr_vs_greedy_train` reached **~90%** by step ~270, surpassing the 80% peak of the move-only game.
 
-Unit positions are passed separately as raw `(r, q)` coordinates through
-`Policy.unit_encoder` (`Linear(2, 16) → ReLU → Linear(16, 32)`), then
-mean-pooled per side into a 64-d "my units + opp units" vector that is
-concatenated with the board features at the actor head. **The conv encoder
-never sees a unit.** Unit-vs-unit reasoning is happening entirely in the
-actor head MLP, fed by an averaged coordinate encoding — a clunky
-representation for "are my unit and the opponent's unit on hex-adjacent
-cells".
+**What it supersedes.** The *Future work: spatial unit channels* section below is now implemented. The legacy `unit_encoder` MLP, flat action table, and separate slot-keyed unit observation array are all removed. `reinforce.py` and `policy_viz.py` are deprecated (incompatible with the new interfaces).
 
-When the game gains attack / strike actions (where adjacency to enemy
-units becomes a first-class concept), the right architectural fix is to add
-unit positions as additional channels in `encode_board`:
+---
 
-- channel 6: `1` where my units are
-- channel 7: `1` where opp units are
-- later: per-unit-type channels for swordsman / archer / etc.
-
-With units in the spatial encoding, "is there an enemy on a hex-adjacent
-cell" becomes a single `HexConv2d` step on the correct topology — exactly
-the operation needed for strike actions. The hex-conv decision above
-compounds with this change: it is the substrate, this is the use case.
-
-The separate `unit_encoder` MLP can then either be removed (if all unit
-information is captured spatially) or retained for per-unit metadata that
-doesn't fit spatially — HP, ability cooldown, coin colour, etc.
-
-**Do not make this change until attack actions actually exist.** It adds
-parameters and complexity that buy nothing for the current 2-unit,
-move-only prototype. The trigger to revisit is: adding any action whose
-validity depends on a unit being adjacent to another unit.

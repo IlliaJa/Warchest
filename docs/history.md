@@ -1,0 +1,53 @@
+# Training history — implemented improvements
+
+Consolidated record of all applied fixes and architectural changes. For the reasoning behind each item see the source doc noted in each section header.
+
+---
+
+## Phase 1 — REINFORCE era: correctness fixes
+
+*Source: `docs/IDEAS.md`. These unblocked training from producing a policy worse than random.*
+
+| # | What was fixed | Effect |
+|---|---|---|
+| 1 | **Egocentric observation.** `generate_observation` now always puts the active player in slot 0; swaps base counts and board channels. Dropped the `active_player` scalar. | Eliminated directly contradictory gradients in self-play. Single biggest unblocking fix — went from WR < 0.5 to meaningful learning. |
+| 2 | **`observation_space` shape.** Declared `global_features=3` but emitted 4. Fixed to match. | Removed latent shape mismatch. |
+| 3 | **Reward shaping reset.** `MOVE_ON_BASE_REWARD` and `MOVE_NEAR_BASE_REWARD` were gated by flags that were never reset — silent after the first visit per episode. Replaced with a live distance-based signal. | Gave the critic a signal in the middle 80 turns of each game. |
+| 4 | **`make_random_step` credit assignment.** When the policy picked an invalid action the env ran a random step but paired the random reward with the policy's log-prob. Now treated as a non-learning step. | Latent footgun removed (zero-count in logs, but wrong in principle). |
+| 5 | **Random player's GAE.** The GAE loop ran for both players even when one was the random bot, producing meaningless advantages and a spurious `critic_loss≈0.038` in every log line. Now skipped for the random side. | Log clarity; minor compute saving. |
+| 6 | **Sorted units ordering.** `generate_observation` sorted by class name; `get_active_player_units` used raw `board.units` order. Now both use `board.units` directly. | Prevented silent unit-ID mismatch when a second unit type is added. |
+| 7 | **`gamma=0.99`.** Previous `gamma=0.9` made `0.9^99 ≈ 3×10⁻⁵` — win reward invisible to the critic for the first 50 turns. | Propagated win signal meaningfully through long episodes. |
+| 8 | **`CLAIM_BASE_REWARD` balance.** Was 0.03 vs WIN_REWARD=1.0; cumulative claim reward (0.12) was negligible relative to the win. Raised to give claims comparable signal to the win in truncated episodes. | Gave the policy a reason to claim bases instead of just not losing. |
+| 9 | **Return normalisation for critic.** Advantages were normalised but returns (the critic target) were not. With `gamma=0.99` and dense rewards the return scale grew unbounded. Added running mean/std on returns. | Stabilised critic targets across varying episode lengths. |
+
+---
+
+## Phase 2 — Architecture migration
+
+*Source: `docs/IDEAS.md`. Large structural changes that moved the project from REINFORCE to PPO.*
+
+**Separate actor/critic encoders (#13).** Gave `Policy` and `Critic` independent `board_encoder + unit_encoder` instances. Critic now takes a privileged `opp_onehot` input the actor never sees; separate `Adam` instances (`lr_actor=1e-4`, `lr_critic=3e-4`) honour different learning rates without interference. See `docs/rl_algorithms.md` → *Architecture: shared vs separate actor-critic encoders* for the full rationale.
+
+**PPO migration (#14).** Replaced REINFORCE+GAE with PPO (`src/app/ppo.py`). Same actor-critic network; added rollout buffer, clipped surrogate loss, and inner epoch loop. `src/app/reinforce.py` retained as legacy reference.
+
+**Opponent pool (#16).** `src/services/opponent_pool.py` — weighted sampler over random / greedy / past policy snapshots. Breaks the co-adaptation cycle that caused WR to *decline* over training under pure self-play.
+
+**Hex-aware encoder (#15 / C13).** Replaced the standard 2D `Conv2d` with `HexConv2d` (custom kernel using the 6 hex-direction offsets). Removed the false-diagonal / missing-neighbour bias of the 3×3 square kernel on a hex grid. See `docs/decision.md`.
+
+---
+
+## Phase 3 — PPO era: stability and tuning fixes
+
+*Source: `docs/improvement_ideas.md` run `ppo_20260527-191432`. Starting point: WR vs greedy ~5–15%, critic MAE growing, entropy collapsing. Ending point: WR ~49%.*
+
+| ID | What was fixed | Effect |
+|---|---|---|
+| C1 | **`ppo_epochs=4`.** Was 1 — PPO was silently A2C, clipping never active. Set to 4 (canonical default). | ~4× more gradient updates per episode. Biggest single fix. |
+| C2 | **Normalise `action_count` in globals.** Was emitted raw (0–100), 100× larger than all other features. Divided by `max_actions`; also normalised `my_bases/6`, `opp_bases/6`. | Critic MAE started trending down instead of up. |
+| C3 | **Opponent pool diversity.** `snapshot_every=1` meant the pool contained only the last 20 policies by batch 50. Set `snapshot_every=3`. | Stabilised the return distribution; older, weaker opponents stayed in the pool. |
+| C4 | **PBR reward shaping + steal incentive.** Two bugs: (1) `phi_after` was measured after own move, not after opponent — breaking the potential-based telescoping; (2) stepping onto an enemy-controlled base triggered `MOVE_NEG_REWARD_PER_TURN`, punishing the very action that leads to stealing. | Unblocked the "policy never steals" failure mode. |
+| C5 | **Clipped value loss.** Plain `F.mse_loss` on the critic caused two NaN events (batches 133, 143, `grad_c=46`). Added PPO-style clipped value loss with `clip_range=0.2`. | Eliminated NaN events and late-training critic instability. |
+| C6 | **180° board rotation for P2.** The spatial encoder saw absolute board orientation — player 2's units always in the bottom-right corner. Added `np.rot90(board, 2)` (and action remapping) when `active_player==2`. | Lifted WR vs greedy from ~33% to ~49%. Effectively doubled spatial data efficiency. |
+| C7 | **Entropy coefficient.** Was 0.005 — quickly outscaled by actor loss. Raised to 0.025. | Maintained exploration deeper into training; prevented premature commitment to the first "good enough" move. |
+| C11 | **`hidden_dim=128`.** Was 64 — a 49× spatial compression bottleneck. Doubled to 128. | Modest convergence speed improvement; meaningful with the separate-encoder design. |
+| C13 | **`HexConv2d` board encoder.** Already done as part of phase 2 (see above), confirmed in `src/services/policy/policy.py`. | — |

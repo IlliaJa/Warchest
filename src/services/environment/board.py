@@ -75,6 +75,15 @@ class Board:
     def all_cells_list(self):
         return list(zip(*np.where(self.board != INVALID_CELL_ID)))
 
+    def get_unit_at(self, r: int, q: int):
+        for u in self.units:
+            if u.loc == (r, q):
+                return u
+        return None
+
+    def remove_unit(self, unit):
+        self.units.remove(unit)
+
     def is_valid_claim(self, player_id, cell_loc):
         available_cells_for_claim = {
             1: (CONTROLLED_BASE_PLAYER_2_CELL_ID, UNCONTROLLED_BASE_CELL_ID),

@@ -10,7 +10,8 @@ Turn-based hex-grid strategy game with a reinforcement learning agent (REINFORCE
 - [Policy network](docs/policy_network.md) — CNN + MLP architecture, encoding, hyperparameters
 - [Training guide](docs/training.md) — algorithm, hyperparameters, W&B metrics, cloud training
 - [Environment API](docs/environment_api.md) — Gymnasium interface, observation/action spaces, Board API
-- [Improvement ideas](docs/improvement_ideas.md) — issues found from log analysis, prioritised fixes
+- [Ideas](docs/IDEAS.md) — open issues (top) + REINFORCE-era archive (bottom)
+- [Training history](docs/history.md) — implemented fixes and their observed effects
 - [RL algorithms](docs/rl_algorithms.md) — GAE, PPO, DQN, and alternatives with Warchest-specific trade-offs
 - [Metrics reference](docs/METRICS.md) — W&B metrics explained: ideal ranges, trends, warning signs
 

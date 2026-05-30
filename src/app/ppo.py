@@ -11,7 +11,7 @@ import time
 import wandb
 
 from src.services.policy.policy import Policy, Critic
-from src.services.environment.warchest_env import WarChestEnv, WIN_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION
+from src.services.environment.warchest_env import WarChestEnv, WIN_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION, DEPLOY_ACTION
 from src.services.opponent_pool import OpponentPool
 from src.utils.rollout_buffer import RolloutBuffer
 from src.services.bots import GreedyBot, RandomBot
@@ -136,11 +136,7 @@ class PPOTrainer:
         self._wr_vs_greedy = deque(maxlen=100)
 
         # pre-computed once; actor-side params are needed for separate gradient clipping
-        self._actor_side_params = (
-            list(self._policy.board_encoder.parameters())
-            + list(self._policy.unit_encoder.parameters())
-            + list(self._policy.actor_head.parameters())
-        )
+        self._actor_side_params = list(self._policy.parameters())
 
         self._ret_normalizer = ReturnNormalizer()
 
@@ -185,6 +181,8 @@ class PPOTrainer:
         outcome = 'truncated'
         invalid_count = 0
         claims = 0
+        deploys = 0
+        deploy_turns = []
         main_score = 0.0
         turns = 0
 
@@ -234,6 +232,9 @@ class PPOTrainer:
 
                 if step_info['action'].type == CLAIM_BASE_ACTION and step_info['action'].is_valid:
                     claims += 1
+                if step_info['action'].type == DEPLOY_ACTION and step_info['action'].is_valid:
+                    deploys += 1
+                    deploy_turns.append(turn)
 
                 self._buffer.add_step(obs_before, action, log_prob, shaped_reward, value, opp_onehot)
             else:
@@ -275,6 +276,8 @@ class PPOTrainer:
             'turns': turns,
             'invalid_count': invalid_count,
             'claims': claims,
+            'deploys': deploys,
+            'deploy_turns': deploy_turns,
             'main_score': main_score,
             'main_pid': main_pid,
             'opp_type': opp_type,
@@ -290,12 +293,6 @@ class PPOTrainer:
         critic_stats = self._update_critic(batch_num)
         return {**actor_stats, **critic_stats}
 
-    def _encode_batch(self, batch: dict) -> None:
-        encoded = Policy.encode_board_batch(
-            batch['boards'], batch['exploration_maps'], batch['active_players']
-        )
-        batch['board'] = torch.tensor(encoded, dtype=torch.float32).to(self._device)
-
     def _update_actor(self, batch_num: int) -> dict:
         kl_accum = 0.0
         actor_accum = 0.0
@@ -309,8 +306,6 @@ class PPOTrainer:
             if done:
                 break
             for batch in self._buffer.iter_minibatches(self._minibatch_size, self._device):
-                self._encode_batch(batch)
-
                 lp_new, ent = self._policy.evaluate_actions_batch(batch)
                 lp_old = batch['log_probs_old']
                 ratio = (lp_new - lp_old).exp()
@@ -374,8 +369,6 @@ class PPOTrainer:
             if done:
                 break
             for batch in self._buffer.iter_minibatches(self._minibatch_size, self._device):
-                self._encode_batch(batch)
-
                 ret = batch['returns']
                 ret_n = self._ret_normalizer.normalize(ret)
                 v_old_n = self._ret_normalizer.normalize(batch['values_old'])
@@ -409,7 +402,7 @@ class PPOTrainer:
                 val_raw = self._ret_normalizer.denormalize(val_n.detach())
                 critic_mae_accum += (val_raw - ret).abs().mean().item()
                 critic_mean_accum += val_raw.mean().item()
-                critic_std_accum += val_raw.std().item()
+                critic_std_accum += val_raw.std(correction=0).item()
                 n_critic_updates += 1
 
         denom = max(n_critic_updates, 1)
@@ -524,6 +517,10 @@ class PPOTrainer:
             f"{ep['outcome'][0]}({ep['opp_type'][0]})" for ep in self._batch_eps
         )
 
+        all_deploy_turns = [t for ep in self._batch_eps for t in ep['deploy_turns']]
+        avg_deploys = float(np.mean([ep['deploys'] for ep in self._batch_eps]))
+        deploy_turn_mean = float(np.mean(all_deploy_turns)) if all_deploy_turns else 0.0
+
         logger.debug(
             f'batch={batch_num} n_actor={s["n_actor_updates"]} n_critic={s["n_critic_updates"]} '
             f'adv mean={self._buffer.raw_adv_mean:.4f} std={self._buffer.raw_adv_std:.4f} '
@@ -539,6 +536,7 @@ class PPOTrainer:
             f'kl={s["avg_kl"]:.4f} ent={s["avg_entropy"]:.3f} '
             f'grad_a={s["last_actor_grad"]:.3f} grad_c={s["last_critic_grad"]:.3f} '
             f'pool={len(self._pool)} turns={avg_turns:.0f} invalid={total_invalid} '
+            f'deploys={avg_deploys:.2f} deploy_turn={deploy_turn_mean:.0f} '
             f't={time.time() - self._batch_start:.2f}s'
         )
 
@@ -557,11 +555,13 @@ class PPOTrainer:
                 'critic_mae': s['avg_critic_mae'],
                 'advantage_std': self._buffer.raw_adv_std,
                 'avg_turns': avg_turns,
+                'avg_deploys_per_ep': avg_deploys,
+                'deploy_turn_mean': deploy_turn_mean,
             })
 
 
 if __name__ == '__main__':
-    use_wandb = bool(1)
+    use_wandb = True
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     run_id = time.strftime('%Y%m%d-%H%M%S')
@@ -592,7 +592,6 @@ if __name__ == '__main__':
         'minibatch_size': 64,
         'lr_actor': 1e-4,
         'lr_critic': 3e-4,
-        'action_space': environment.action_space.n,
         'hidden_dim': 64,
         'print_every': 10,
         # opponent sampling weights — initial phase (random opponent included)
@@ -627,20 +626,11 @@ if __name__ == '__main__':
         logger.info(f'wandb_run={run.url}')
 
     def policy_constructor():
-        return Policy(
-            action_dim=hp['action_space'],
-            device=device,
-            hidden_dim=hp['hidden_dim'],
-        )
+        return Policy(device=device, hidden_dim=hp['hidden_dim'])
 
     warchest_policy = policy_constructor().to(device)
     warchest_critic = Critic(device=device, hidden_dim=hp['hidden_dim']).to(device)
-    actor_optimizer = optim.Adam(
-        list(warchest_policy.board_encoder.parameters())
-        + list(warchest_policy.unit_encoder.parameters())
-        + list(warchest_policy.actor_head.parameters()),
-        lr=hp['lr_actor'],
-    )
+    actor_optimizer = optim.Adam(warchest_policy.parameters(), lr=hp['lr_actor'])
     critic_optimizer = optim.Adam(warchest_critic.parameters(), lr=hp['lr_critic'])
 
     trainer = PPOTrainer(
@@ -655,10 +645,15 @@ if __name__ == '__main__':
     )
 
     exception_for_raising = None
+    save_model = True
     try:
         trainer.train()
     except KeyboardInterrupt:
         logger.info('Training interrupted by user')
+        sys.stdout.write('Save results? (y/n)')
+        sys.stdout.flush()
+        save_results = sys.stdin.buffer.readline().decode('utf-8', errors='replace').strip()
+        save_model = save_results == 'y'
     except Exception as e:
         exception_for_raising = e
         logger.exception(f'Training failed: {e}')
@@ -666,10 +661,7 @@ if __name__ == '__main__':
         if exception_for_raising is not None:
             raise exception_for_raising
         else:
-            sys.stdout.write('Save results? (y/n)')
-            sys.stdout.flush()
-            save_results = sys.stdin.buffer.readline().decode('utf-8', errors='replace').strip()
-            if save_results == 'y':
+            if save_model:
                 timestamp = time.strftime('%Y%m%d-%H%M')
                 filename = f'warchest_ppo_{timestamp}.pth'
                 os.makedirs('data', exist_ok=True)
