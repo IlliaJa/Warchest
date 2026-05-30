@@ -23,6 +23,11 @@ UNIT_COLORS = {
     1: 'darkred',
     2: 'midnightblue'
 }
+COIN_ICONS = {
+    COIN_SWORD: '♖',
+    COIN_KNIGHT: '♞',
+    COIN_ROYAL: '♚',
+}
 
 MOVE_ACTION = 'move'
 ATTACK_ACTION = 'attack'
@@ -171,11 +176,14 @@ class WarChestEnv(gym.Env):
 
     def set_init_state(self):
         # Board starts with control markers on the starting locations but NO units;
-        # units are deployed from hand during play.
+        # units are deployed from hand during play. Initiative (and thus who acts
+        # first) is assigned randomly, mirroring the setup Initiative Marker flip.
         board = Board()
         map_ = np.where(board.board == INVALID_CELL_ID, INVALID_CELL_ID, 0)
         self.exploration_map_dict = {1: map_.copy(), 2: map_.copy()}
-        self.state = GameState(board=board, active_player=1, action_count=0)
+        owner = int(np.random.choice([1, 2]))
+        self.state = GameState(board=board, active_player=owner, action_count=0,
+                               initiative_owner=owner)
         if self.history is not None:
             self.history = [deepcopy(self.state)]
 
@@ -225,6 +233,8 @@ class WarChestEnv(gym.Env):
         self.state.round_number += 1
 
     def _spend_coin(self, coin: int):
+        self.state.last_coin = coin
+        self.state.last_coin_player = self.active_player
         self.state.hands[self.active_player].discard(coin)
 
     def step(self, action_id):
@@ -237,6 +247,7 @@ class WarChestEnv(gym.Env):
 
         if action.is_valid:
             self.action_count += 1
+            self.state.last_action_type = action_type
             if not action.finishes_game:
                 self._advance_turn()
             if self.history is not None:
@@ -282,6 +293,21 @@ class WarChestEnv(gym.Env):
             x, y = self.convert_hex_grid_to_cartesian(*_unit.loc, hex_radius=hex_radius)
             ax.text(x, y, s=_unit.icon, ha='center', va='center', fontsize=30,
                     color=UNIT_COLORS[_unit.player_id])
+
+        # Initiative mark (top-left) and the coin spent on the action that produced
+        # this state (top-right). Drawn as axes text so they survive even when the
+        # replay renderer overwrites the title.
+        owner = self.state.initiative_owner
+        ax.text(0.02, 0.98, f'★ initiative P{owner}', transform=ax.transAxes,
+                ha='left', va='top', fontsize=12, fontweight='bold',
+                color=UNIT_COLORS[owner])
+        if self.state.last_coin is not None:
+            player = self.state.last_coin_player
+            ax.text(0.98, 0.98, COIN_ICONS[self.state.last_coin], transform=ax.transAxes,
+                    ha='right', va='top', fontsize=28, color=UNIT_COLORS[player])
+            ax.text(0.98, 0.85, f'P{player} {self.state.last_action_type or ""}',
+                    transform=ax.transAxes, ha='right', va='top', fontsize=9,
+                    color=UNIT_COLORS[player])
 
         ax.set_aspect('equal')
         ax.autoscale_view()

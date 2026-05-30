@@ -23,5 +23,9 @@ class GameState:
     # Initiative may transfer at most once per round.
     initiative_transferred_this_round: bool = False
     round_number: int = 0
+    # Last action taken (for rendering); set on each valid coin play.
+    last_action_type: str = None
+    last_coin: int = None
+    last_coin_player: int = None
     is_terminated = False
     is_truncated = False
