@@ -17,17 +17,19 @@ class RolloutBuffer:
         self._rewards = []
         self._values = []
         self._opp_onehots = []
+        self._privileged = []
         self._episode_ends = []
         self.advantages = None
         self.returns = None
 
-    def add_step(self, obs, action, log_prob, reward, value, opp_onehot):
+    def add_step(self, obs, action, log_prob, reward, value, opp_onehot, privileged):
         self._obs.append(obs)
         self._actions.append(action)
         self._log_probs_old.append(log_prob.detach().cpu())
         self._rewards.append(float(reward))
         self._values.append(value.detach().cpu())
         self._opp_onehots.append(opp_onehot)
+        self._privileged.append(privileged)
 
     def end_episode(self):
         self._episode_ends.append(len(self._rewards))
@@ -99,6 +101,9 @@ class RolloutBuffer:
                 'opp_onehot': torch.tensor(
                     np.stack([self._opp_onehots[i] for i in idx]), dtype=torch.float32
                 ).to(device),
+                'privileged': torch.tensor(
+                    np.stack([self._privileged[i] for i in idx]), dtype=torch.float32
+                ).to(device),
                 'actions': torch.tensor(
                     [self._actions[i] for i in idx], dtype=torch.long
                 ).to(device),
@@ -127,6 +132,7 @@ class RolloutBuffer:
         self._rewards.clear()
         self._values.clear()
         self._opp_onehots.clear()
+        self._privileged.clear()
         self._episode_ends.clear()
         self.advantages = None
         self.returns = None

@@ -37,3 +37,21 @@ Chronological record of training runs — what changed, when, and what the metri
 **Results:** `wr_vs_greedy_train` climbed from near 0 to **~90% by step ~270**, well above the 80% peak of the previous run on the move-only game. The curve shows a consistent upward trend with no regression — the richer action set (attack pressure, deploy recovery) and the spatially-coherent head appear to make the learning problem structurally easier for the agent, not harder. Attack and deploy actions are both used by the trained policy.
 
 ![wr_vs_greedy_train](../src/app/../.claude/image-cache/d6caddcd-b06a-442e-a19c-41da97c16ea1/2.png)
+
+---
+
+## 2026-05-31 — Full coin economy (Phase 1c), ~650 batches
+
+**Changes:** First training run on the complete Phase 1 coin/bag economy (Phase 1a→1c). The env is now faithful two-unit-type War Chest: a per-player **bag** (2 Swordsman + 2 Knight + 1 Royal) with a random 3-coin draw each round, discard + reshuffle; **round/turn controller** with initiative (randomised at setup, claim-initiative transfers it ≤ once/round); coins **bind to the board** (deploy moves a coin hand→board; **coin-stack HP** via bolster; attack removes one coin to the box); **recruit** from a per-type supply; **pass**. Action space is the temporary flat head, now `796` (spatial `16×49` incl. deploy-S/K + bolster, plus 12 face-down slots for claim/pass/recruit). Observation `OBS_VERSION=3`, `GLOBAL_DIM=28`: ego-centric coin-counting features (own hand/bag/discard/supply known; opponent on-board/face-up-discard/supply + derived `hidden_pool`), unit planes carry stack height. **Privileged critic** wired (`PRIV_DIM=9` — opponent's true hidden hand/bag/face-down split, never seen by the policy).
+
+**Results:** Strong, healthy convergence over ~650 batches.
+- `wr_vs_greedy_eval` rises to **~0.9** and holds there from ~step 220 onward (peaks near 1.0); `wr_vs_greedy_train` tracks it at **~0.9**.
+- `wr_vs_random_eval` saturates at **1.0** within ~20 steps and stays flat.
+- `wr_vs_pool_train` (self-play vs the opponent-pool snapshots) sits at **~0.5**, oscillating 0.4–0.6 — the expected equilibrium for self-play and a sign the pool is keeping pace.
+- `score_main` plateaus around **0.9–1.0**; `grad_norm_critic` stays low (~2–5) with only occasional spikes (≤27) — stable value learning, no divergence.
+
+The full coin economy is learnable end-to-end: the agent masters the much larger action/observation space and beats greedy at the same ~90% it reached on the far simpler move+attack+deploy prototype, while self-play stays balanced.
+
+**Caveats.** (1) `GreedyBot` ignores bolster and recruit, so "WR vs greedy" is a softer bar than full-economy play — the agent is beating an economy-blind, myopic bot. (2) The privileged critic is in use but **not yet A/B'd** against a public-only critic, so its contribution to this result is unmeasured. Both are open items before reading too much into the 90%.
+
+![Phase 1c training curves](assets/2026-05-31-phase1c.png)

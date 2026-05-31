@@ -12,7 +12,7 @@ import wandb
 
 from src.services.policy.policy import Policy, Critic
 from src.services.environment.warchest_env import WarChestEnv, WIN_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION, DEPLOY_ACTION
-from src.services.environment.game_state import DECK
+from src.services.environment.game_state import HAND_SIZE
 from src.services.opponent_pool import OpponentPool
 from src.utils.rollout_buffer import RolloutBuffer
 from src.services.bots import GreedyBot, RandomBot
@@ -197,9 +197,13 @@ class PPOTrainer:
 
             if acting_pid == main_pid:
                 obs_before = copy_obs(state)
+                # Privileged critic input: the opponent's true hidden coin split,
+                # captured at the main player's decision point. Never seen by the policy.
+                privileged = self._env.get_privileged_features()
+                privileged_t = torch.tensor(privileged, dtype=torch.float32).unsqueeze(0).to(self._device)
                 action, log_prob, _ = self._policy.act(obs_before)
                 with torch.no_grad():
-                    value_norm = self._critic.value_single(obs_before, opp_onehot_t)
+                    value_norm = self._critic.value_single(obs_before, opp_onehot_t, privileged_t)
                     value = torch.tensor(
                         self._ret_normalizer.denormalize(value_norm.item()),
                         dtype=torch.float32,
@@ -237,7 +241,7 @@ class PPOTrainer:
                     deploys += 1
                     deploy_turns.append(turn)
 
-                self._buffer.add_step(obs_before, action, log_prob, shaped_reward, value, opp_onehot)
+                self._buffer.add_step(obs_before, action, log_prob, shaped_reward, value, opp_onehot, privileged)
             else:
                 with torch.no_grad():
                     action, _, _ = opp.act(state)
@@ -578,7 +582,7 @@ if __name__ == '__main__':
     # is about max_rounds * coins-per-round.
     holding_reward_rate = (
         WIN_REWARD
-        / ((environment.winning_base_count - 1) * (environment.max_rounds * len(DECK)))
+        / ((environment.winning_base_count - 1) * (environment.max_rounds * HAND_SIZE))
         * 0.8  # 0.8 is a safety margin so worst-case holding never exceeds WIN_REWARD
     )
 

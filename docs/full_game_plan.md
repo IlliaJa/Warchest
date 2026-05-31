@@ -117,7 +117,15 @@ are still unspent) and **initiative ownership**. Unit planes gain a type channel
 boundary, initiative default & once-per-round transfer. **Exit:** stable training; turn
 controller tests pass; archive `baseline_deck_v1`.
 
-### Phase 1b — The BAG (stochastic draws; partial observability enters)
+### Phase 1b — The BAG (stochastic draws; partial observability enters)  ✅ implemented (2026-05-31)
+
+Bag = `2 S + 2 K + 1 R` per player; draw 3/round with reshuffle; maneuvers discard face-up,
+face-down actions face-down. **Coins bind to the board**: deploy moves a coin hand→board,
+attack sends the enemy's coin to the **box** (out of game). Hand is now a `Counter` (multiset).
+`GLOBAL_DIM` 8→23 (own known counts + opponent public counts + `hidden_pool`); **privileged
+critic** wired (`PRIV_DIM=9` = opp true hand/bag/face-down, plumbed through the buffer). Action
+space unchanged (741); bots unchanged. Tests: `tests/test_phase1b.py` + updated
+`tests/test_phase1a.py` (35 total). Note: privileged-critic *benefit* still to be A/B'd.
 
 **Phase 1b implements the bag.** War Chest is a *bag-builder* (not a deck-builder — there is
 no "deck" in the rules). 1a gave every player the same three coins in hand each round with no
@@ -169,7 +177,17 @@ the opponent's `hidden_pool` stays a learned reactive heuristic. Stronger belief
 **Tests:** draw/reshuffle correctness, discard accounting, face-up/face-down tracking, the
 1–2-coin draw edge. **Exit:** stable training under stochastic draws; archive `baseline_bag_v2`.
 
-### Phase 1c — Coin stacks (HP) + bolster + recruit + supply
+### Phase 1c — Coin stacks (HP) + bolster + recruit + supply  ✅ implemented (2026-05-31)
+
+Units carry a `stack` height (HP). **Bolster** = new spatial verb 15 (cell-targeted; type from
+the unit there) moves a matching coin hand→stack. **Attack** removes one coin to the box; unit
+dies at 0. **Supply** = 2 per unit type (total owned 4 S / 4 K / 1 R); **recruit** = face-down
+action paying any hand coin (full agency over pay-coin × take-type, 6 slots) and taking a supply
+coin into the face-up discard. Action space 741→**796** (verb 15 + 6 recruit slots);
+`GLOBAL_DIM` 23→**28** (`OBS_VERSION=3`: stack-height unit planes, own/opp supply, initiative-
+transferred flag; `hidden_pool` now subtracts the public supply). Renderer shows stack badges +
+supply panel. Tests: `tests/test_phase1c.py` (42 total). GreedyBot left as-is (ignores
+bolster/recruit — still a legal, myopic yardstick).
 
 **Goal.** Add the HP model and the placement/economy actions (the "coin stacks now"
 decision lands here).

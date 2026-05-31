@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from ..environment.warchest_env import (
     N_VERBS, BOARD_DIM, ACTION_SPACE_SIZE, GLOBAL_DIM,
-    BOARD_CHANNELS, SPATIAL_SIZE, FACEDOWN_SIZE,
+    BOARD_CHANNELS, SPATIAL_SIZE, FACEDOWN_SIZE, PRIV_DIM,
 )
 
 
@@ -131,12 +131,14 @@ class Policy(nn.Module):
 class Critic(nn.Module):
     """Separate value network with its own spatial encoder.
 
-    Privileged at training time: receives a 3-d opponent one-hot (random/greedy/pool)
-    that the policy never sees.
+    Privileged at training time, in two ways the policy never sees:
+      - a 3-d opponent one-hot (random / greedy / pool);
+      - a PRIV_DIM vector of the opponent's *true* hidden coin split
+        (opp hand / bag / face-down discard per coin). Discarded at inference.
 
     Board trunk: same HexConv2d stack as Policy → [B, Cf, 7, 7].
-    Global average pool → [B, Cf]. Concatenate with global features and opp_onehot
-    → scalar value.
+    Global average pool → [B, Cf]. Concatenate with global features, opp_onehot and
+    the privileged vector → scalar value.
     """
 
     OPP_DIM = 3
@@ -149,7 +151,7 @@ class Critic(nn.Module):
             HexConv2d(32, hidden_dim),
             nn.ReLU(),
         )
-        head_in = hidden_dim + GLOBAL_DIM + self.OPP_DIM
+        head_in = hidden_dim + GLOBAL_DIM + self.OPP_DIM + PRIV_DIM
         self.head = nn.Sequential(
             nn.Linear(head_in, hidden_dim),
             nn.ReLU(),
@@ -161,20 +163,24 @@ class Critic(nn.Module):
         )
         self.device = device
 
-    def _forward(self, board_enc, global_feats, opp_onehot):
+    def _forward(self, board_enc, global_feats, opp_onehot, privileged):
         feat = self.board_encoder(board_enc)  # [B, hidden_dim, 7, 7]
         pooled = feat.mean(dim=(-2, -1))  # global avg pool → [B, hidden_dim]
-        return self.head(torch.cat([pooled, global_feats, opp_onehot], dim=-1)).squeeze(-1)
+        combined = torch.cat([pooled, global_feats, opp_onehot, privileged], dim=-1)
+        return self.head(combined).squeeze(-1)
 
-    def value_single(self, obs, opp_onehot):
-        """V(s) for one raw observation dict. opp_onehot: (1, OPP_DIM) tensor on device."""
+    def value_single(self, obs, opp_onehot, privileged):
+        """V(s) for one raw observation dict.
+
+        opp_onehot: (1, OPP_DIM) tensor; privileged: (1, PRIV_DIM) tensor — both on device.
+        """
         board_t = torch.tensor(obs['board'], dtype=torch.float32).unsqueeze(0).to(self.device)
         global_t = torch.tensor(obs['global'], dtype=torch.float32).unsqueeze(0).to(self.device)
-        return self._forward(board_t, global_t, opp_onehot).squeeze(0)
+        return self._forward(board_t, global_t, opp_onehot, privileged).squeeze(0)
 
     def value_batch(self, batch):
         """V(s) for a pre-encoded batch.
 
-        Expects batch keys: board (N,8,7,7), global (N,GLOBAL_DIM), opp_onehot (N,3).
+        Expects batch keys: board, global, opp_onehot (N,3), privileged (N,PRIV_DIM).
         """
-        return self._forward(batch['board'], batch['global'], batch['opp_onehot'])
+        return self._forward(batch['board'], batch['global'], batch['opp_onehot'], batch['privileged'])

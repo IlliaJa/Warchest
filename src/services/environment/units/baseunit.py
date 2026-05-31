@@ -9,6 +9,7 @@ class BaseUnit(ABC):
         self.player_id = player_id
         self.board = board
         self.loc = None
+        self.stack = 1  # number of coins in the unit's stack (HP); grows with bolster
 
     def place_on_board(self, loc):
         self.loc = loc

@@ -9,7 +9,11 @@ from .cell_ids import *
 from .game_renderer import GameRenderer
 from typing import Tuple, Dict
 from .action import Action
-from .game_state import GameState, COIN_SWORD, COIN_KNIGHT, COIN_ROYAL, DECK
+from .game_state import (
+    GameState, COIN_SWORD, COIN_KNIGHT, COIN_ROYAL, DECK,
+    INITIAL_BAG, SUPPLY, INITIAL_OWNED, HAND_SIZE,
+)
+from collections import Counter
 from copy import deepcopy
 
 
@@ -35,9 +39,11 @@ CLAIM_BASE_ACTION = 'claim_base'
 DEPLOY_ACTION = 'deploy'
 CLAIM_INITIATIVE_ACTION = 'claim_initiative'
 PASS_ACTION = 'pass'
+BOLSTER_ACTION = 'bolster'
+RECRUIT_ACTION = 'recruit'
 
 # ---------------------------------------------------------------------------
-# Action encoding (Phase 1a — temporary flat head)
+# Action encoding (Phase 1c — temporary flat head)
 #
 # Spatial actions: id = verb * BOARD_DIM^2 + r * BOARD_DIM + q
 #   verb 0-5:   move in direction d
@@ -45,29 +51,54 @@ PASS_ACTION = 'pass'
 #   verb 12:    control (claim) current cell
 #   verb 13:    deploy a Swordsman onto this cell
 #   verb 14:    deploy a Knight onto this cell
+#   verb 15:    bolster the matching unit on this cell (type from the unit there)
 # Face-down actions (no board cell): appended after the spatial block.
-#   SPATIAL_SIZE + 0..2: claim_initiative paying {sword, knight, royal}
-#   SPATIAL_SIZE + 3..5: pass paying {sword, knight, royal}
+#   +0..2:  claim_initiative paying {S, K, R}
+#   +3..5:  pass            paying {S, K, R}
+#   +6..11: recruit take-type {S, K} × pay-coin {S, K, R}
 # Deploy is per-type because an empty target cell does not determine the unit;
-# move/attack/control are not, because the occupied source cell does.
+# move/attack/control/bolster are not, because the occupied source cell does.
 # ---------------------------------------------------------------------------
-N_VERBS = 15
+N_VERBS = 16
 BOARD_DIM = 7
-SPATIAL_SIZE = N_VERBS * BOARD_DIM * BOARD_DIM  # 735
-FACEDOWN_KINDS = 2  # claim_initiative, pass
-FACEDOWN_SIZE = FACEDOWN_KINDS * len(DECK)  # 6
-ACTION_SPACE_SIZE = SPATIAL_SIZE + FACEDOWN_SIZE  # 741
+SPATIAL_SIZE = N_VERBS * BOARD_DIM * BOARD_DIM  # 784
 
-# Verbs that deploy, and which unit type each deploys.
+# Verbs that deploy, and which unit type each deploys; bolster is a single verb.
 DEPLOY_VERBS = {13: COIN_SWORD, 14: COIN_KNIGHT}
+BOLSTER_VERB = 15
 UNIT_CLASS_BY_COIN = {COIN_SWORD: Swordsman, COIN_KNIGHT: Knight}
 
 # Coin <-> contiguous index, used for the face-down action block and obs encoding.
 COIN_TO_IDX = {COIN_SWORD: 0, COIN_KNIGHT: 1, COIN_ROYAL: 2}
 IDX_TO_COIN = list(DECK)
 
+# Recruitable unit types (those with a supply); the royal has none.
+RECRUIT_TYPES = tuple(c for c in DECK if SUPPLY.get(c, 0) > 0)  # (S, K)
+_RECRUIT_BLOCK = 2 * len(DECK)  # claim (3) + pass (3) precede recruit in the block
+FACEDOWN_SIZE = _RECRUIT_BLOCK + len(RECRUIT_TYPES) * len(DECK)  # 6 + 6 = 12
+ACTION_SPACE_SIZE = SPATIAL_SIZE + FACEDOWN_SIZE  # 796
+
 BOARD_CHANNELS = 10  # see Policy docstring for the channel map
-GLOBAL_DIM = 8  # [turn_frac, my_bases, opp_bases, hand_sword, hand_knight, hand_royal, my_initiative, opp_coins_left]
+
+# Unit coin types (deployable); the royal coin has no board unit.
+UNIT_COINS = (COIN_SWORD, COIN_KNIGHT)
+OWNED_TOTAL = sum(INITIAL_OWNED.values())  # 9 (used to normalize bag size)
+STACK_NORM = max(INITIAL_OWNED.values())  # 4 (max coins of one type on one stack)
+
+# Global feature layout (ego-centric, OBS_VERSION 3). Counts normalized by initial owned.
+#   [0] round fraction   [1] my bases   [2] opp bases   [3] my initiative
+#   own (known), per coin {S,K,R} unless noted:
+#     [4:7] hand   [7:10] bag   [10:13] discard   [13:15] supply {S,K}   [15] bag_size/OWNED_TOTAL
+#   opponent (public):
+#     [16:18] on_board {S,K}   [18:21] faceup_discard {S,K,R}   [21:23] supply {S,K}
+#     [23:26] hidden_pool {S,K,R}   [26] opp hand_size/HAND_SIZE
+#   [27] initiative already transferred this round
+GLOBAL_DIM = 28
+OBS_VERSION = 3
+
+# Privileged critic-only features: the opponent's true hidden split, per coin {S,K,R}.
+#   [0:3] opp hand   [3:6] opp bag   [6:9] opp face-down discard
+PRIV_DIM = 9
 
 MOVE_EXPLORE_REWARD_MAX_TURN = 5
 MOVE_EXPLORE_REWARD_PER_TURN = 0.1
@@ -79,8 +110,6 @@ WIN_REWARD = 1.0
 LOSS_REWARD = -1.0
 
 NUM_PLAYERS = 2
-
-OBS_VERSION = 1
 
 
 class WarChestEnv(gym.Env):
@@ -107,16 +136,27 @@ class WarChestEnv(gym.Env):
 
     @staticmethod
     def encode_facedown(kind: int, coin: int) -> int:
-        """kind 0 = claim_initiative, 1 = pass."""
+        """kind 0 = claim_initiative, 1 = pass, paying `coin`."""
         return SPATIAL_SIZE + kind * len(DECK) + COIN_TO_IDX[coin]
 
     @staticmethod
-    def decode_facedown(action_id: int) -> Tuple[int, int]:
-        """Return (kind, coin) for a face-down action id."""
+    def encode_recruit(take: int, pay: int) -> int:
+        """Recruit a supply coin of type `take`, paying hand coin `pay`."""
+        take_idx = RECRUIT_TYPES.index(take)
+        return SPATIAL_SIZE + _RECRUIT_BLOCK + take_idx * len(DECK) + COIN_TO_IDX[pay]
+
+    @staticmethod
+    def decode_facedown(action_id: int) -> Tuple[str, Tuple]:
+        """Return (action_type, args) for a face-down action id."""
         off = action_id - SPATIAL_SIZE
-        kind = off // len(DECK)
-        coin = IDX_TO_COIN[off % len(DECK)]
-        return kind, coin
+        if off < len(DECK):
+            return CLAIM_INITIATIVE_ACTION, (IDX_TO_COIN[off],)
+        if off < _RECRUIT_BLOCK:
+            return PASS_ACTION, (IDX_TO_COIN[off - len(DECK)],)
+        r = off - _RECRUIT_BLOCK
+        take = RECRUIT_TYPES[r // len(DECK)]
+        pay = IDX_TO_COIN[r % len(DECK)]
+        return RECRUIT_ACTION, (pay, take)
 
     @staticmethod
     def remap_action(action_id: int) -> int:
@@ -165,8 +205,10 @@ class WarChestEnv(gym.Env):
             ATTACK_ACTION: {'act_function': self.perform_attack_action},
             CLAIM_BASE_ACTION: {'act_function': self.perform_claim_base_action},
             DEPLOY_ACTION: {'act_function': self.perform_deploy_action},
+            BOLSTER_ACTION: {'act_function': self.perform_bolster_action},
             CLAIM_INITIATIVE_ACTION: {'act_function': self.perform_claim_initiative_action},
             PASS_ACTION: {'act_function': self.perform_pass_action},
+            RECRUIT_ACTION: {'act_function': self.perform_recruit_action},
         }
 
     def reset(self, seed=None, options=None):
@@ -184,6 +226,8 @@ class WarChestEnv(gym.Env):
         owner = int(np.random.choice([1, 2]))
         self.state = GameState(board=board, active_player=owner, action_count=0,
                                initiative_owner=owner)
+        for pid in (1, 2):
+            self._draw_hand(pid)
         if self.history is not None:
             self.history = [deepcopy(self.state)]
 
@@ -227,15 +271,60 @@ class WarChestEnv(gym.Env):
             self._start_new_round()
 
     def _start_new_round(self):
-        self.state.hands = {1: set(DECK), 2: set(DECK)}
         self.state.initiative_transferred_this_round = False
         self.state.active_player = self.state.initiative_owner
         self.state.round_number += 1
+        for pid in (1, 2):
+            self._draw_hand(pid)
 
-    def _spend_coin(self, coin: int):
+    def _draw_hand(self, player: int):
+        """Draw up to HAND_SIZE coins from the bag into the player's hand.
+
+        Reshuffles the discard (face-up and face-down) into the bag when it empties.
+        If fewer than HAND_SIZE coins are available in total, draws what there is
+        (the rulebook's 'not enough coins' case).
+        """
+        self.state.hands[player] = Counter()
+        for _ in range(HAND_SIZE):
+            if not self.state.bags[player]:
+                self._reshuffle(player)
+                if not self.state.bags[player]:
+                    break  # nothing left to draw
+            coin = self._draw_one(player)
+            self.state.hands[player][coin] += 1
+
+    def _reshuffle(self, player: int):
+        """Move the whole discard pile back into the bag; face-up info is lost."""
+        self.state.bags[player] += self.state.discard_faceup[player]
+        self.state.bags[player] += self.state.discard_facedown[player]
+        self.state.discard_faceup[player] = Counter()
+        self.state.discard_facedown[player] = Counter()
+
+    def _draw_one(self, player: int) -> int:
+        """Remove and return one coin chosen uniformly from the bag's contents."""
+        coins = list(self.state.bags[player].elements())
+        coin = int(np.random.choice(coins))
+        self.state.bags[player][coin] -= 1
+        if self.state.bags[player][coin] == 0:
+            del self.state.bags[player][coin]
+        return coin
+
+    def _play_coin(self, coin: int, dest: str):
+        """Remove a coin from the active player's hand and route it to `dest`.
+
+        dest: 'faceup' / 'facedown' discard, or 'board' (the coin becomes a unit).
+        """
+        active = self.active_player
+        self.state.hands[active][coin] -= 1
+        if self.state.hands[active][coin] == 0:
+            del self.state.hands[active][coin]
+        if dest == 'faceup':
+            self.state.discard_faceup[active][coin] += 1
+        elif dest == 'facedown':
+            self.state.discard_facedown[active][coin] += 1
+        # dest == 'board': the coin is now the deployed unit; nothing to store here.
         self.state.last_coin = coin
-        self.state.last_coin_player = self.active_player
-        self.state.hands[self.active_player].discard(coin)
+        self.state.last_coin_player = active
 
     def step(self, action_id):
         action_type, action_args = self.get_action_info(action_id)
@@ -293,6 +382,9 @@ class WarChestEnv(gym.Env):
             x, y = self.convert_hex_grid_to_cartesian(*_unit.loc, hex_radius=hex_radius)
             ax.text(x, y, s=_unit.icon, ha='center', va='center', fontsize=30,
                     color=UNIT_COLORS[_unit.player_id])
+            # Stack height (HP) as a small badge on the unit.
+            ax.text(x + 0.18, y + 0.18, s=str(_unit.stack), ha='center', va='center',
+                    fontsize=11, fontweight='bold', color=UNIT_COLORS[_unit.player_id])
 
         # Initiative mark (top-left) and the coin spent on the action that produced
         # this state (top-right). Drawn as axes text so they survive even when the
@@ -301,6 +393,9 @@ class WarChestEnv(gym.Env):
         ax.text(0.02, 0.98, f'★ initiative P{owner}', transform=ax.transAxes,
                 ha='left', va='top', fontsize=12, fontweight='bold',
                 color=UNIT_COLORS[owner])
+        # Round and whose turn — persistent (the title is overwritten in replay).
+        ax.text(0.5, 0.99, f'round {self.state.round_number}  ·  P{self.active_player} to act',
+                transform=ax.transAxes, ha='center', va='top', fontsize=11, color='black')
         if self.state.last_coin is not None:
             player = self.state.last_coin_player
             ax.text(0.98, 0.98, COIN_ICONS[self.state.last_coin], transform=ax.transAxes,
@@ -309,6 +404,21 @@ class WarChestEnv(gym.Env):
                     transform=ax.transAxes, ha='right', va='top', fontsize=9,
                     color=UNIT_COLORS[player])
 
+        # Per-player coin economy panel (hand / bag / discard), drawn as axes text so
+        # the bag stays visible in replay even when the title is overwritten.
+        for pid, x, ha in ((1, 0.02, 'left'), (2, 0.98, 'right')):
+            st = self.state
+            panel = (
+                f'P{pid}  hand[{self._coin_str(st.hands[pid])}]  '
+                f'bag[{self._coin_str(st.bags[pid])}]  '
+                f'fu[{self._coin_str(st.discard_faceup[pid])}]  '
+                f'fd[{self._coin_str(st.discard_facedown[pid])}]  '
+                f'sup[{self._coin_str(st.supply[pid])}]  '
+                f'box[{self._coin_str(st.boxed[pid])}]'
+            )
+            ax.text(x, 0.02, panel, transform=ax.transAxes, ha=ha, va='bottom',
+                    fontsize=8, family='monospace', color=UNIT_COLORS[pid])
+
         ax.set_aspect('equal')
         ax.autoscale_view()
         ax.set_title(self._render_status_text(), fontsize=10)
@@ -316,18 +426,17 @@ class WarChestEnv(gym.Env):
         if created_ax:
             plt.show()
 
+    @staticmethod
+    def _coin_str(counter) -> str:
+        """Compact multiset of coins, e.g. Counter({S:2, R:1}) -> 'SSR'."""
+        names = {COIN_SWORD: 'S', COIN_KNIGHT: 'K', COIN_ROYAL: 'R'}
+        return ''.join(names[c] * counter[c] for c in DECK) or '·'
+
     def _render_status_text(self) -> str:
-        coin_names = {COIN_SWORD: 'S', COIN_KNIGHT: 'K', COIN_ROYAL: 'R'}
-
-        def hand_str(pid):
-            return ''.join(coin_names[c] for c in DECK if c in self.state.hands[pid]) or '-'
-
         return (
             f'round={self.state.round_number} active=P{self.active_player} '
             f'init=P{self.state.initiative_owner} | '
-            f'P1 hand=[{hand_str(1)}] P2 hand=[{hand_str(2)}] | '
-            f'P1 bases={len(self.board.get_controlled_bases(1))} '
-            f'P2 bases={len(self.board.get_controlled_bases(2))}'
+            f'bases {len(self.board.get_controlled_bases(1))}-{len(self.board.get_controlled_bases(2))}'
         )
 
     def render_game(self):
@@ -386,22 +495,56 @@ class WarChestEnv(gym.Env):
             if active == 2:
                 r, q = s - r, s - q
             owner_offset = 6 if u.player_id == active else 8
-            board_enc[owner_offset + type_plane[u.id], r, q] = 1.0
+            board_enc[owner_offset + type_plane[u.id], r, q] = u.stack / STACK_NORM
 
-        # Global features [GLOBAL_DIM]
+        # Global features [GLOBAL_DIM] — ego-centric coin-counting (OBS_VERSION 3).
         my_bases = len(self.board.get_controlled_bases(active))
         opp_bases = len(self.board.get_controlled_bases(opponent))
-        hand = self.state.hands[active]
-        global_feats = np.array([
-            min(self.state.round_number / self.max_rounds, 1.0),
-            my_bases / self.winning_base_count,
-            opp_bases / self.winning_base_count,
-            float(COIN_SWORD in hand),
-            float(COIN_KNIGHT in hand),
-            float(COIN_ROYAL in hand),
-            float(self.state.initiative_owner == active),
-            len(self.state.hands[opponent]) / len(DECK),
-        ], dtype=np.float32)
+
+        own_hand = self.state.hands[active]
+        own_bag = self.state.bags[active]
+        own_discard = self.state.discard_faceup[active] + self.state.discard_facedown[active]
+        own_supply = self.state.supply[active]
+
+        # On-board counts are stack heights (committed coins), one unit per type.
+        opp_on_board = Counter()
+        for u in self.board.units:
+            if u.player_id == opponent:
+                opp_on_board[u.id] += u.stack
+        opp_faceup = self.state.discard_faceup[opponent]
+        opp_supply = self.state.supply[opponent]
+        opp_owned = {c: INITIAL_OWNED[c] - self.state.boxed[opponent][c] for c in DECK}
+        # Hidden cycle = owned minus all public zones (on board, face-up discard, supply).
+        opp_hidden = {
+            c: opp_owned[c] - opp_on_board[c] - opp_faceup[c] - opp_supply[c] for c in DECK
+        }
+
+        def norm(counter):  # per-coin counts normalized by initial owned
+            return [counter[c] / INITIAL_OWNED[c] for c in DECK]
+
+        def norm_supply(counter):
+            return [counter[c] / SUPPLY[c] for c in RECRUIT_TYPES]
+
+        global_feats = np.array(
+            [
+                min(self.state.round_number / self.max_rounds, 1.0),
+                my_bases / self.winning_base_count,
+                opp_bases / self.winning_base_count,
+                float(self.state.initiative_owner == active),
+            ]
+            + norm(own_hand)
+            + norm(own_bag)
+            + norm(own_discard)
+            + norm_supply(own_supply)
+            + [sum(own_bag.values()) / OWNED_TOTAL]
+            + [opp_on_board[c] / INITIAL_OWNED[c] for c in UNIT_COINS]
+            + norm(opp_faceup)
+            + norm_supply(opp_supply)
+            + [opp_hidden[c] / INITIAL_OWNED[c] for c in DECK]
+            + [sum(self.state.hands[opponent].values()) / HAND_SIZE]
+            + [float(self.state.initiative_transferred_this_round)],
+            dtype=np.float32,
+        )
 
         # Valid action mask [ACTION_SPACE_SIZE]
         valid_ids = self.get_possible_actions()
@@ -418,6 +561,24 @@ class WarChestEnv(gym.Env):
             'valid_action_mask': mask,
             'active_player': active,
         }
+
+    def get_privileged_features(self):
+        """Opponent's true hidden coin split — critic-only (never given to the policy).
+
+        Ego-centric: the opponent is 3 - active. Per coin {S,K,R}: hand, bag, face-down
+        discard counts, normalized by initial owned. These are exactly the quantities the
+        policy can only estimate via `hidden_pool`.
+        """
+        opp = 3 - self.active_player
+        hand = self.state.hands[opp]
+        bag = self.state.bags[opp]
+        fd = self.state.discard_facedown[opp]
+        feats = (
+            [hand[c] / INITIAL_OWNED[c] for c in DECK]
+            + [bag[c] / INITIAL_OWNED[c] for c in DECK]
+            + [fd[c] / INITIAL_OWNED[c] for c in DECK]
+        )
+        return np.array(feats, dtype=np.float32)
 
     def get_possible_actions(self):
         """Return valid action IDs in absolute (non-rotated) frame."""
@@ -444,6 +605,8 @@ class WarChestEnv(gym.Env):
                     ids.append(self.encode_action(6 + d, r, q))
             if self.board.is_valid_claim(active, (r, q)):
                 ids.append(self.encode_action(12, r, q))
+            # Bolster: add a matching coin onto this unit's stack (any number of times).
+            ids.append(self.encode_action(BOLSTER_VERB, r, q))
 
         # Deploy: a coin in hand whose unit type is not already on the board, onto
         # any controlled empty location. (One unit of each type at a time.)
@@ -466,15 +629,16 @@ class WarChestEnv(gym.Env):
             ids.append(self.encode_facedown(1, coin))  # pass
             if can_claim:
                 ids.append(self.encode_facedown(0, coin))  # claim_initiative
+            # Recruit: pay this coin face-down, take a supply coin of any available type.
+            for take in RECRUIT_TYPES:
+                if self.state.supply[active][take] > 0:
+                    ids.append(self.encode_recruit(take, coin))
 
         return ids
 
     def get_action_info(self, action_id: int) -> Tuple[str, Tuple]:
         if action_id >= SPATIAL_SIZE:
-            kind, coin = self.decode_facedown(action_id)
-            if kind == 0:
-                return CLAIM_INITIATIVE_ACTION, (coin,)
-            return PASS_ACTION, (coin,)
+            return self.decode_facedown(action_id)
 
         verb, r, q = self.decode_action(action_id)
         if 0 <= verb <= 5:
@@ -485,6 +649,8 @@ class WarChestEnv(gym.Env):
             return CLAIM_BASE_ACTION, (verb, r, q)
         elif verb in DEPLOY_VERBS:
             return DEPLOY_ACTION, (DEPLOY_VERBS[verb], r, q)
+        elif verb == BOLSTER_VERB:
+            return BOLSTER_ACTION, (r, q)
         raise ValueError(f'Unknown verb {verb} in action_id {action_id}')
 
     def make_random_step(self):
@@ -526,7 +692,7 @@ class WarChestEnv(gym.Env):
 
         moving_unit.move(loc=end)
         self.exploration_map_dict[self.active_player][end] += 1
-        self._spend_coin(moving_unit.id)
+        self._play_coin(moving_unit.id, 'faceup')
         return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
                       txt_result='Move successful', is_valid=True)
 
@@ -551,8 +717,13 @@ class WarChestEnv(gym.Env):
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                           txt_result='No enemy unit at target cell', is_valid=False)
 
-        self.board.remove_unit(enemy)
-        self._spend_coin(attacker.id)
+        # Remove one coin from the target's stack; it leaves the game (to the box),
+        # not the discard. The unit is destroyed only when its last coin is removed.
+        enemy.stack -= 1
+        self.state.boxed[enemy.player_id][enemy.id] += 1
+        if enemy.stack <= 0:
+            self.board.remove_unit(enemy)
+        self._play_coin(attacker.id, 'faceup')
         return Action(reward=ATTACK_REWARD, finishes_game=False,
                       txt_result='Attack successful', is_valid=True)
 
@@ -568,7 +739,7 @@ class WarChestEnv(gym.Env):
                           txt_result='No matching coin in hand', is_valid=False)
 
         self.board.change_base_control(player_id=self.active_player, base_loc=base_loc)
-        self._spend_coin(unit.id)
+        self._play_coin(unit.id, 'faceup')
         if len(self.board.get_controlled_bases(self.active_player)) < self.winning_base_count:
             return Action(reward=CLAIM_BASE_REWARD, finishes_game=False, is_valid=True,
                           txt_result='Claimed base')
@@ -596,9 +767,24 @@ class WarChestEnv(gym.Env):
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                           txt_result=f'Deploy failed: {e}', is_valid=False)
 
-        self._spend_coin(coin)
+        self._play_coin(coin, 'board')  # the coin becomes the deployed unit
         return Action(reward=0.0, finishes_game=False, is_valid=True,
                       txt_result='Unit deployed')
+
+    def perform_bolster_action(self, r: int, q: int) -> Action:
+        active = self.active_player
+        unit = self.board.get_unit_at(r, q)
+        if unit is None or unit.player_id != active:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='No own unit to bolster', is_valid=False)
+        if unit.id not in self.state.hands[active]:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='No matching coin in hand', is_valid=False)
+
+        unit.stack += 1  # the coin joins the stack on the board
+        self._play_coin(unit.id, 'board')
+        return Action(reward=0.0, finishes_game=False, is_valid=True,
+                      txt_result='Unit bolstered')
 
     def perform_claim_initiative_action(self, coin: int) -> Action:
         active = self.active_player
@@ -611,7 +797,7 @@ class WarChestEnv(gym.Env):
 
         self.state.initiative_owner = active
         self.state.initiative_transferred_this_round = True
-        self._spend_coin(coin)
+        self._play_coin(coin, 'facedown')
         return Action(reward=0.0, finishes_game=False, is_valid=True,
                       txt_result='Claimed initiative')
 
@@ -619,8 +805,26 @@ class WarChestEnv(gym.Env):
         if coin not in self.state.hands[self.active_player]:
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                           txt_result='No matching coin in hand', is_valid=False)
-        self._spend_coin(coin)
+        self._play_coin(coin, 'facedown')
         return Action(reward=0.0, finishes_game=False, is_valid=True, txt_result='Passed')
+
+    def perform_recruit_action(self, pay: int, take: int) -> Action:
+        active = self.active_player
+        if pay not in self.state.hands[active]:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='No matching coin in hand', is_valid=False)
+        if self.state.supply[active][take] <= 0:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='No supply coin of that type', is_valid=False)
+
+        self._play_coin(pay, 'facedown')  # the payment is discarded face-down
+        # The recruited coin is shown to the opponent and enters the discard face-up.
+        self.state.supply[active][take] -= 1
+        if self.state.supply[active][take] == 0:
+            del self.state.supply[active][take]
+        self.state.discard_faceup[active][take] += 1
+        return Action(reward=0.0, finishes_game=False, is_valid=True,
+                      txt_result='Recruited')
 
     def get_active_player_units(self):
         return [u for u in self.board.units if u.player_id == self.active_player]
