@@ -7,6 +7,7 @@ from .units import *
 from .board import Board
 from .cell_ids import *
 from .game_renderer import GameRenderer
+from .coin_render import draw_coin, draw_zone
 from typing import Tuple, Dict
 from .action import Action
 from .game_state import (
@@ -388,7 +389,7 @@ class WarChestEnv(gym.Env):
     def render(self, ax=None):
         created_ax = False
         if ax is None:
-            fig, ax = plt.subplots(figsize=(8, 8))
+            fig, ax = plt.subplots(figsize=(9, 11))
             fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
             created_ax = True
         else:
@@ -400,70 +401,79 @@ class WarChestEnv(gym.Env):
         hex_radius = 0.5
         board = self.board.board
 
+        xs, ys = [], []
         for r in range(board.shape[0]):
             for q in range(board.shape[1]):
                 if board[r, q] != INVALID_CELL_ID:
                     x, y = self.convert_hex_grid_to_cartesian(r, q, hex_radius=hex_radius)
+                    xs.append(x)
+                    ys.append(y)
                     hexagon = patches.RegularPolygon(
                         (x, y), numVertices=6, radius=hex_radius, orientation=np.pi / 2,
                         edgecolor='black', facecolor=BASE_COLORS[int(board[r, q])]
                     )
                     ax.add_patch(hexagon)
-                    ax.text(x, y - 0.3, f'r={r} q={q}', ha='center', va='center', fontsize=10)
+                    ax.text(x, y - 0.34, f'{r},{q}', ha='center', va='center',
+                            fontsize=6, color='silver')
 
+        # On-board units as coin discs (face = type color, rim = player) plus a stack badge.
         for _unit in self.board.units:
             x, y = self.convert_hex_grid_to_cartesian(*_unit.loc, hex_radius=hex_radius)
-            ax.text(x, y, s=_unit.icon, ha='center', va='center', fontsize=30,
-                    color=UNIT_COLORS[_unit.player_id])
-            # Stack height (HP) as a small badge on the unit.
-            ax.text(x + 0.18, y + 0.18, s=str(_unit.stack), ha='center', va='center',
-                    fontsize=11, fontweight='bold', color=UNIT_COLORS[_unit.player_id])
+            draw_coin(ax, x, y, _unit.id, _unit.player_id, radius=0.3, fontsize=22)
+            ax.text(x + 0.22, y + 0.22, s=str(_unit.stack), ha='center', va='center',
+                    fontsize=11, fontweight='bold', color=UNIT_COLORS[_unit.player_id],
+                    zorder=5)
 
-        # Initiative mark (top-left) and the coin spent on the action that produced
-        # this state (top-right). Drawn as axes text so they survive even when the
-        # replay renderer overwrites the title.
-        owner = self.state.initiative_owner
-        ax.text(0.02, 0.98, f'★ initiative P{owner}', transform=ax.transAxes,
-                ha='left', va='top', fontsize=12, fontweight='bold',
-                color=UNIT_COLORS[owner])
-        # Round and whose turn — persistent (the title is overwritten in replay).
-        ax.text(0.5, 0.99, f'round {self.state.round_number}  ·  P{self.active_player} to act',
+        # Coin-economy bands: P1 below the board, P2 above it. Each player's six
+        # zones sit in a single row spanning the window width, so every coin pile
+        # (incl. the normally-hidden bag and face-down discard) is visible in replay.
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        board_cx = (x_min + x_max) / 2
+        col_w = 2.0
+        zone_names = ('Hand', 'Bag', 'Supply', 'Discard ↑', 'Discard ↓', 'Eliminated')
+        # Center the row of zones on the board.
+        block_left = board_cx - (len(zone_names) - 1) * col_w / 2 - 0.3
+
+        def draw_band(pid, row_y):
+            star = ' ★' if self.state.initiative_owner == pid else ''
+            ax.text(block_left, row_y + 0.62, f'Player {pid}{star}', ha='left',
+                    va='center', fontsize=12, fontweight='bold', color=UNIT_COLORS[pid])
+            counters = (
+                self.state.hands[pid], self.state.bags[pid], self.state.supply[pid],
+                self.state.discard_faceup[pid], self.state.discard_facedown[pid],
+                self.state.boxed[pid],
+            )
+            for k, (label, counter) in enumerate(zip(zone_names, counters)):
+                draw_zone(ax, block_left + k * col_w, row_y, label, counter, pid)
+
+        draw_band(2, y_max + 1.0)
+        draw_band(1, y_min - 1.0)
+
+        # Round / turn banner and the coin spent on the action that produced this
+        # state — axes text so they survive the replay renderer overwriting the title.
+        ax.text(0.5, 0.995, f'round {self.state.round_number}  ·  P{self.active_player} to act',
                 transform=ax.transAxes, ha='center', va='top', fontsize=11, color='black')
+        # Last action played — in the empty gap right of the board, clear of the
+        # top band's Eliminated zone and the nav buttons.
         if self.state.last_coin is not None:
             player = self.state.last_coin_player
-            ax.text(0.98, 0.98, COIN_ICONS[self.state.last_coin], transform=ax.transAxes,
-                    ha='right', va='top', fontsize=28, color=UNIT_COLORS[player])
-            ax.text(0.98, 0.85, f'P{player} {self.state.last_action_type or ""}',
+            ax.text(0.985, 0.78, COIN_ICONS[self.state.last_coin], transform=ax.transAxes,
+                    ha='right', va='top', fontsize=24, color=UNIT_COLORS[player])
+            ax.text(0.985, 0.70, f'P{player} {self.state.last_action_type or ""}',
                     transform=ax.transAxes, ha='right', va='top', fontsize=9,
                     color=UNIT_COLORS[player])
 
-        # Per-player coin economy panel (hand / bag / discard), drawn as axes text so
-        # the bag stays visible in replay even when the title is overwritten.
-        for pid, x, ha in ((1, 0.02, 'left'), (2, 0.98, 'right')):
-            st = self.state
-            panel = (
-                f'P{pid}  hand[{self._coin_str(st.hands[pid])}]  '
-                f'bag[{self._coin_str(st.bags[pid])}]  '
-                f'fu[{self._coin_str(st.discard_faceup[pid])}]  '
-                f'fd[{self._coin_str(st.discard_facedown[pid])}]  '
-                f'sup[{self._coin_str(st.supply[pid])}]  '
-                f'box[{self._coin_str(st.boxed[pid])}]'
-            )
-            ax.text(x, 0.02, panel, transform=ax.transAxes, ha=ha, va='bottom',
-                    fontsize=8, family='monospace', color=UNIT_COLORS[pid])
-
-        ax.set_aspect('equal')
-        ax.autoscale_view()
+        # Limits derived from actual content, symmetric about the board so nothing
+        # clips and the board stays centered; datalim lets the wide axis fill space.
+        rightmost = block_left + (len(zone_names) - 1) * col_w + 1.8
+        half = max(board_cx - block_left, rightmost - board_cx, (x_max - x_min) / 2) + 0.4
+        ax.set_aspect('equal')  # default adjustable='box': shrink the box, never the limits
+        ax.set_xlim(board_cx - half, board_cx + half)
+        ax.set_ylim(y_min - 1.0 - 0.7, y_max + 1.0 + 0.62 + 0.5)
         ax.set_title(self._render_status_text(), fontsize=10)
-        plt.margins(0)
         if created_ax:
             plt.show()
-
-    @staticmethod
-    def _coin_str(counter) -> str:
-        """Compact multiset of coins, e.g. Counter({S:2, R:1}) -> 'SSR'."""
-        names = {COIN_SWORD: 'S', COIN_KNIGHT: 'K', COIN_ROYAL: 'R'}
-        return ''.join(names[c] * counter[c] for c in DECK) or '·'
 
     def _render_status_text(self) -> str:
         return (

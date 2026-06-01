@@ -11,12 +11,12 @@ class GameRenderer:
         self.history = history
         self.idx = 0
 
-        self.fig, self.ax = plt.subplots(figsize=(9, 9))
-        plt.subplots_adjust(left=0, right=1, top=0.97, bottom=0.1)
+        self.fig, self.ax = plt.subplots(figsize=(11, 8))
+        plt.subplots_adjust(left=0.02, right=0.88, top=0.93, bottom=0.05)
 
-        # Buttons
-        axprev = plt.axes([0.3, 0.05, 0.1, 0.075])
-        axnext = plt.axes([0.6, 0.05, 0.1, 0.075])
+        # Buttons on the right edge (vertical), so no height is spent on a bottom bar.
+        axnext = plt.axes([0.91, 0.55, 0.08, 0.06])
+        axprev = plt.axes([0.91, 0.45, 0.08, 0.06])
         self.bnext = Button(axnext, 'Next')
         self.bprev = Button(axprev, 'Prev')
         self.bnext.on_clicked(self.next)
