@@ -6,6 +6,7 @@ from torch.distributions import Categorical
 from ..environment.warchest_env import (
     N_VERBS, BOARD_DIM, ACTION_SPACE_SIZE, GLOBAL_DIM,
     BOARD_CHANNELS, SPATIAL_SIZE, FACEDOWN_SIZE, PRIV_DIM,
+    N_FACTORED_VERBS, VERB_OF_ACTION,
 )
 
 
@@ -46,18 +47,28 @@ class HexConv2d(nn.Module):
 
 
 class Policy(nn.Module):
-    """Actor network with a spatial cell-keyed convolutional head plus a small
-    non-spatial head for the coin-only (face-down) actions.
+    """Actor with a factored (verb-level) action head — Phase 2.
+
+    The action space is grouped into top-level verbs (move / attack / control /
+    deploy / bolster / claim_initiative / pass / recruit). The policy factors:
+
+        P(a) = P(verb = v(a) | s) · P(a | v(a), s)
+
+    where P(verb) comes from a dedicated verb head, and P(a | verb) is a softmax
+    over that verb's legal flat actions, using the existing spatial-conv +
+    face-down logits. Both masks are conditional (verbs with no legal action are
+    masked out; within-verb is masked to the verb's legal actions). The result is
+    still a single distribution over ACTION_SPACE_SIZE flat ids, so sampling,
+    log-prob, entropy and the whole PPO/buffer/env stack are unchanged — only the
+    way the per-action log-probs are computed differs.
+
+    The verb head therefore receives a gradient on every step (it shapes P(verb)
+    for all actions), which is the structure that pays off as unit types grow.
+    All sub-field agency (direction, deploy-type, pay-coin, take-type) is retained
+    inside the within-verb softmax, so there is no loss of expressiveness vs the
+    flat head.
 
     Board trunk: HexConv2d stack on BOARD_CHANNELS input planes → [B, Cf, 7, 7].
-    Global features are broadcast as extra planes (tiled over the grid) and
-    concatenated with the trunk output before the spatial head.
-    Spatial head: 1×1 Conv2d → [B, N_VERBS, 7, 7] logit map, flattened to
-    [B, SPATIAL_SIZE]. Face-down head: a Linear over (pooled trunk ++ globals)
-    → [B, FACEDOWN_SIZE]. The two are concatenated into the [B, ACTION_SPACE_SIZE]
-    flat logit vector, masked, softmax.
-
-    Action encoding: spatial id = verb * 49 + r * 7 + q; face-down ids follow.
     Input planes (BOARD_CHANNELS, ego-centric):
         0: invalid  1: empty  2: uncontrolled base
         3: own base  4: opp base  5: exploration
@@ -74,57 +85,93 @@ class Policy(nn.Module):
             nn.ReLU(),
         )
 
-        # 1×1 conv maps (hidden_dim + GLOBAL_DIM) planes → N_VERBS logit planes
+        # Within-verb logits: 1×1 conv → N_VERBS spatial planes (flattened) plus a
+        # linear head for the face-down actions.
         self.policy_head = nn.Conv2d(hidden_dim + GLOBAL_DIM, N_VERBS, kernel_size=1)
-        # Non-spatial head for the face-down actions (claim_initiative / pass).
         self.facedown_head = nn.Linear(hidden_dim + GLOBAL_DIM, FACEDOWN_SIZE)
+        # Top-level verb head.
+        self.verb_head = nn.Linear(hidden_dim + GLOBAL_DIM, N_FACTORED_VERBS)
+
+        # Static flat-id -> verb-index map, and a per-verb membership matrix.
+        verb_index = torch.tensor(VERB_OF_ACTION, dtype=torch.long)
+        group_mat = torch.zeros(N_FACTORED_VERBS, ACTION_SPACE_SIZE, dtype=torch.bool)
+        group_mat[verb_index, torch.arange(ACTION_SPACE_SIZE)] = True
+        self.register_buffer('_verb_index', verb_index, persistent=False)
+        self.register_buffer('_group_mat', group_mat, persistent=False)
 
         self.device = device
 
-    def _logits(self, board: torch.Tensor, global_feats: torch.Tensor) -> torch.Tensor:
-        """board: [B,C,7,7], global_feats: [B,G] → logits [B, ACTION_SPACE_SIZE]"""
+    def _features(self, board: torch.Tensor, global_feats: torch.Tensor):
+        """board: [B,C,7,7], global_feats: [B,G] → (flat_logits [B,A], verb_logits [B,V])"""
         B = board.shape[0]
         feat = self.board_encoder(board)  # [B, hidden_dim, 7, 7]
         g = global_feats.view(B, GLOBAL_DIM, 1, 1).expand(B, GLOBAL_DIM, BOARD_DIM, BOARD_DIM)
-        combined = torch.cat([feat, g], dim=1)  # [B, hidden_dim+G, 7, 7]
-        spatial = self.policy_head(combined).flatten(1)  # [B, SPATIAL_SIZE]
+        spatial = self.policy_head(torch.cat([feat, g], dim=1)).flatten(1)  # [B, SPATIAL_SIZE]
         pooled = feat.mean(dim=(-2, -1))  # [B, hidden_dim]
-        facedown = self.facedown_head(torch.cat([pooled, global_feats], dim=-1))  # [B, FACEDOWN_SIZE]
-        return torch.cat([spatial, facedown], dim=1)  # [B, ACTION_SPACE_SIZE]
+        pg = torch.cat([pooled, global_feats], dim=-1)
+        facedown = self.facedown_head(pg)  # [B, FACEDOWN_SIZE]
+        flat_logits = torch.cat([spatial, facedown], dim=1)  # [B, ACTION_SPACE_SIZE]
+        verb_logits = self.verb_head(pg)  # [B, N_FACTORED_VERBS]
+        return flat_logits, verb_logits
 
-    def forward(self, obs):
+    def _joint_log_probs(self, flat_logits, verb_logits, mask):
+        """Factored joint log-probs over the flat action space. [B, ACTION_SPACE_SIZE].
+
+        log P(a) = log P(verb=v(a)) + log P(a | verb=v(a)); illegal ids -> NEG.
+        """
+        NEG = -1e9
+        B = flat_logits.shape[0]
+        ml = flat_logits.masked_fill(~mask, NEG)  # [B, A]
+        g = self._verb_index.unsqueeze(0).expand(B, -1)  # [B, A]
+
+        # Per-verb max for a numerically stable within-group softmax.
+        gmax = torch.stack(
+            [ml[:, self._group_mat[v]].max(dim=1).values for v in range(N_FACTORED_VERBS)],
+            dim=1,
+        )  # [B, V]
+        shifted = ml - gmax.gather(1, g)  # [B, A]; ≤0 for legal members
+        exp_shifted = shifted.exp() * mask.float()  # zero out illegal ids
+        gsum = torch.stack(
+            [exp_shifted[:, self._group_mat[v]].sum(dim=1) for v in range(N_FACTORED_VERBS)],
+            dim=1,
+        )  # [B, V]
+        within_logp = (shifted - gsum.clamp_min(1e-12).log().gather(1, g)).masked_fill(~mask, NEG)
+
+        verb_mask = gsum > 0  # verbs with at least one legal action
+        verb_logp = F.log_softmax(verb_logits.masked_fill(~verb_mask, NEG), dim=1)  # [B, V]
+
+        joint = verb_logp.gather(1, g) + within_logp  # [B, A]
+        return joint.masked_fill(~mask, NEG)
+
+    def _obs_logits(self, obs):
         board = torch.tensor(obs['board'], dtype=torch.float32).unsqueeze(0).to(self.device)
         global_feats = torch.tensor(obs['global'], dtype=torch.float32).unsqueeze(0).to(self.device)
-
-        logits = self._logits(board, global_feats)  # [1, 686]
-
         mask = torch.tensor(obs['valid_action_mask'].astype(bool)).unsqueeze(0).to(self.device)
-        return F.softmax(logits.masked_fill(~mask, -1e9), dim=-1)
+        flat_logits, verb_logits = self._features(board, global_feats)
+        return self._joint_log_probs(flat_logits, verb_logits, mask)  # [1, A]
+
+    def forward(self, obs):
+        """Return action probabilities for a single observation dict."""
+        return F.softmax(self._obs_logits(obs), dim=-1)
 
     def act(self, obs):
-        probs = self.forward(obs)
-        dist = Categorical(probs)
+        dist = Categorical(logits=self._obs_logits(obs))
         action = dist.sample()
         return action.item(), dist.log_prob(action).squeeze(0), dist.entropy().squeeze(0)
 
     def evaluate_actions(self, obs, action):
-        probs = self.forward(obs)
-        dist = Categorical(probs)
+        dist = Categorical(logits=self._obs_logits(obs))
         return dist.log_prob(action), dist.entropy()
 
     def evaluate_actions_batch(self, batch):
         """Single forward pass over a full buffer batch.
 
-        batch keys (all on device):
-            board   (N, 8, 7, 7) float
-            global  (N, GLOBAL_DIM) float
-            mask    (N, 686) bool
-            actions (N,) long
-        Returns log_probs (N,), entropies (N,).
+        batch keys (all on device): board (N,C,7,7), global (N,GLOBAL_DIM),
+        mask (N,A) bool, actions (N,) long. Returns log_probs (N,), entropies (N,).
         """
-        logits = self._logits(batch['board'], batch['global'])  # [N, 686]
-        masked = logits.masked_fill(~batch['mask'], -1e9)
-        dist = Categorical(F.softmax(masked, dim=-1))
+        flat_logits, verb_logits = self._features(batch['board'], batch['global'])
+        joint = self._joint_log_probs(flat_logits, verb_logits, batch['mask'])
+        dist = Categorical(logits=joint)
         return dist.log_prob(batch['actions']), dist.entropy()
 
 

@@ -78,6 +78,39 @@ _RECRUIT_BLOCK = 2 * len(DECK)  # claim (3) + pass (3) precede recruit in the bl
 FACEDOWN_SIZE = _RECRUIT_BLOCK + len(RECRUIT_TYPES) * len(DECK)  # 6 + 6 = 12
 ACTION_SPACE_SIZE = SPATIAL_SIZE + FACEDOWN_SIZE  # 796
 
+# ---------------------------------------------------------------------------
+# Verb grouping for the factored policy head (Phase 2).
+# Each flat action id belongs to exactly one top-level verb. The factored head
+# learns P(verb) explicitly and P(action | verb) over that verb's legal actions;
+# the joint stays a single distribution over ACTION_SPACE_SIZE flat ids.
+# ---------------------------------------------------------------------------
+(V_MOVE, V_ATTACK, V_CONTROL, V_DEPLOY, V_BOLSTER, V_CLAIM, V_PASS, V_RECRUIT) = range(8)
+N_FACTORED_VERBS = 8
+
+
+def verb_of_action(action_id: int) -> int:
+    if action_id < SPATIAL_SIZE:
+        sv = action_id // (BOARD_DIM * BOARD_DIM)
+        if sv <= 5:
+            return V_MOVE
+        if sv <= 11:
+            return V_ATTACK
+        if sv == 12:
+            return V_CONTROL
+        if sv in DEPLOY_VERBS:
+            return V_DEPLOY
+        return V_BOLSTER  # sv == BOLSTER_VERB
+    off = action_id - SPATIAL_SIZE
+    if off < len(DECK):
+        return V_CLAIM
+    if off < _RECRUIT_BLOCK:
+        return V_PASS
+    return V_RECRUIT
+
+
+# Static map flat action id -> verb index; consumed by the factored policy head.
+VERB_OF_ACTION = np.array([verb_of_action(a) for a in range(ACTION_SPACE_SIZE)], dtype=np.int64)
+
 BOARD_CHANNELS = 10  # see Policy docstring for the channel map
 
 # Unit coin types (deployable); the royal coin has no board unit.

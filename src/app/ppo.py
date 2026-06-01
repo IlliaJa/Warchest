@@ -215,10 +215,6 @@ class PPOTrainer:
                 phi_before = SHAPING_C * base_diff
                 holding_reward = self._holding_reward_rate * base_diff
                 env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
-                logger.debug(
-                    f'turn={turn} main_pid={main_pid} acting_pid={acting_pid} '
-                    f'action={action} env_action={env_action}'
-                )
                 state, reward, terminated, truncated, step_info = self._env.step(env_action)
 
                 if not step_info['action'].is_valid:
@@ -246,10 +242,6 @@ class PPOTrainer:
                 with torch.no_grad():
                     action, _, _ = opp.act(state)
                 env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
-                logger.debug(
-                    f'turn={turn} opp acting_pid={acting_pid} '
-                    f'action={action} env_action={env_action}'
-                )
                 state, _, terminated, truncated, step_info = self._env.step(env_action)
                 if not step_info['action'].is_valid:
                     state, _, terminated, truncated, step_info = self._env.make_random_step()

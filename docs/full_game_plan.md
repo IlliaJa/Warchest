@@ -213,7 +213,21 @@ per type; "initiative already transferred this round" flag.
 
 ---
 
-## Phase 2 — Observation finalization + factored / autoregressive head
+## Phase 2 — Observation finalization + factored / autoregressive head  ✅ implemented (2026-06-01)
+
+Implemented as a **verb-level factorization**: a dedicated verb head learns `P(verb)`, and
+`P(a) = P(verb(a))·P(a|verb(a))` where the within-verb conditional is a masked softmax over
+that verb's legal flat actions (reusing the existing spatial-conv + face-down logits). Verbs:
+move / attack / control / deploy / bolster / claim_initiative / pass / recruit (`N_FACTORED_VERBS=8`,
+`VERB_OF_ACTION` map lives in the env). Both stages are conditionally masked (verbs with no legal
+action are dropped; within-verb masked to legal ids). The result is still a single `Categorical`
+over the 796 flat ids, so **env / buffer / critic / bots / remap are unchanged** — only how the
+per-action log-probs are computed differs. Chose this over the doc's "auto-pick pay-coin" first
+cut to **preserve all sub-field agency** (direction / deploy-type / pay-coin / take-type stay
+learnable → no regression). The verb head gets gradient every step — the structure that pays off
+as the roster grows. Tests: `tests/test_phase2.py` (47 total). Finer autoregressive sub-stages
+(splitting direction/pay-coin/etc. into their own conditional heads with cross-verb parameter
+sharing) remain a later incremental refinement; not needed at the 2-unit scale.
 
 **Goal.** Replace the flat+appended head with the factored head from
 `docs/rl_algorithms.md`. Env logic does **not** change — this is a pure policy/plumbing
