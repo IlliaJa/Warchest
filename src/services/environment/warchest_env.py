@@ -3,7 +3,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from .units import *
+from .units import UNIT_CLASS_BY_ID
 from .board import Board
 from .cell_ids import *
 from .game_renderer import GameRenderer
@@ -11,8 +11,12 @@ from .coin_render import draw_coin, draw_zone
 from typing import Tuple, Dict
 from .action import Action
 from .game_state import (
-    GameState, COIN_SWORD, COIN_KNIGHT, COIN_ROYAL, DECK,
-    INITIAL_BAG, SUPPLY, INITIAL_OWNED, HAND_SIZE,
+    GameState, DECK, COIN_ROYAL, HAND_SIZE, UNITS_PER_PLAYER,
+    build_bag, build_supply,
+)
+from .roster import (
+    UNIT_IDS, ROYAL_ID, NUM_UNIT_TYPES, TOTAL_COINS, SUPPLY_CAP, MAX_TOTAL,
+    COIN_BY_ID,
 )
 from collections import Counter
 from copy import deepcopy
@@ -28,11 +32,8 @@ UNIT_COLORS = {
     1: 'darkred',
     2: 'midnightblue'
 }
-COIN_ICONS = {
-    COIN_SWORD: '♖',
-    COIN_KNIGHT: '♞',
-    COIN_ROYAL: '♚',
-}
+# Coin id -> renderer glyph (units + royal), from the roster.
+COIN_ICONS = {c.id: c.icon for c in COIN_BY_ID.values()}
 
 MOVE_ACTION = 'move'
 ATTACK_ACTION = 'attack'
@@ -44,46 +45,49 @@ BOLSTER_ACTION = 'bolster'
 RECRUIT_ACTION = 'recruit'
 
 # ---------------------------------------------------------------------------
-# Action encoding (Phase 1c — temporary flat head)
+# Action encoding (flat ids under the factored head).
 #
 # Spatial actions: id = verb * BOARD_DIM^2 + r * BOARD_DIM + q
-#   verb 0-5:   move in direction d
-#   verb 6-11:  attack in direction d
-#   verb 12:    control (claim) current cell
-#   verb 13:    deploy a Swordsman onto this cell
-#   verb 14:    deploy a Knight onto this cell
-#   verb 15:    bolster the matching unit on this cell (type from the unit there)
-# Face-down actions (no board cell): appended after the spatial block.
-#   +0..2:  claim_initiative paying {S, K, R}
-#   +3..5:  pass            paying {S, K, R}
-#   +6..11: recruit take-type {S, K} × pay-coin {S, K, R}
+#   verb 0-5:    move in direction d
+#   verb 6-11:   attack in direction d
+#   verb 12:     control (claim) the current cell
+#   verb 13:     bolster the matching unit on this cell (type from the unit there)
+#   verb 14..29: deploy unit type UNIT_IDS[verb-14] onto this cell
+# Face-down actions (no board cell): appended after the spatial block, over the
+# full 17-coin universe (only the player's drafted coins are ever unmasked).
+#   +[0:C):           claim_initiative paying coin c
+#   +[C:2C):          pass            paying coin c
+#   +[2C:2C+U*C):     recruit take-type t (a unit) × pay-coin c
 # Deploy is per-type because an empty target cell does not determine the unit;
 # move/attack/control/bolster are not, because the occupied source cell does.
 # ---------------------------------------------------------------------------
-N_VERBS = 16
+N_COIN_TYPES = len(DECK)  # 17 (16 units + royal)
 BOARD_DIM = 7
-SPATIAL_SIZE = N_VERBS * BOARD_DIM * BOARD_DIM  # 784
+CONTROL_VERB = 12
+BOLSTER_VERB = 13
+DEPLOY_VERB_BASE = 14
+# Deploy verb -> unit id (one verb per deployable unit type).
+DEPLOY_VERBS = {DEPLOY_VERB_BASE + i: t for i, t in enumerate(UNIT_IDS)}
+N_VERBS = DEPLOY_VERB_BASE + NUM_UNIT_TYPES  # 14 + 16 = 30
+SPATIAL_SIZE = N_VERBS * BOARD_DIM * BOARD_DIM  # 1470
 
-# Verbs that deploy, and which unit type each deploys; bolster is a single verb.
-DEPLOY_VERBS = {13: COIN_SWORD, 14: COIN_KNIGHT}
-BOLSTER_VERB = 15
-UNIT_CLASS_BY_COIN = {COIN_SWORD: Swordsman, COIN_KNIGHT: Knight}
+UNIT_CLASS_BY_COIN = UNIT_CLASS_BY_ID
 
 # Coin <-> contiguous index, used for the face-down action block and obs encoding.
-COIN_TO_IDX = {COIN_SWORD: 0, COIN_KNIGHT: 1, COIN_ROYAL: 2}
+COIN_TO_IDX = {c: i for i, c in enumerate(DECK)}
 IDX_TO_COIN = list(DECK)
+ROYAL_COIN_IDX = COIN_TO_IDX[ROYAL_ID]
 
-# Recruitable unit types (those with a supply); the royal has none.
-RECRUIT_TYPES = tuple(c for c in DECK if SUPPLY.get(c, 0) > 0)  # (S, K)
-_RECRUIT_BLOCK = 2 * len(DECK)  # claim (3) + pass (3) precede recruit in the block
-FACEDOWN_SIZE = _RECRUIT_BLOCK + len(RECRUIT_TYPES) * len(DECK)  # 6 + 6 = 12
-ACTION_SPACE_SIZE = SPATIAL_SIZE + FACEDOWN_SIZE  # 796
+# Recruitable types = all unit types (each owns >= 4 coins, so supply >= 2).
+RECRUIT_TYPES = UNIT_IDS  # 16 types
+_RECRUIT_BLOCK = 2 * N_COIN_TYPES  # claim (C) + pass (C) precede recruit
+FACEDOWN_SIZE = _RECRUIT_BLOCK + len(RECRUIT_TYPES) * N_COIN_TYPES  # 34 + 272 = 306
+ACTION_SPACE_SIZE = SPATIAL_SIZE + FACEDOWN_SIZE  # 1776
 
 # ---------------------------------------------------------------------------
-# Verb grouping for the factored policy head (Phase 2).
-# Each flat action id belongs to exactly one top-level verb. The factored head
-# learns P(verb) explicitly and P(action | verb) over that verb's legal actions;
-# the joint stays a single distribution over ACTION_SPACE_SIZE flat ids.
+# Verb grouping for the factored policy head (Phase 2). The factoring is by verb
+# (8 of them), independent of how many unit types exist — the type choice lives
+# inside the within-verb softmax, so the head scales with the roster for free.
 # ---------------------------------------------------------------------------
 (V_MOVE, V_ATTACK, V_CONTROL, V_DEPLOY, V_BOLSTER, V_CLAIM, V_PASS, V_RECRUIT) = range(8)
 N_FACTORED_VERBS = 8
@@ -96,13 +100,13 @@ def verb_of_action(action_id: int) -> int:
             return V_MOVE
         if sv <= 11:
             return V_ATTACK
-        if sv == 12:
+        if sv == CONTROL_VERB:
             return V_CONTROL
-        if sv in DEPLOY_VERBS:
-            return V_DEPLOY
-        return V_BOLSTER  # sv == BOLSTER_VERB
+        if sv == BOLSTER_VERB:
+            return V_BOLSTER
+        return V_DEPLOY  # 14..29
     off = action_id - SPATIAL_SIZE
-    if off < len(DECK):
+    if off < N_COIN_TYPES:
         return V_CLAIM
     if off < _RECRUIT_BLOCK:
         return V_PASS
@@ -112,27 +116,33 @@ def verb_of_action(action_id: int) -> int:
 # Static map flat action id -> verb index; consumed by the factored policy head.
 VERB_OF_ACTION = np.array([verb_of_action(a) for a in range(ACTION_SPACE_SIZE)], dtype=np.int64)
 
-BOARD_CHANNELS = 10  # see Policy docstring for the channel map
+# Board planes: 6 terrain/base/exploration + one stack-valued plane per unit type
+# per side (own then opp). Only the ~4 drafted types per side are ever nonzero.
+N_BASE_PLANES = 6
+BOARD_CHANNELS = N_BASE_PLANES + 2 * NUM_UNIT_TYPES  # 6 + 32 = 38
+OWN_UNIT_PLANE_BASE = N_BASE_PLANES               # 6
+OPP_UNIT_PLANE_BASE = N_BASE_PLANES + NUM_UNIT_TYPES  # 22
 
 # Unit coin types (deployable); the royal coin has no board unit.
-UNIT_COINS = (COIN_SWORD, COIN_KNIGHT)
-OWNED_TOTAL = sum(INITIAL_OWNED.values())  # 9 (used to normalize bag size)
-STACK_NORM = max(INITIAL_OWNED.values())  # 4 (max coins of one type on one stack)
+UNIT_COINS = UNIT_IDS
+STACK_NORM = MAX_TOTAL  # 5 — max coins of one type on one stack
+# Max coins a player can hold across hand+bag (4 units × total + 1 royal); bag-size norm.
+OWNED_TOTAL = UNITS_PER_PLAYER * MAX_TOTAL + 1  # 21
 
-# Global feature layout (ego-centric, OBS_VERSION 3). Counts normalized by initial owned.
-#   [0] round fraction   [1] my bases   [2] opp bases   [3] my initiative
-#   own (known), per coin {S,K,R} unless noted:
-#     [4:7] hand   [7:10] bag   [10:13] discard   [13:15] supply {S,K}   [15] bag_size/OWNED_TOTAL
-#   opponent (public):
-#     [16:18] on_board {S,K}   [18:21] faceup_discard {S,K,R}   [21:23] supply {S,K}
-#     [23:26] hidden_pool {S,K,R}   [26] opp hand_size/HAND_SIZE
-#   [27] initiative already transferred this round
-GLOBAL_DIM = 28
-OBS_VERSION = 3
+# Global feature layout (ego-centric, OBS_VERSION 4). Per-type vectors run over
+# the full coin universe (DECK, len C=17) or the unit types (U=16); absent types
+# are zero. Counts normalized per type by total owned (or supply capacity).
+#   [0] round fraction  [1] my bases  [2] opp bases  [3] my initiative
+#   own (known): hand[C] bag[C] discard[C] supply[U] bag_size[1] owned[C]
+#   opponent (public): on_board[U] faceup[C] supply[U] hidden_pool[C] owned[C]
+#                      opp_hand_size[1]
+#   [last] initiative already transferred this round
+GLOBAL_DIM = 7 * N_COIN_TYPES + 3 * NUM_UNIT_TYPES + 7  # 174
+OBS_VERSION = 4
 
-# Privileged critic-only features: the opponent's true hidden split, per coin {S,K,R}.
-#   [0:3] opp hand   [3:6] opp bag   [6:9] opp face-down discard
-PRIV_DIM = 9
+# Privileged critic-only features: the opponent's true hidden split, per coin (C).
+#   [0:C] opp hand   [C:2C] opp bag   [2C:3C] opp face-down discard
+PRIV_DIM = 3 * N_COIN_TYPES  # 51
 
 MOVE_EXPLORE_REWARD_MAX_TURN = 5
 MOVE_EXPLORE_REWARD_PER_TURN = 0.1
@@ -258,9 +268,19 @@ class WarChestEnv(gym.Env):
         map_ = np.where(board.board == INVALID_CELL_ID, INVALID_CELL_ID, 0)
         self.exploration_map_dict = {1: map_.copy(), 2: map_.copy()}
         owner = int(np.random.choice([1, 2]))
+
+        # Draft: sample 8 distinct unit types, assign 4 to each player so the two
+        # compositions never share a unit (mirrors a drafted War Chest setup).
+        drafted = np.random.choice(UNIT_COINS, size=2 * UNITS_PER_PLAYER, replace=False)
+        compositions = {
+            1: tuple(int(t) for t in drafted[:UNITS_PER_PLAYER]),
+            2: tuple(int(t) for t in drafted[UNITS_PER_PLAYER:]),
+        }
         self.state = GameState(board=board, active_player=owner, action_count=0,
-                               initiative_owner=owner)
+                               initiative_owner=owner, compositions=compositions)
         for pid in (1, 2):
+            self.state.bags[pid] = build_bag(compositions[pid])
+            self.state.supply[pid] = build_supply(compositions[pid])
             self._draw_hand(pid)
         if self.history is not None:
             self.history = [deepcopy(self.state)]
@@ -530,17 +550,18 @@ class WarChestEnv(gym.Env):
         board_enc[4] = (raw_board == opp_base_id)
         visits = np.clip(expl, 0, None).astype(np.float32)
         board_enc[5] = visits / (visits.max() + 1e-5)
-        # Unit planes: per type per owner, ego-centric. Channels:
-        #   6 own sword  7 own knight  8 opp sword  9 opp knight
-        type_plane = {COIN_SWORD: 0, COIN_KNIGHT: 1}
+        # Unit planes: one stack-valued plane per unit type per owner, ego-centric.
+        #   own types -> planes [OWN_UNIT_PLANE_BASE : +NUM_UNIT_TYPES]
+        #   opp types -> planes [OPP_UNIT_PLANE_BASE : +NUM_UNIT_TYPES]
+        # plane index within a side = unit id - 1 (ids run 1..16).
         for u in self.board.units:
             r, q = u.loc
             if active == 2:
                 r, q = s - r, s - q
-            owner_offset = 6 if u.player_id == active else 8
-            board_enc[owner_offset + type_plane[u.id], r, q] = u.stack / STACK_NORM
+            owner_base = OWN_UNIT_PLANE_BASE if u.player_id == active else OPP_UNIT_PLANE_BASE
+            board_enc[owner_base + (u.id - 1), r, q] = u.stack / STACK_NORM
 
-        # Global features [GLOBAL_DIM] — ego-centric coin-counting (OBS_VERSION 3).
+        # Global features [GLOBAL_DIM] — ego-centric coin-counting (OBS_VERSION 4).
         my_bases = len(self.board.get_controlled_bases(active))
         opp_bases = len(self.board.get_controlled_bases(opponent))
 
@@ -556,17 +577,28 @@ class WarChestEnv(gym.Env):
                 opp_on_board[u.id] += u.stack
         opp_faceup = self.state.discard_faceup[opponent]
         opp_supply = self.state.supply[opponent]
-        opp_owned = {c: INITIAL_OWNED[c] - self.state.boxed[opponent][c] for c in DECK}
-        # Hidden cycle = owned minus all public zones (on board, face-up discard, supply).
+
+        def in_play(pid):
+            """Coins still in the cycle = owned-by-composition minus boxed."""
+            o = self.state.owned(pid)
+            b = self.state.boxed[pid]
+            return Counter({c: o[c] - b[c] for c in DECK})
+
+        own_owned = in_play(active)
+        opp_owned = in_play(opponent)
+        # Hidden cycle = in-play owned minus all public zones.
         opp_hidden = {
             c: opp_owned[c] - opp_on_board[c] - opp_faceup[c] - opp_supply[c] for c in DECK
         }
 
-        def norm(counter):  # per-coin counts normalized by initial owned
-            return [counter[c] / INITIAL_OWNED[c] for c in DECK]
+        def norm(counter):  # per-coin counts normalized by total owned per type
+            return [counter[c] / TOTAL_COINS[c] for c in DECK]
 
-        def norm_supply(counter):
-            return [counter[c] / SUPPLY[c] for c in RECRUIT_TYPES]
+        def norm_units(counter):  # over unit types only
+            return [counter[c] / TOTAL_COINS[c] for c in UNIT_COINS]
+
+        def norm_supply(counter):  # over unit types, by supply capacity
+            return [counter[c] / SUPPLY_CAP[c] for c in RECRUIT_TYPES]
 
         global_feats = np.array(
             [
@@ -580,10 +612,12 @@ class WarChestEnv(gym.Env):
             + norm(own_discard)
             + norm_supply(own_supply)
             + [sum(own_bag.values()) / OWNED_TOTAL]
-            + [opp_on_board[c] / INITIAL_OWNED[c] for c in UNIT_COINS]
+            + norm(own_owned)
+            + norm_units(opp_on_board)
             + norm(opp_faceup)
             + norm_supply(opp_supply)
-            + [opp_hidden[c] / INITIAL_OWNED[c] for c in DECK]
+            + [opp_hidden[c] / TOTAL_COINS[c] for c in DECK]
+            + norm(opp_owned)
             + [sum(self.state.hands[opponent].values()) / HAND_SIZE]
             + [float(self.state.initiative_transferred_this_round)],
             dtype=np.float32,
@@ -617,9 +651,9 @@ class WarChestEnv(gym.Env):
         bag = self.state.bags[opp]
         fd = self.state.discard_facedown[opp]
         feats = (
-            [hand[c] / INITIAL_OWNED[c] for c in DECK]
-            + [bag[c] / INITIAL_OWNED[c] for c in DECK]
-            + [fd[c] / INITIAL_OWNED[c] for c in DECK]
+            [hand[c] / TOTAL_COINS[c] for c in DECK]
+            + [bag[c] / TOTAL_COINS[c] for c in DECK]
+            + [fd[c] / TOTAL_COINS[c] for c in DECK]
         )
         return np.array(feats, dtype=np.float32)
 

@@ -51,3 +51,18 @@ Consolidated record of all applied fixes and architectural changes. For the reas
 | C7 | **Entropy coefficient.** Was 0.005 — quickly outscaled by actor loss. Raised to 0.025. | Maintained exploration deeper into training; prevented premature commitment to the first "good enough" move. |
 | C11 | **`hidden_dim=128`.** Was 64 — a 49× spatial compression bottleneck. Doubled to 128. | Modest convergence speed improvement; meaningful with the separate-encoder design. |
 | C13 | **`HexConv2d` board encoder.** Already done as part of phase 2 (see above), confirmed in `src/services/policy/policy.py`. | — |
+
+---
+
+## Phase 3 — 16-unit roster + per-game disjoint drafting (2026-06-01)
+
+*Source: `docs/full_game_plan.md` Phase 3 (with Phase-5 drafting pulled forward). Schema-breaking — a new obs/action generation (`OBS_VERSION=4`); prior saved models retired.*
+
+| What changed | Detail |
+|---|---|
+| **Full 16-unit vanilla roster** | `environment/roster.py` is the single source of truth (id/icon/colour/total-coins); unit classes are generated from it in `units/__init__.py`. All units share move/attack/control/deploy/bolster (tactics/attributes are Phase 4). |
+| **Per-game disjoint draft** | `set_init_state` samples 8 distinct types and gives 4 to each player, disjoint, + the shared Royal coin. Per-player `build_bag`/`build_supply` replace the old global `INITIAL_BAG/SUPPLY/INITIAL_OWNED`; `GameState.owned()` is per-composition. |
+| **Full-roster sizing** | Action space 796→1776 (16 deploy verbs → `N_VERBS=30`; claim/pass over 17 coins; recruit 16×17). Board planes 10→38 (6 terrain + 16 own + 16 opp, stack-valued). `GLOBAL_DIM` 28→174, `PRIV_DIM` 9→51. |
+| **No policy/critic edits** | The factored head groups by verb (8), not by type, and reads sizes from env constants — Policy/Critic/RolloutBuffer adapted automatically. |
+| **Renderer + bots** | Coins use per-unit colours/glyphs (2-letter codes) from the roster; GreedyBot verb-offset constants updated; RandomBot unchanged (mask-driven). |
+| **Tests** | `tests/test_phase3.py` (23 total green): disjoint-draft, roster totals, encode/decode round-trips, per-type legality/planes, recruit accounting, and a coin-conservation invariant across full random games. Old `test_phase1*` retired (dead schema); `test_phase2` (factored head) still passes. |

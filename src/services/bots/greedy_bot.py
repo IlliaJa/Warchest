@@ -3,19 +3,22 @@ from collections import deque
 import numpy as np
 
 from .base import Bot
-from ..environment.warchest_env import BOARD_DIM, SPATIAL_SIZE
+from ..environment.warchest_env import (
+    BOARD_DIM, SPATIAL_SIZE, N_COIN_TYPES, N_VERBS,
+    CONTROL_VERB, BOLSTER_VERB, DEPLOY_VERB_BASE, ROYAL_COIN_IDX,
+)
 
 # Verb ranges in the spatial action scheme
 _VERB_MOVE_END = 5
 _VERB_ATTACK_START = 6
 _VERB_ATTACK_END = 11
-_VERB_CONTROL = 12
-_VERB_DEPLOY_START = 13
-_VERB_DEPLOY_END = 14
+_VERB_CONTROL = CONTROL_VERB        # 12
+_VERB_DEPLOY_START = DEPLOY_VERB_BASE  # 14
+_VERB_DEPLOY_END = N_VERBS - 1      # 29
 
-# Face-down block layout (offsets from SPATIAL_SIZE): 0-2 claim_initiative, 3-5 pass.
-_PASS_OFFSET = 3
-_ROYAL_IDX = 2  # royal coin is the last entry of DECK
+# Face-down block layout (offsets from SPATIAL_SIZE): [0:C) claim, [C:2C) pass.
+_PASS_OFFSET = N_COIN_TYPES         # pass block starts after the claim block
+_ROYAL_IDX = ROYAL_COIN_IDX         # royal coin's contiguous index in DECK
 
 OFFSETS = [(-1, -1), (-1, 0), (0, 1), (1, 1), (1, 0), (0, -1)]
 

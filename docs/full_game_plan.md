@@ -268,7 +268,22 @@ recruit/initiative/pass verbs are now first-class (no appended-slot kludge); fre
 
 ---
 
-## Phase 3 — Unit variety (vanilla: no tactics/attributes yet)
+## Phase 3 — Unit variety (vanilla: no tactics/attributes yet)  ✅ implemented (2026-06-01)
+
+Implemented the **full 16-unit vanilla roster** (`roster.py` is the single source of truth:
+id/icon/colour/total-coins; unit classes generated from it) **and pulled Phase 5's drafting
+forward** at the user's request: each game `set_init_state` samples 8 distinct unit types and
+gives 4 to each player **disjoint** (players never share a unit), plus the shared Royal coin.
+Per-player bag/supply replace the old global constants (`build_bag`/`build_supply`); `owned`
+is per-composition. The network is sized for the **whole roster** (fixed slots, masked per
+game): action space 796→**1776** (16 deploy verbs → `N_VERBS=30`; claim/pass over 17 coins;
+recruit take 16 × pay 17), board planes 10→**38** (6 terrain + 16 own + 16 opp stack-valued,
+chosen for Phase-4 readiness), `GLOBAL_DIM` 28→**174**, `PRIV_DIM` 9→**51**, `OBS_VERSION=4`.
+Policy/Critic/buffer were **shape-agnostic** (factoring is by verb, not type) and needed no
+edits. Renderer + both bots updated; `tests/test_phase3.py` (coin-conservation invariant,
+disjoint draft, per-type legality/planes, encode/decode, economy) — 23 tests green. Breaks all
+prior saved models (expected at a schema change); re-baseline GreedyBot for this generation.
+Tactics/attributes remain Phase 4; variable-composition *eval bucketing* remains Phase 5.
 
 **Goal.** Add several plain unit types that differ **only by coin identity**, all sharing
 move/attack/control/deploy/bolster. Validates that the factored head's `hand_coin` and

@@ -264,6 +264,56 @@ If PPO feels unstable on the current prototype, the right move is to debug PPO (
 
 ---
 
+## R-NaD (Regularized Nash Dynamics) — idea, the "NaD" in WaRNaD
+
+This is a proposal, not implemented. It is the algorithmic core of DeepMind's **DeepNash** (Perolat et al., *Science* 2022), the agent that reached expert-level Stratego with no search. The project name "WaRNaD" points at this method; the section records why it is the right long-term target and what it buys over the current PPO + opponent-pool setup.
+
+### The problem it solves: self-play cycles, it does not converge
+
+Current training is self-play (pool of frozen snapshots + greedy/random). The implicit goal of self-play in a two-player zero-sum game is the **Nash equilibrium** — the unexploitable strategy that secures the game's value against *any* opponent, including a best-responder. Warchest is genuinely zero-sum and genuinely **imperfect-information** (the critic is fed a privileged `PRIV_DIM` vector of the opponent's true hidden coin split that the policy never sees, `Critic` in `src/services/policy/policy.py`). Hidden information means the equilibrium is generally a **mixed** strategy — being predictable is exploitable, exactly as in Rock-Paper-Scissors.
+
+The catch: plain policy-gradient dynamics in a zero-sum game **do not converge to the equilibrium — they orbit it**. This is a structural property of the dynamics, not a learning-rate bug: gradient/replicator dynamics in zero-sum games are conservative (energy-preserving), like a frictionless pendulum. The policy circles the equilibrium forever — beat A, drift to a policy that beats A but loses to B, drift back, repeat. Two consequences:
+
+- **The last iterate is exploitable.** Whatever point on the orbit you stop at is *not* the center. Saving the final network (`torch.save(... policy.state_dict())`, `src/app/ppo.py`) saves a point on the orbit.
+- **Only the time-average converges.** The average over the orbit lands near the equilibrium even though no single point does. The opponent pool is a practical approximation of "average over the orbit" — but it treats the symptom (average away the cycling) rather than the cause (the dynamics cycle at all). The `max_size`-capped snapshot deque evicting old snapshots (`OpponentPool`, `src/services/opponent_pool.py`) is a known cause of *re-forgetting* and re-introduces cycling.
+
+### The mechanism: a moving KL-to-reference regularizer adds friction
+
+R-NaD adds a reward transform that pulls the policy toward a **reference policy** `pi_ref` (a recent frozen copy):
+
+```
+r'(s, a) = r(s, a) - eta * ( log pi(a|s) - log pi_ref(a|s) )
+```
+
+This converts the frictionless orbit into a **damped spiral that contracts to a fixed point** — the pendulum now has friction and comes to rest. That gives **last-iterate convergence**: the single network you hold at the end is itself near-equilibrium, so you no longer need to average or ship a snapshot mixture to be unexploitable.
+
+The reference must **move**, and this is the part that distinguishes it from the entropy bonus the code already has:
+
+- A *fixed* pull (toward `pi_ref`, or toward uniform — which is what `entropy_coeff=0.025` in `src/app/ppo.py` does) converges to a **biased, smoothed** equilibrium (a quantal-response equilibrium), not the true Nash. The regularization permanently distorts the answer, the same way a non-potential reward bonus would.
+- R-NaD instead solves the regularized game to its stable fixed point, then sets `pi_ref <- pi` and re-solves with the new anchor. Each solve is convergent (friction), and the **sequence of anchors walks to the true Nash**. This is a proximal-point / mirror-descent scheme: stable convergent sub-problems whose fixed points converge to the exact equilibrium, because `eta`'s pull vanishes as `pi` and `pi_ref` coincide at Nash.
+
+Distinguish this from PPO's existing KL machinery. The `KL_TARGET=0.015` early-stop (`src/app/ppo.py`) is a pull toward the policy *one optimization step ago* — a trust region for **optimizer** stability (step-size control). It does nothing about the orbit. The R-NaD reference is a **slowly-moving anchor on a much longer timescale** that reshapes *which* equilibrium is sought and damps the cycle. Different layer, different purpose.
+
+### What it buys for Warchest
+
+- **The saved network is unexploitable on its own.** Last-iterate convergence removes the "did I save an exploitable point on the orbit?" problem at the root, rather than patching it by deploying a mixture.
+- **No more forgetting / cycling.** Training progress becomes roughly monotone toward equilibrium instead of orbiting; the pool stops being load-bearing.
+- **A well-defined target.** Plain self-play has no fixed point it is converging to (it orbits); R-NaD makes the Nash equilibrium an actual attractor.
+- **Makes the exploitability metric meaningful.** With a best-responder exploitability eval (the work-in-progress: pool of size 10–20 playing a frozen policy), an orbiting policy would show exploitability *wobbling around a floor*; a converging one shows it *descending*. R-NaD turns that curve from a noise gauge into a progress curve.
+- **Mixed strategies where the game requires them.** Because Warchest hides the opponent's coin split, equilibrium play is mixed; a method that targets Nash directly is the principled way to get unexploitable randomization rather than relying on the entropy bonus to keep the policy from collapsing to a predictable best-response.
+
+### Drawbacks / cost
+
+- **Heavier than the other items.** Requires holding a frozen `pi_ref`, adding the per-step log-ratio term to the reward before GAE, and a schedule for refreshing `pi_ref` and annealing `eta`. More moving parts than dropping `holding_reward` or annealing greedy out.
+- **New hyperparameters.** `eta` (regularization strength), the reference-update period, and the anneal schedule all interact, on top of PPO's existing knobs.
+- **Pairs with, does not replace, the cheaper fixes.** It assumes the reward is the true zero-sum payoff. The non-potential `holding_reward` term (`src/app/ppo.py`) and training against fixed greedy/random opponents both bias the game away from its true equilibrium, so R-NaD would converge to the *wrong* fixed point unless those are addressed first. Sequence it after: (1) exploitability metric, (2) deploy a mixture/average, (3) pure zero-sum reward, (4) anneal fixed bots out — *then* R-NaD.
+
+### Relationship to the other ideas
+
+The snapshot pool fights cycling by **averaging over** the orbit; R-NaD fights cycling by **killing** the orbit so there is nothing to average. They are complementary, but if R-NaD works the pool and the deploy-a-mixture workaround stop being necessary for unexploitability (the pool may still be useful as an opponent-diversity curriculum). It composes cleanly with the factored action head (the head is just the policy parameterization; R-NaD only changes the reward and adds the reference anchor). It is an alternative path to AlphaZero (C15) rather than a complement: both target the equilibrium of a two-player zero-sum game, but R-NaD is **search-free** (model-free, no MCTS at decision time), which is the whole reason DeepNash used it for Stratego — the game tree was too large and too imperfect-information for the MCTS that worked on Go/chess.
+
+---
+
 ## Other Alternatives
 
 ### A2C / A3C (Synchronous / Asynchronous Advantage Actor-Critic)
