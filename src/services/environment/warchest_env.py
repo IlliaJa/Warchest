@@ -11,12 +11,12 @@ from .coin_render import draw_coin, draw_zone
 from typing import Tuple, Dict
 from .action import Action
 from .game_state import (
-    GameState, DECK, COIN_ROYAL, HAND_SIZE, UNITS_PER_PLAYER,
+    GameState, Pending, DECK, COIN_ROYAL, HAND_SIZE, UNITS_PER_PLAYER,
     build_bag, build_supply,
 )
 from .roster import (
     UNIT_IDS, ROYAL_ID, NUM_UNIT_TYPES, TOTAL_COINS, SUPPLY_CAP, MAX_TOTAL,
-    COIN_BY_ID,
+    COIN_BY_ID, UNIT_BY_ID,
 )
 from collections import Counter
 from copy import deepcopy
@@ -43,6 +43,8 @@ CLAIM_INITIATIVE_ACTION = 'claim_initiative'
 PASS_ACTION = 'pass'
 BOLSTER_ACTION = 'bolster'
 RECRUIT_ACTION = 'recruit'
+TACTIC_ACTION = 'tactic'      # initiate a unit's tactic (Phase 4); opens a pending sub-turn
+DECLINE_ACTION = 'decline'    # end an optional pending continuation early
 
 # ---------------------------------------------------------------------------
 # Action encoding (flat ids under the factored head).
@@ -53,13 +55,22 @@ RECRUIT_ACTION = 'recruit'
 #   verb 12:     control (claim) the current cell
 #   verb 13:     bolster the matching unit on this cell (type from the unit there)
 #   verb 14..29: deploy unit type UNIT_IDS[verb-14] onto this cell
+#   verb 30:     tactic — the unit on this cell uses its tactic (Phase 4); the unit
+#                type determines which tactic, which then opens a pending sub-turn
 # Face-down actions (no board cell): appended after the spatial block, over the
 # full 17-coin universe (only the player's drafted coins are ever unmasked).
 #   +[0:C):           claim_initiative paying coin c
 #   +[C:2C):          pass            paying coin c
 #   +[2C:2C+U*C):     recruit take-type t (a unit) × pay-coin c
+#   +[2C+U*C]:        decline — end an optional pending continuation (no coin)
 # Deploy is per-type because an empty target cell does not determine the unit;
-# move/attack/control/bolster are not, because the occupied source cell does.
+# move/attack/control/bolster/tactic are not, because the occupied source cell does.
+#
+# Phase 4 sub-turns: multi-step tactics (and triggered attributes) are NOT encoded
+# as one atomic id. The TACTIC verb only *initiates*; the follow-up clicks (a move
+# direction, an attack direction) reuse verbs 0-11 and are gated by `state.pending`
+# via get_possible_actions. This keeps the action space near-flat as the roster's
+# tactic variety grows — the variety lives in the env's pending state machine.
 # ---------------------------------------------------------------------------
 N_COIN_TYPES = len(DECK)  # 17 (16 units + royal)
 BOARD_DIM = 7
@@ -68,8 +79,9 @@ BOLSTER_VERB = 13
 DEPLOY_VERB_BASE = 14
 # Deploy verb -> unit id (one verb per deployable unit type).
 DEPLOY_VERBS = {DEPLOY_VERB_BASE + i: t for i, t in enumerate(UNIT_IDS)}
-N_VERBS = DEPLOY_VERB_BASE + NUM_UNIT_TYPES  # 14 + 16 = 30
-SPATIAL_SIZE = N_VERBS * BOARD_DIM * BOARD_DIM  # 1470
+TACTIC_VERB = DEPLOY_VERB_BASE + NUM_UNIT_TYPES  # 30 — sits just past the deploy block
+N_VERBS = TACTIC_VERB + 1  # 31
+SPATIAL_SIZE = N_VERBS * BOARD_DIM * BOARD_DIM  # 1519
 
 UNIT_CLASS_BY_COIN = UNIT_CLASS_BY_ID
 
@@ -81,16 +93,22 @@ ROYAL_COIN_IDX = COIN_TO_IDX[ROYAL_ID]
 # Recruitable types = all unit types (each owns >= 4 coins, so supply >= 2).
 RECRUIT_TYPES = UNIT_IDS  # 16 types
 _RECRUIT_BLOCK = 2 * N_COIN_TYPES  # claim (C) + pass (C) precede recruit
-FACEDOWN_SIZE = _RECRUIT_BLOCK + len(RECRUIT_TYPES) * N_COIN_TYPES  # 34 + 272 = 306
-ACTION_SPACE_SIZE = SPATIAL_SIZE + FACEDOWN_SIZE  # 1776
+_DECLINE_OFFSET = _RECRUIT_BLOCK + len(RECRUIT_TYPES) * N_COIN_TYPES  # past recruit
+FACEDOWN_SIZE = _DECLINE_OFFSET + 1  # 34 + 272 + 1 = 307
+ACTION_SPACE_SIZE = SPATIAL_SIZE + FACEDOWN_SIZE  # 1826
+DECLINE_ACTION_ID = SPATIAL_SIZE + _DECLINE_OFFSET
 
 # ---------------------------------------------------------------------------
-# Verb grouping for the factored policy head (Phase 2). The factoring is by verb
-# (8 of them), independent of how many unit types exist — the type choice lives
-# inside the within-verb softmax, so the head scales with the roster for free.
+# Verb grouping for the factored policy head (Phase 2/4). The factoring is by verb,
+# independent of how many unit types exist — the type choice lives inside the
+# within-verb softmax, so the head scales with the roster for free. Phase 4 adds
+# TACTIC (initiate) and DECLINE (end an optional continuation); tactic follow-up
+# moves/attacks stay under V_MOVE/V_ATTACK (their flat ids are ordinary spatial
+# ids), disambiguated for the policy by the pending-context one-hot in globals.
 # ---------------------------------------------------------------------------
-(V_MOVE, V_ATTACK, V_CONTROL, V_DEPLOY, V_BOLSTER, V_CLAIM, V_PASS, V_RECRUIT) = range(8)
-N_FACTORED_VERBS = 8
+(V_MOVE, V_ATTACK, V_CONTROL, V_DEPLOY, V_BOLSTER, V_CLAIM, V_PASS, V_RECRUIT,
+ V_TACTIC, V_DECLINE) = range(10)
+N_FACTORED_VERBS = 10
 
 
 def verb_of_action(action_id: int) -> int:
@@ -104,13 +122,17 @@ def verb_of_action(action_id: int) -> int:
             return V_CONTROL
         if sv == BOLSTER_VERB:
             return V_BOLSTER
+        if sv == TACTIC_VERB:
+            return V_TACTIC
         return V_DEPLOY  # 14..29
     off = action_id - SPATIAL_SIZE
     if off < N_COIN_TYPES:
         return V_CLAIM
     if off < _RECRUIT_BLOCK:
         return V_PASS
-    return V_RECRUIT
+    if off < _DECLINE_OFFSET:
+        return V_RECRUIT
+    return V_DECLINE
 
 
 # Static map flat action id -> verb index; consumed by the factored policy head.
@@ -137,8 +159,17 @@ OWNED_TOTAL = UNITS_PER_PLAYER * MAX_TOTAL + 1  # 21
 #   opponent (public): on_board[U] faceup[C] supply[U] hidden_pool[C] owned[C]
 #                      opp_hand_size[1]
 #   [last] initiative already transferred this round
-GLOBAL_DIM = 7 * N_COIN_TYPES + 3 * NUM_UNIT_TYPES + 7  # 174
-OBS_VERSION = 4
+#   + pending-context one-hot (PENDING_CTX_DIM): which mid-tactic continuation, if any
+#
+# Pending-context one-hot (Phase 4): slot 0 = no pending (normal play); the rest are
+# one slot per kind in PENDING_KINDS. This is what lets the policy read an otherwise
+# ambiguous move/attack click as "a Cavalry follow-up" vs "a normal maneuver". Adding
+# a kind extends this vector → bump OBS_VERSION (a schema change), as for any phase.
+PENDING_KINDS = ('cavalry_move', 'cavalry_attack')
+PENDING_CTX_DIM = 1 + len(PENDING_KINDS)  # 3
+PENDING_KIND_IDX = {k: i for i, k in enumerate(PENDING_KINDS)}
+GLOBAL_DIM = 7 * N_COIN_TYPES + 3 * NUM_UNIT_TYPES + 7 + PENDING_CTX_DIM  # 177
+OBS_VERSION = 5
 
 # Privileged critic-only features: the opponent's true hidden split, per coin (C).
 #   [0:C] opp hand   [C:2C] opp bag   [2C:3C] opp face-down discard
@@ -197,6 +228,8 @@ class WarChestEnv(gym.Env):
             return CLAIM_INITIATIVE_ACTION, (IDX_TO_COIN[off],)
         if off < _RECRUIT_BLOCK:
             return PASS_ACTION, (IDX_TO_COIN[off - len(DECK)],)
+        if off == _DECLINE_OFFSET:
+            return DECLINE_ACTION, ()
         r = off - _RECRUIT_BLOCK
         take = RECRUIT_TYPES[r // len(DECK)]
         pay = IDX_TO_COIN[r % len(DECK)]
@@ -211,10 +244,11 @@ class WarChestEnv(gym.Env):
         passed through this function before env.step(), and vice-versa.
         Self-inverse: remap_action(remap_action(a)) == a.
 
-        Face-down actions are non-spatial and map to themselves. Cell rotation:
-        (r,q) → (s-r, s-q) where s = BOARD_DIM - 1 = 6. Direction flip applies only
-        to move (0-5) and attack (6-11); control (12) and deploy (13,14) rotate
-        spatially only — no verb change.
+        Face-down actions (incl. decline) are non-spatial and map to themselves.
+        Cell rotation: (r,q) → (s-r, s-q) where s = BOARD_DIM - 1 = 6. Direction
+        flip applies only to move (0-5) and attack (6-11); control, bolster, deploy
+        and tactic rotate spatially only — no verb change. Tactic follow-up clicks
+        are ordinary move/attack ids, so they flip exactly like normal maneuvers.
         """
         if action_id >= SPATIAL_SIZE:
             return action_id
@@ -253,6 +287,7 @@ class WarChestEnv(gym.Env):
             CLAIM_INITIATIVE_ACTION: {'act_function': self.perform_claim_initiative_action},
             PASS_ACTION: {'act_function': self.perform_pass_action},
             RECRUIT_ACTION: {'act_function': self.perform_recruit_action},
+            TACTIC_ACTION: {'act_function': self.perform_tactic_action},
         }
 
     def reset(self, seed=None, options=None):
@@ -381,17 +416,25 @@ class WarChestEnv(gym.Env):
         self.state.last_coin_player = active
 
     def step(self, action_id):
-        action_type, action_args = self.get_action_info(action_id)
-        action = self.action_dict[action_type]['act_function'](*action_args)
+        # During a pending sub-turn (a tactic mid-resolution) the same player keeps
+        # acting and the action is a continuation click, dispatched separately from
+        # the normal verb table; the turn only passes once `pending` clears.
+        if self.state.pending is not None:
+            action = self._perform_continuation(action_id)
+            action.type = TACTIC_ACTION
+            action_args = None
+        else:
+            action_type, action_args = self.get_action_info(action_id)
+            action = self.action_dict[action_type]['act_function'](*action_args)
+            action.type = action_type
         action.id = action_id
         action.player_id = self.active_player
-        action.type = action_type
         action.additional_info = action_args
 
         if action.is_valid:
             self.action_count += 1
-            self.state.last_action_type = action_type
-            if not action.finishes_game:
+            self.state.last_action_type = action.type
+            if not action.finishes_game and self.state.pending is None:
                 self._advance_turn()
             if self.history is not None:
                 self.history.append(deepcopy(self.state))
@@ -496,10 +539,15 @@ class WarChestEnv(gym.Env):
             plt.show()
 
     def _render_status_text(self) -> str:
+        pending = ''
+        if self.state.pending is not None:
+            p = self.state.pending
+            pending = f' | tactic={p.kind}@{p.unit_loc}'
         return (
             f'round={self.state.round_number} active=P{self.active_player} '
             f'init=P{self.state.initiative_owner} | '
             f'bases {len(self.board.get_controlled_bases(1))}-{len(self.board.get_controlled_bases(2))}'
+            f'{pending}'
         )
 
     def render_game(self):
@@ -623,6 +671,16 @@ class WarChestEnv(gym.Env):
             dtype=np.float32,
         )
 
+        # Pending-context one-hot: which mid-tactic continuation (if any) is being
+        # asked for. Slot 0 = normal play; this disambiguates a reused move/attack
+        # click as a Cavalry follow-up vs an ordinary maneuver.
+        ctx = np.zeros(PENDING_CTX_DIM, dtype=np.float32)
+        if self.state.pending is None:
+            ctx[0] = 1.0
+        else:
+            ctx[1 + PENDING_KIND_IDX[self.state.pending.kind]] = 1.0
+        global_feats = np.concatenate([global_feats, ctx])
+
         # Valid action mask [ACTION_SPACE_SIZE]
         valid_ids = self.get_possible_actions()
         mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
@@ -660,6 +718,10 @@ class WarChestEnv(gym.Env):
     def get_possible_actions(self):
         """Return valid action IDs in absolute (non-rotated) frame."""
         active = self.active_player
+        # Mid-tactic: only the legal continuation clicks for the owed sub-turn.
+        if self.state.pending is not None:
+            return self._continuation_actions()
+
         hand = self.state.hands[active]
         ids = []
 
@@ -684,6 +746,10 @@ class WarChestEnv(gym.Env):
                 ids.append(self.encode_action(12, r, q))
             # Bolster: add a matching coin onto this unit's stack (any number of times).
             ids.append(self.encode_action(BOLSTER_VERB, r, q))
+            # Tactic: the unit's coin pays for the whole tactic; once initiated the
+            # follow-up clicks are gated by `pending`, not enumerated here.
+            if self._tactic_startable(u):
+                ids.append(self.encode_action(TACTIC_VERB, r, q))
 
         # Deploy: a coin in hand whose unit type is not already on the board, onto
         # any controlled empty location. (One unit of each type at a time.)
@@ -728,6 +794,8 @@ class WarChestEnv(gym.Env):
             return DEPLOY_ACTION, (DEPLOY_VERBS[verb], r, q)
         elif verb == BOLSTER_VERB:
             return BOLSTER_ACTION, (r, q)
+        elif verb == TACTIC_VERB:
+            return TACTIC_ACTION, (r, q)
         raise ValueError(f'Unknown verb {verb} in action_id {action_id}')
 
     def make_random_step(self):
@@ -902,6 +970,129 @@ class WarChestEnv(gym.Env):
         self.state.discard_faceup[active][take] += 1
         return Action(reward=0.0, finishes_game=False, is_valid=True,
                       txt_result='Recruited')
+
+    # ------------------------------------------------------------------
+    # Tactics (Phase 4): a tactic initiates here, then resolves over one or
+    # more pending sub-turn clicks. The coin is paid once, at initiation; the
+    # follow-up clicks reuse the move/attack verbs and are masked by `pending`.
+    # ------------------------------------------------------------------
+
+    def _tactic_startable(self, unit) -> bool:
+        """Can this unit begin its tactic right now? (Coin-in-hand checked by caller.)"""
+        tac = UNIT_BY_ID[unit.id].tactic
+        if tac is None:
+            return False
+        if tac == 'cavalry':
+            # "Move and then attack" — needs at least one cell to move into.
+            return bool(self.board.get_free_adjacent_cells(*unit.loc))
+        return False
+
+    def perform_tactic_action(self, r: int, q: int) -> Action:
+        active = self.active_player
+        unit = self.board.get_unit_at(r, q)
+        if unit is None or unit.player_id != active:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='No own unit to use a tactic', is_valid=False)
+        tac = UNIT_BY_ID[unit.id].tactic
+        if tac is None or unit.id not in self.state.hands[active]:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='No matching coin or unit has no tactic', is_valid=False)
+
+        if tac == 'cavalry':
+            if not self.board.get_free_adjacent_cells(r, q):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Cavalry has nowhere to move', is_valid=False)
+            # The coin pays for the whole move-then-attack; discard it face-up now.
+            self._play_coin(unit.id, 'faceup')
+            self.state.pending = Pending('cavalry_move', unit_loc=(r, q), optional=False)
+            return Action(reward=0.0, finishes_game=False, is_valid=True,
+                          txt_result='Cavalry tactic: choose a move')
+
+        return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                      txt_result=f'Unknown tactic {tac!r}', is_valid=False)
+
+    def _continuation_actions(self):
+        """Legal continuation ids for the current pending sub-turn (absolute frame)."""
+        p = self.state.pending
+        active = self.active_player
+        r, q = p.unit_loc
+        ids = []
+
+        if p.kind == 'cavalry_move':
+            for d, (dr, dq) in enumerate(self.board.offsets):
+                if (r + dr, q + dq) in self.board.get_free_adjacent_cells(r, q):
+                    ids.append(self.encode_action(d, r, q))  # reuse move verbs 0-5
+        elif p.kind == 'cavalry_attack':
+            for d, (dr, dq) in enumerate(self.board.offsets):
+                enemy = self.board.get_unit_at(r + dr, q + dq)
+                if enemy is not None and enemy.player_id != active:
+                    ids.append(self.encode_action(6 + d, r, q))  # reuse attack verbs 6-11
+
+        if p.optional:
+            ids.append(DECLINE_ACTION_ID)
+        return ids
+
+    def _perform_continuation(self, action_id: int) -> Action:
+        """Apply one click of the owed pending sub-turn; clear/advance `pending`."""
+        p = self.state.pending
+        active = self.active_player
+
+        if action_id == DECLINE_ACTION_ID:
+            if not p.optional:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='This continuation is mandatory', is_valid=False)
+            self.state.pending = None
+            return Action(reward=0.0, finishes_game=False, is_valid=True,
+                          txt_result='Declined continuation')
+
+        if action_id >= SPATIAL_SIZE:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='Not a legal continuation', is_valid=False)
+        verb, r, q = self.decode_action(action_id)
+        if (r, q) != p.unit_loc:
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='Continuation must act on the pending unit', is_valid=False)
+
+        if p.kind == 'cavalry_move':
+            if not (0 <= verb <= 5):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Cavalry must move first', is_valid=False)
+            offset = self.board.offsets[verb]
+            end = (r + offset[0], q + offset[1])
+            if end not in self.board.get_free_adjacent_cells(r, q):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Target cell not free', is_valid=False)
+            unit = self.board.get_unit_at(r, q)
+            unit.move(loc=end)
+            self.exploration_map_dict[active][end] += 1
+            # Then attack — optional so a move into a position with no enemy adjacent
+            # is not a softlock (matches "attack, if able").
+            self.state.pending = Pending('cavalry_attack', unit_loc=end, optional=True)
+            return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
+                          txt_result='Cavalry moved; choose an attack', is_valid=True)
+
+        if p.kind == 'cavalry_attack':
+            if not (6 <= verb <= 11):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Expected an attack', is_valid=False)
+            offset = self.board.offsets[verb - 6]
+            target = (r + offset[0], q + offset[1])
+            enemy = self.board.get_unit_at(*target)
+            if enemy is None or enemy.player_id == active:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='No enemy unit at target cell', is_valid=False)
+            enemy.stack -= 1
+            self.state.boxed[enemy.player_id][enemy.id] += 1
+            if enemy.stack <= 0:
+                self.board.remove_unit(enemy)
+            self.state.pending = None
+            return Action(reward=ATTACK_REWARD, finishes_game=False,
+                          txt_result='Cavalry attacked', is_valid=True)
+
+        # Unknown pending kind — clear it to avoid a stuck turn.
+        self.state.pending = None
+        return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                      txt_result=f'Unknown pending kind {p.kind!r}', is_valid=False)
 
     def get_active_player_units(self):
         return [u for u in self.board.units if u.player_id == self.active_player]

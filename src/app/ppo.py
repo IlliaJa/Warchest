@@ -11,7 +11,7 @@ import time
 import wandb
 
 from src.services.policy.policy import Policy, Critic
-from src.services.environment.warchest_env import WarChestEnv, WIN_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION, DEPLOY_ACTION
+from src.services.environment.warchest_env import WarChestEnv, WIN_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION
 from src.services.environment.game_state import HAND_SIZE
 from src.services.opponent_pool import OpponentPool
 from src.utils.rollout_buffer import RolloutBuffer
@@ -182,8 +182,6 @@ class PPOTrainer:
         outcome = 'truncated'
         invalid_count = 0
         claims = 0
-        deploys = 0
-        deploy_turns = []
         main_score = 0.0
         turns = 0
 
@@ -233,9 +231,6 @@ class PPOTrainer:
 
                 if step_info['action'].type == CLAIM_BASE_ACTION and step_info['action'].is_valid:
                     claims += 1
-                if step_info['action'].type == DEPLOY_ACTION and step_info['action'].is_valid:
-                    deploys += 1
-                    deploy_turns.append(turn)
 
                 self._buffer.add_step(obs_before, action, log_prob, shaped_reward, value, opp_onehot, privileged)
             else:
@@ -273,8 +268,6 @@ class PPOTrainer:
             'turns': turns,
             'invalid_count': invalid_count,
             'claims': claims,
-            'deploys': deploys,
-            'deploy_turns': deploy_turns,
             'main_score': main_score,
             'main_pid': main_pid,
             'opp_type': opp_type,
@@ -514,10 +507,6 @@ class PPOTrainer:
             f"{ep['outcome'][0]}({ep['opp_type'][0]})" for ep in self._batch_eps
         )
 
-        all_deploy_turns = [t for ep in self._batch_eps for t in ep['deploy_turns']]
-        avg_deploys = float(np.mean([ep['deploys'] for ep in self._batch_eps]))
-        deploy_turn_mean = float(np.mean(all_deploy_turns)) if all_deploy_turns else 0.0
-
         logger.debug(
             f'batch={batch_num} n_actor={s["n_actor_updates"]} n_critic={s["n_critic_updates"]} '
             f'adv mean={self._buffer.raw_adv_mean:.4f} std={self._buffer.raw_adv_std:.4f} '
@@ -533,7 +522,6 @@ class PPOTrainer:
             f'kl={s["avg_kl"]:.4f} ent={s["avg_entropy"]:.3f} '
             f'grad_a={s["last_actor_grad"]:.3f} grad_c={s["last_critic_grad"]:.3f} '
             f'pool={len(self._pool)} turns={avg_turns:.0f} invalid={total_invalid} '
-            f'deploys={avg_deploys:.2f} deploy_turn={deploy_turn_mean:.0f} '
             f't={time.time() - self._batch_start:.2f}s'
         )
 
@@ -552,8 +540,6 @@ class PPOTrainer:
                 'critic_mae': s['avg_critic_mae'],
                 'advantage_std': self._buffer.raw_adv_std,
                 'avg_turns': avg_turns,
-                'avg_deploys_per_ep': avg_deploys,
-                'deploy_turn_mean': deploy_turn_mean,
             })
 
 
@@ -580,7 +566,7 @@ if __name__ == '__main__':
 
     hp = {
         'n_batches': 600,
-        'collect_episodes': 16,
+        'collect_episodes': 32,
         'max_t': 1000,
         'gamma': 0.99,
         'lam': 0.95,
@@ -589,7 +575,7 @@ if __name__ == '__main__':
         'entropy_coeff': 0.025,
         'holding_reward_rate': holding_reward_rate,
         'minibatch_size': 64,
-        'lr_actor': 1e-4,
+        'lr_actor': 3e-4,
         'lr_critic': 3e-4,
         'hidden_dim': 64,
         'print_every': 10,

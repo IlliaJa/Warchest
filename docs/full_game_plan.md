@@ -301,6 +301,26 @@ non-trivial type preference; freeze `baseline_multiunit_v4`.
 
 ## Phase 4 — Tactics & attributes (incremental, a few units at a time)
 
+**Scaffolding + Cavalry slice implemented (2026-06-02).** The variety of tactics is kept
+*out* of the action space via a **pending sub-turn** state machine: a multi-step tactic
+resolves as a sequence of masked clicks, not one atomic id. `GameState.pending` (a `Pending`
+dataclass) parks the owed continuation; while it is set the turn does **not** pass,
+`get_possible_actions` returns only the legal next clicks, and those clicks **reuse the
+move/attack verbs** — the policy disambiguates "normal maneuver" vs "tactic follow-up" via a
+**pending-context one-hot** appended to the globals. Action-space additions are minimal: one
+spatial `TACTIC` verb (initiate; the on-board unit's type picks the tactic) + one non-spatial
+`DECLINE` slot (end an optional continuation). Schema bump: `N_VERBS` 30→**31**, `FACEDOWN_SIZE`
+306→**307**, `GLOBAL_DIM` 174→**177** (`PENDING_CTX_DIM=3`), `N_FACTORED_VERBS` 8→**10**
+(`V_TACTIC`, `V_DECLINE`), `OBS_VERSION=5`. Cavalry (`tactic='cavalry'` in `roster.py`) is the
+end-to-end proof: `TACTIC@unit → move-dir (mandatory) → attack-dir (optional)`, coin paid once
+at initiation; attack is optional so a move with no adjacent enemy is not a softlock. Policy/
+Critic/buffer/trainer are shape-agnostic — only the constants changed; GreedyBot's deploy-verb
+range was capped below `TACTIC_VERB` so it stays a tactic-ignoring yardstick. Tests:
+`tests/test_phase4.py` (16: schema/encode/remap, the full + declined + mandatory sub-turn,
+context one-hot, P2-via-remap, coin-conservation-with-tactics, no-softlock, bots, nets).
+Remaining clusters below add a `Pending` kind + a continuation branch + a roster flag per unit;
+the `SELECT` verb (non-directional targets: ranged, friendly-unit grants) is the next primitive.
+
 **Goal.** Add the `tactic` verb branch + conditional masks and passive `attributes`,
 one cluster of units per sub-step so failures stay localized.
 

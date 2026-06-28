@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from collections import Counter
+from typing import Optional, Tuple
 from .board import Board
 from .roster import (
     UNIT_IDS, ALL_COIN_IDS, ROYAL_ID, NUM_UNIT_TYPES,
@@ -18,6 +19,29 @@ UNITS_PER_PLAYER = 4  # each player drafts this many distinct unit types
 
 def _empty_counters():
     return {1: Counter(), 2: Counter()}
+
+
+@dataclass
+class Pending:
+    """A continuation owed by the active player mid-tactic (Phase 4 sub-turn).
+
+    A tactic (or a triggered attribute) that spans several decisions parks its
+    state here instead of inflating the action space: while `pending` is set the
+    turn does NOT pass, `get_possible_actions` returns only the legal next clicks
+    for this `kind`, and those clicks reuse the existing move/attack verbs (the
+    policy disambiguates via the pending-context one-hot in the global features).
+
+    kind:      context label; drives both the legal-continuation mask and the
+               observation context one-hot (must be listed in PENDING_KINDS).
+    unit_loc:  the on-board cell the continuation acts on/from (updated as a unit
+               moves through a multi-step tactic).
+    optional:  whether DECLINE is a legal continuation (ends the tactic early).
+    data:      per-tactic scratch (e.g. a locked line direction) for future kinds.
+    """
+    kind: str
+    unit_loc: Tuple[int, int]
+    optional: bool = False
+    data: dict = field(default_factory=dict)
 
 
 def build_bag(unit_ids) -> Counter:
@@ -49,6 +73,8 @@ class GameState:
     initiative_owner: int = 1
     # Initiative may transfer at most once per round.
     initiative_transferred_this_round: bool = False
+    # Owed mid-tactic continuation (Phase 4); None during normal play.
+    pending: Optional[Pending] = None
     round_number: int = 0
     # Last action taken (for rendering); set on each valid coin play.
     last_action_type: str = None

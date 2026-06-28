@@ -4,7 +4,7 @@ import numpy as np
 
 from .base import Bot
 from ..environment.warchest_env import (
-    BOARD_DIM, SPATIAL_SIZE, N_COIN_TYPES, N_VERBS,
+    BOARD_DIM, SPATIAL_SIZE, N_COIN_TYPES, TACTIC_VERB,
     CONTROL_VERB, BOLSTER_VERB, DEPLOY_VERB_BASE, ROYAL_COIN_IDX,
 )
 
@@ -14,7 +14,10 @@ _VERB_ATTACK_START = 6
 _VERB_ATTACK_END = 11
 _VERB_CONTROL = CONTROL_VERB        # 12
 _VERB_DEPLOY_START = DEPLOY_VERB_BASE  # 14
-_VERB_DEPLOY_END = N_VERBS - 1      # 29
+_VERB_DEPLOY_END = TACTIC_VERB - 1  # 29 — deploy block ends just before the tactic verb
+# GreedyBot is a myopic yardstick: it never *initiates* a tactic (no V_TACTIC branch),
+# but if random exploration parks it mid-tactic the continuation clicks reuse the
+# move/attack verbs above, so it still plays them through.
 
 # Face-down block layout (offsets from SPATIAL_SIZE): [0:C) claim, [C:2C) pass.
 _PASS_OFFSET = N_COIN_TYPES         # pass block starts after the claim block
