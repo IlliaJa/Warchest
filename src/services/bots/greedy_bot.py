@@ -37,7 +37,7 @@ class GreedyBot(Bot):
     RANDOM_ACTION_PROB = 0.30
 
     def act(self, obs: dict) -> tuple[int, None, None]:
-        valid = list(np.where(obs['valid_action_mask'] == 1)[0])
+        valid = list(np.where(obs['valid_action_mask'])[0])
         board = obs['board']  # [C, 7, 7] ego-centric encoded
 
         if np.random.random() < self.RANDOM_ACTION_PROB:

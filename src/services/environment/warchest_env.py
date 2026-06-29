@@ -736,8 +736,7 @@ class WarChestEnv(gym.Env):
         valid_ids = self.get_possible_actions()
         mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.bool_)
         if active == 2:
-            for a in valid_ids:
-                mask[self.remap_action(a)] = True
+            mask[_REMAP_TABLE[np.array(valid_ids, dtype=np.int64)]] = True
         else:
             mask[valid_ids] = True
         self.prof['obs_mask'] += _pt() - _t0
@@ -1797,3 +1796,9 @@ class WarChestEnv(gym.Env):
 
     def get_active_player_units(self):
         return [u for u in self.board.units if u.player_id == self.active_player]
+
+
+# Precomputed full remap table — vectorises the P2 ego-centric mask translation.
+# Shape (ACTION_SPACE_SIZE,); face-down actions are identity, spatial actions are
+# rotated 180°. Built once at import time (~400 µs), reused every observation call.
+_REMAP_TABLE = np.array([WarChestEnv.remap_action(a) for a in range(ACTION_SPACE_SIZE)], dtype=np.int64)
