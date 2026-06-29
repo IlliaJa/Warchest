@@ -143,11 +143,6 @@ class PPOTrainer:
         self._t_env: float = 0.0
         self._t_model_play: float = 0.0
         self._t_gradient: float = 0.0
-        # env sub-timers (debug only, remove when no longer needed)
-        self._t_env_reset: float = 0.0
-        self._t_env_step_main: float = 0.0
-        self._t_env_step_opp: float = 0.0
-        self._t_env_board_q: float = 0.0  # get_controlled_bases + get_privileged_features outside step
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -178,11 +173,6 @@ class PPOTrainer:
         self._batch_eps = []
         self._t_env = 0.0
         self._t_model_play = 0.0
-        self._t_env_reset = 0.0
-        self._t_env_step_main = 0.0
-        self._t_env_step_opp = 0.0
-        self._t_env_board_q = 0.0
-        self._env.reset_prof()
         self._policy.train()
         self._critic.train()
         for _ in range(self._collect_episodes):
@@ -199,9 +189,7 @@ class PPOTrainer:
 
         t0 = _pt()
         state, _ = self._env.reset()
-        _dt = _pt() - t0
-        self._t_env += _dt
-        self._t_env_reset += _dt
+        self._t_env += _pt() - t0
 
         outcome = 'truncated'
         invalid_count = 0
@@ -224,9 +212,7 @@ class PPOTrainer:
                 # captured at the main player's decision point. Never seen by the policy.
                 t0 = _pt()
                 privileged = self._env.get_privileged_features()
-                _dt = _pt() - t0
-                self._t_env += _dt
-                self._t_env_board_q += _dt
+                self._t_env += _pt() - t0
                 privileged_t = torch.from_numpy(privileged).unsqueeze(0)
 
                 t0 = _pt()
@@ -251,18 +237,14 @@ class PPOTrainer:
 
                 t0 = _pt()
                 state, reward, terminated, truncated, step_info = self._env.step(env_action)
-                _dt = _pt() - t0
-                self._t_env += _dt
-                self._t_env_step_main += _dt
+                self._t_env += _pt() - t0
 
                 if not step_info['action'].is_valid:
                     invalid_count += 1
                     logger.warning(f'turn={turn} main_pid={main_pid} invalid_action={action} env_action={env_action}')
                     t0 = _pt()
                     state, reward, terminated, truncated, step_info = self._env.make_random_step()
-                    _dt = _pt() - t0
-                    self._t_env += _dt
-                    self._t_env_step_main += _dt
+                    self._t_env += _pt() - t0
                     log_prob = torch.tensor(0.0)
                     value = torch.tensor(0.0)
 
@@ -286,15 +268,11 @@ class PPOTrainer:
                 env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
                 t0 = _pt()
                 state, _, terminated, truncated, step_info = self._env.step(env_action)
-                _dt = _pt() - t0
-                self._t_env += _dt
-                self._t_env_step_opp += _dt
+                self._t_env += _pt() - t0
                 if not step_info['action'].is_valid:
                     t0 = _pt()
                     state, _, terminated, truncated, step_info = self._env.make_random_step()
-                    _dt = _pt() - t0
-                    self._t_env += _dt
-                    self._t_env_step_opp += _dt
+                    self._t_env += _pt() - t0
 
             if terminated:
                 outcome = 'win' if acting_pid == main_pid else 'lose'
@@ -578,28 +556,6 @@ class PPOTrainer:
             f'model_play={self._t_model_play:.2f}s ({100*self._t_model_play/total_t:.0f}%) '
             f'gradient={self._t_gradient:.2f}s ({100*self._t_gradient/total_t:.0f}%) '
             f'total_accounted={total_t:.2f}s'
-        )
-        t_env_other = self._t_env - self._t_env_reset - self._t_env_step_main - self._t_env_step_opp - self._t_env_board_q
-        p = self._env.prof
-        t_step_total = self._t_env_step_main + self._t_env_step_opp
-        t_obs = p['obs_board'] + p['obs_global'] + p['obs_mask']
-        t_action_exec = p['action_exec']
-        t_step_other = t_step_total - t_obs - t_action_exec
-        logger.info(
-            f'batch={batch_num} env breakdown: '
-            f'reset={self._t_env_reset:.2f}s '
-            f'step_main={self._t_env_step_main:.2f}s '
-            f'step_opp={self._t_env_step_opp:.2f}s '
-            f'board_queries={self._t_env_board_q:.2f}s '
-            f'other={t_env_other:.2f}s'
-        )
-        logger.info(
-            f'batch={batch_num} step internals: '
-            f'action_exec={t_action_exec:.2f}s '
-            f'obs_board={p["obs_board"]:.2f}s '
-            f'obs_global={p["obs_global"]:.2f}s '
-            f'obs_mask={p["obs_mask"]:.2f}s '
-            f'step_other={t_step_other:.2f}s'
         )
         logger.info(
             f'batch={batch_num}/{self._n_batches} [{outcomes_str}] '

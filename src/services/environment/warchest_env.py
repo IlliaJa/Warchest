@@ -1,4 +1,3 @@
-import time
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -298,13 +297,6 @@ class WarChestEnv(gym.Env):
         self.observation_space = self.get_observation_space()
         self.action_dict = self._build_action_dict()
         self.action_space = spaces.Discrete(ACTION_SPACE_SIZE)
-        # Debug profiling — cumulative seconds per sub-operation; call reset_prof() to clear.
-        self.prof = {'action_exec': 0.0, 'obs_board': 0.0, 'obs_global': 0.0, 'obs_mask': 0.0}
-
-    def reset_prof(self):
-        for k in self.prof:
-            self.prof[k] = 0.0
-
     def _build_action_dict(self) -> Dict:
         return {
             MOVE_ACTION: {'act_function': self.perform_move_action},
@@ -447,7 +439,6 @@ class WarChestEnv(gym.Env):
         # During a pending sub-turn (a tactic mid-resolution) the same player keeps
         # acting and the action is a continuation click, dispatched separately from
         # the normal verb table; the turn only passes once `pending` clears.
-        _t0 = time.perf_counter()
         if self.state.pending is not None:
             # Capture the acting unit before it might move/die during the continuation,
             # so we can record the correct coin in last_coin for the history display.
@@ -483,8 +474,6 @@ class WarChestEnv(gym.Env):
             if self.debug_mode and not action.finishes_game and not self.get_possible_actions():
                 action.finishes_game = True
                 action.reward += WIN_REWARD
-        self.prof['action_exec'] += time.perf_counter() - _t0
-
         truncated = self.state.round_number >= self.max_rounds
         if self.debug_mode:
             print(f'Got action_id {action.id} type={action.type} args={action.additional_info}')
@@ -625,9 +614,7 @@ class WarChestEnv(gym.Env):
         active = self.active_player
         opponent = 3 - active
         s = self.board.board_size - 1  # 6
-        _pt = time.perf_counter
 
-        _t0 = _pt()
         raw_board = self.board.board
         expl = self.exploration_map_dict[active]
         if active == 2:
@@ -655,9 +642,6 @@ class WarChestEnv(gym.Env):
                 r, q = s - r, s - q
             owner_base = OWN_UNIT_PLANE_BASE if u.player_id == active else OPP_UNIT_PLANE_BASE
             board_enc[owner_base + (u.id - 1), r, q] = u.stack / STACK_NORM
-        self.prof['obs_board'] += _pt() - _t0
-
-        _t0 = _pt()
         # Global features [GLOBAL_DIM] — ego-centric coin-counting (OBS_VERSION 4).
         my_bases = len(self.board.get_controlled_bases(active))
         opp_bases = len(self.board.get_controlled_bases(opponent))
@@ -683,42 +667,47 @@ class WarChestEnv(gym.Env):
 
         own_owned = in_play(active)
         opp_owned = in_play(opponent)
-        # Hidden cycle = in-play owned minus all public zones.
-        opp_hidden = {
-            c: opp_owned[c] - opp_on_board[c] - opp_faceup[c] - opp_supply[c] for c in DECK
-        }
+        # Convert all counters to dense numpy vectors; remaining ops are vectorised.
+        hand_v    = _counter_to_deck_vec(own_hand)
+        bag_v     = _counter_to_deck_vec(own_bag)
+        discard_v = _counter_to_deck_vec(own_discard)
+        supply_v  = _counter_to_unit_vec(own_supply)
+        owned_v   = _counter_to_deck_vec(own_owned)
+        onboard_v = _counter_to_unit_vec(opp_on_board)
+        faceup_v  = _counter_to_deck_vec(opp_faceup)
+        opp_sup_v = _counter_to_unit_vec(opp_supply)
+        opp_own_v = _counter_to_deck_vec(opp_owned)
 
-        def norm(counter):  # per-coin counts normalized by total owned per type
-            return [counter[c] / TOTAL_COINS[c] for c in DECK]
+        # opp_hidden: expand unit-only vectors to DECK-length, then subtract.
+        onboard_deck = np.zeros(N_COIN_TYPES, dtype=np.float32)
+        onboard_deck[_UNIT_IN_DECK] = onboard_v
+        opp_sup_deck = np.zeros(N_COIN_TYPES, dtype=np.float32)
+        opp_sup_deck[_UNIT_IN_DECK] = opp_sup_v
+        hidden_v = opp_own_v - onboard_deck - faceup_v - opp_sup_deck
 
-        def norm_units(counter):  # over unit types only
-            return [counter[c] / TOTAL_COINS[c] for c in UNIT_COINS]
-
-        def norm_supply(counter):  # over unit types, by supply capacity
-            return [counter[c] / SUPPLY_CAP[c] for c in RECRUIT_TYPES]
-
-        global_feats = np.array(
-            [
+        global_feats = np.concatenate([
+            np.array([
                 min(self.state.round_number / self.max_rounds, 1.0),
                 my_bases / self.winning_base_count,
                 opp_bases / self.winning_base_count,
                 float(self.state.initiative_owner == active),
-            ]
-            + norm(own_hand)
-            + norm(own_bag)
-            + norm(own_discard)
-            + norm_supply(own_supply)
-            + [sum(own_bag.values()) / OWNED_TOTAL]
-            + norm(own_owned)
-            + norm_units(opp_on_board)
-            + norm(opp_faceup)
-            + norm_supply(opp_supply)
-            + [opp_hidden[c] / TOTAL_COINS[c] for c in DECK]
-            + norm(opp_owned)
-            + [sum(self.state.hands[opponent].values()) / HAND_SIZE]
-            + [float(self.state.initiative_transferred_this_round)],
-            dtype=np.float32,
-        )
+            ], dtype=np.float32),
+            hand_v / _TOTAL_COINS_VEC,
+            bag_v / _TOTAL_COINS_VEC,
+            discard_v / _TOTAL_COINS_VEC,
+            supply_v / _SUPPLY_CAP_VEC,
+            np.array([sum(own_bag.values()) / OWNED_TOTAL], dtype=np.float32),
+            owned_v / _TOTAL_COINS_VEC,
+            onboard_v / _TOTAL_COINS_UNIT_VEC,
+            faceup_v / _TOTAL_COINS_VEC,
+            opp_sup_v / _SUPPLY_CAP_VEC,
+            hidden_v / _TOTAL_COINS_VEC,
+            opp_own_v / _TOTAL_COINS_VEC,
+            np.array([
+                sum(self.state.hands[opponent].values()) / HAND_SIZE,
+                float(self.state.initiative_transferred_this_round),
+            ], dtype=np.float32),
+        ])
 
         # Pending-context one-hot: which mid-tactic continuation (if any) is being
         # asked for. Slot 0 = normal play; this disambiguates a reused move/attack
@@ -729,9 +718,6 @@ class WarChestEnv(gym.Env):
         else:
             ctx[1 + PENDING_KIND_IDX[self.state.pending.kind]] = 1.0
         global_feats = np.concatenate([global_feats, ctx])
-        self.prof['obs_global'] += _pt() - _t0
-
-        _t0 = _pt()
         # Valid action mask [ACTION_SPACE_SIZE]
         valid_ids = self.get_possible_actions()
         mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.bool_)
@@ -739,8 +725,6 @@ class WarChestEnv(gym.Env):
             mask[_REMAP_TABLE[np.array(valid_ids, dtype=np.int64)]] = True
         else:
             mask[valid_ids] = True
-        self.prof['obs_mask'] += _pt() - _t0
-
         return {
             'board': board_enc,
             'global': global_feats,
@@ -1802,3 +1786,37 @@ class WarChestEnv(gym.Env):
 # Shape (ACTION_SPACE_SIZE,); face-down actions are identity, spatial actions are
 # rotated 180°. Built once at import time (~400 µs), reused every observation call.
 _REMAP_TABLE = np.array([WarChestEnv.remap_action(a) for a in range(ACTION_SPACE_SIZE)], dtype=np.int64)
+
+# ---------------------------------------------------------------------------
+# Vectorised obs_global helpers.
+# All arrays are built once at import time and reused every generate_observation call.
+# _counter_to_deck_vec / _counter_to_unit_vec iterate only over non-zero Counter
+# entries (typically 3–5), replacing O(17) or O(16) per-element Python loops.
+# ---------------------------------------------------------------------------
+_DECK_LIST = list(DECK)                                          # stable DECK iteration order
+_DECK_COIN_TO_IDX = {c: i for i, c in enumerate(_DECK_LIST)}    # coin → position in DECK vec
+_TOTAL_COINS_VEC = np.array([TOTAL_COINS[c] for c in _DECK_LIST], dtype=np.float32)
+_UNIT_COIN_TO_IDX = {c: i for i, c in enumerate(UNIT_COINS)}    # coin → position in unit vec
+_TOTAL_COINS_UNIT_VEC = np.array([TOTAL_COINS[c] for c in UNIT_COINS], dtype=np.float32)
+_SUPPLY_CAP_VEC = np.array([SUPPLY_CAP[c] for c in RECRUIT_TYPES], dtype=np.float32)
+_UNIT_IN_DECK = np.array([_DECK_COIN_TO_IDX[c] for c in UNIT_COINS], dtype=np.int64)
+
+
+def _counter_to_deck_vec(counter) -> np.ndarray:
+    """Counter → float32[N_COIN_TYPES] in _DECK_LIST order; iterates only non-zero entries."""
+    v = np.zeros(N_COIN_TYPES, dtype=np.float32)
+    for coin, cnt in counter.items():
+        i = _DECK_COIN_TO_IDX.get(coin)
+        if i is not None:
+            v[i] = cnt
+    return v
+
+
+def _counter_to_unit_vec(counter) -> np.ndarray:
+    """Counter → float32[NUM_UNIT_TYPES] in UNIT_COINS order; iterates only non-zero entries."""
+    v = np.zeros(NUM_UNIT_TYPES, dtype=np.float32)
+    for coin, cnt in counter.items():
+        i = _UNIT_COIN_TO_IDX.get(coin)
+        if i is not None:
+            v[i] = cnt
+    return v
