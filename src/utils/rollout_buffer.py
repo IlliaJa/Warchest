@@ -88,21 +88,20 @@ class RolloutBuffer:
         for start in range(0, N, batch_size):
             idx = perm[start:start + batch_size]
             yield {
-                'board': torch.tensor(
-                    np.stack([obs[i]['board'] for i in idx]), dtype=torch.float32
+                'board': torch.from_numpy(
+                    np.stack([obs[i]['board'] for i in idx])
                 ).to(device),
-                'global': torch.tensor(
-                    np.stack([obs[i]['global'] for i in idx]), dtype=torch.float32
+                'global': torch.from_numpy(
+                    np.stack([obs[i]['global'] for i in idx])
                 ).to(device),
-                'mask': torch.tensor(
-                    np.stack([obs[i]['valid_action_mask'].astype(bool) for i in idx]),
-                    dtype=torch.bool,
+                'mask': torch.from_numpy(
+                    np.stack([obs[i]['valid_action_mask'] for i in idx])
                 ).to(device),
-                'opp_onehot': torch.tensor(
-                    np.stack([self._opp_onehots[i] for i in idx]), dtype=torch.float32
+                'opp_onehot': torch.from_numpy(
+                    np.stack([self._opp_onehots[i] for i in idx])
                 ).to(device),
-                'privileged': torch.tensor(
-                    np.stack([self._privileged[i] for i in idx]), dtype=torch.float32
+                'privileged': torch.from_numpy(
+                    np.stack([self._privileged[i] for i in idx])
                 ).to(device),
                 'actions': torch.tensor(
                     [self._actions[i] for i in idx], dtype=torch.long

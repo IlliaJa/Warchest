@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -297,6 +298,12 @@ class WarChestEnv(gym.Env):
         self.observation_space = self.get_observation_space()
         self.action_dict = self._build_action_dict()
         self.action_space = spaces.Discrete(ACTION_SPACE_SIZE)
+        # Debug profiling — cumulative seconds per sub-operation; call reset_prof() to clear.
+        self.prof = {'action_exec': 0.0, 'obs_board': 0.0, 'obs_global': 0.0, 'obs_mask': 0.0}
+
+    def reset_prof(self):
+        for k in self.prof:
+            self.prof[k] = 0.0
 
     def _build_action_dict(self) -> Dict:
         return {
@@ -440,6 +447,7 @@ class WarChestEnv(gym.Env):
         # During a pending sub-turn (a tactic mid-resolution) the same player keeps
         # acting and the action is a continuation click, dispatched separately from
         # the normal verb table; the turn only passes once `pending` clears.
+        _t0 = time.perf_counter()
         if self.state.pending is not None:
             # Capture the acting unit before it might move/die during the continuation,
             # so we can record the correct coin in last_coin for the history display.
@@ -470,11 +478,12 @@ class WarChestEnv(gym.Env):
                 self._advance_turn()
             if self.history is not None:
                 self.history.append(deepcopy(self.state))
-            # If the newly active player has no valid actions the previous mover wins.
-            # With pass always legal this is a safety net rather than a normal path.
-            if not action.finishes_game and not self.get_possible_actions():
+            # Safety net: if the newly active player has no valid actions, previous mover wins.
+            # Pass is always legal so this path is nearly unreachable; skip in normal training.
+            if self.debug_mode and not action.finishes_game and not self.get_possible_actions():
                 action.finishes_game = True
                 action.reward += WIN_REWARD
+        self.prof['action_exec'] += time.perf_counter() - _t0
 
         truncated = self.state.round_number >= self.max_rounds
         if self.debug_mode:
@@ -616,7 +625,9 @@ class WarChestEnv(gym.Env):
         active = self.active_player
         opponent = 3 - active
         s = self.board.board_size - 1  # 6
+        _pt = time.perf_counter
 
+        _t0 = _pt()
         raw_board = self.board.board
         expl = self.exploration_map_dict[active]
         if active == 2:
@@ -644,7 +655,9 @@ class WarChestEnv(gym.Env):
                 r, q = s - r, s - q
             owner_base = OWN_UNIT_PLANE_BASE if u.player_id == active else OPP_UNIT_PLANE_BASE
             board_enc[owner_base + (u.id - 1), r, q] = u.stack / STACK_NORM
+        self.prof['obs_board'] += _pt() - _t0
 
+        _t0 = _pt()
         # Global features [GLOBAL_DIM] — ego-centric coin-counting (OBS_VERSION 4).
         my_bases = len(self.board.get_controlled_bases(active))
         opp_bases = len(self.board.get_controlled_bases(opponent))
@@ -716,15 +729,18 @@ class WarChestEnv(gym.Env):
         else:
             ctx[1 + PENDING_KIND_IDX[self.state.pending.kind]] = 1.0
         global_feats = np.concatenate([global_feats, ctx])
+        self.prof['obs_global'] += _pt() - _t0
 
+        _t0 = _pt()
         # Valid action mask [ACTION_SPACE_SIZE]
         valid_ids = self.get_possible_actions()
-        mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+        mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.bool_)
         if active == 2:
             for a in valid_ids:
-                mask[self.remap_action(a)] = 1.0
+                mask[self.remap_action(a)] = True
         else:
-            mask[valid_ids] = 1.0
+            mask[valid_ids] = True
+        self.prof['obs_mask'] += _pt() - _t0
 
         return {
             'board': board_enc,
