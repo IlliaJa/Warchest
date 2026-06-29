@@ -121,12 +121,15 @@ if __name__ == '__main__':
 
     # Evaluate vs random
     env = WarChestEnv(save_game_history=False)
-    evaluate_agent(env, n_eval_episodes=10, policy=policy)
+    evaluate_agent(env, n_eval_episodes=1, policy=policy)
 
     # Rendered game
     env_render = WarChestEnv(save_game_history=True)
     if args.opponent == 'greedy':
-        play_ai_vs_greedy(env_render, policy)
+        ai_pid = 1
+        play_ai_vs_greedy(env_render, policy, ai_pid=ai_pid)
+        labels = {ai_pid: 'Policy', 3 - ai_pid: 'Greedy'}
     else:
         play_ai_vs_ai(env_render, policy)
-    env_render.render_game()
+        labels = {1: 'Policy', 2: 'Policy'}
+    env_render.render_game(player_labels=labels)

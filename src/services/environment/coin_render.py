@@ -33,7 +33,7 @@ def draw_coin(ax, x, y, coin, player_id, radius=0.16, fontsize=10, glyph=True):
     face = COIN_FACE_COLORS[coin]
     ax.add_patch(patches.Circle(
         (x, y), radius=radius, facecolor=face,
-        edgecolor=PLAYER_EDGE_COLORS[player_id], linewidth=2.2, zorder=3,
+        edgecolor=PLAYER_EDGE_COLORS[player_id], linewidth=1.2, zorder=3,
     ))
     if glyph:
         text = COIN_GLYPHS[coin]
@@ -44,12 +44,16 @@ def draw_coin(ax, x, y, coin, player_id, radius=0.16, fontsize=10, glyph=True):
 
 
 def draw_zone(ax, x, y, label, counter, player_id, radius=0.16,
-              stack_dx=0.055, stack_dy=0.055, col_gap=0.5):
+              stack_dx=0.055, stack_dy=0.055, col_gap=0.5, zone_width=None):
     """Draw a labeled zone: a caption, then one leaning pile per coin type.
 
     Coins of the same type are stacked into an overlapping pile (ordered S -> K ->
     R); only the top coin carries the glyph. An empty zone shows a faint
     placeholder so the layout stays stable across frames.
+
+    zone_width: if given, col_gap and stack_dx are scaled down so all coins fit
+    within [x, x + zone_width], keeping zone labels evenly spaced regardless of
+    how many coins a zone contains.
     """
     ax.text(x, y + 0.32, label, ha='left', va='center', fontsize=8,
             color='dimgray', fontweight='bold')
@@ -58,6 +62,18 @@ def draw_zone(ax, x, y, label, counter, player_id, radius=0.16,
         ax.text(x + radius, y, '·', ha='center', va='center',
                 fontsize=12, color='lightgray')
         return
+
+    if zone_width is not None:
+        # Natural spread = stacking offsets + gaps between type columns.
+        stack_spread = sum((counter[c] - 1) * stack_dx for c in types)
+        gap_spread = (len(types) - 1) * col_gap
+        natural = stack_spread + gap_spread
+        available = zone_width - 2 * radius
+        if natural > available > 0:
+            scale = available / natural
+            col_gap = col_gap * scale
+            stack_dx = stack_dx * scale
+
     cx = x + radius
     for c in types:
         n = counter[c]

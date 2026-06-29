@@ -80,6 +80,7 @@ class GameState:
     last_action_type: str = None
     last_coin: int = None
     last_coin_player: int = None
+    last_recruited_coin: int = None  # coin taken from supply (recruit only)
     is_terminated = False
     is_truncated = False
 

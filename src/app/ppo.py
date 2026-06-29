@@ -144,6 +144,9 @@ class PPOTrainer:
         # batch-temporary; written by _collect_batch, read by _log_batch
         self._batch_eps: list = []
         self._batch_start: float = 0.0
+        self._t_env: float = 0.0
+        self._t_model_play: float = 0.0
+        self._t_gradient: float = 0.0
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -153,7 +156,9 @@ class PPOTrainer:
         for batch_num in range(1, self._n_batches + 1):
             self._batch_start = time.time()
             self._collect_batch()
+            t0 = time.perf_counter()
             update_stats = self._run_ppo_update(batch_num)
+            self._t_gradient = time.perf_counter() - t0
             self._pool.maybe_snapshot(self._policy)
             self._maybe_eval(batch_num)
             self._log_batch(batch_num, update_stats)
@@ -166,6 +171,8 @@ class PPOTrainer:
         """Fill the buffer with collect_episodes episodes, then compute GAE."""
         self._buffer.clear()
         self._batch_eps = []
+        self._t_env = 0.0
+        self._t_model_play = 0.0
         self._policy.train()
         self._critic.train()
         for _ in range(self._collect_episodes):
@@ -178,7 +185,12 @@ class PPOTrainer:
 
     def _collect_episode(self, opp, main_pid, opp_type) -> dict:
         """Run one episode; append main-actor steps to the buffer."""
+        _pt = time.perf_counter
+
+        t0 = _pt()
         state, _ = self._env.reset()
+        self._t_env += _pt() - t0
+
         outcome = 'truncated'
         invalid_count = 0
         claims = 0
@@ -197,35 +209,52 @@ class PPOTrainer:
                 obs_before = copy_obs(state)
                 # Privileged critic input: the opponent's true hidden coin split,
                 # captured at the main player's decision point. Never seen by the policy.
+                t0 = _pt()
                 privileged = self._env.get_privileged_features()
+                self._t_env += _pt() - t0
                 privileged_t = torch.tensor(privileged, dtype=torch.float32).unsqueeze(0).to(self._device)
+
+                t0 = _pt()
                 action, log_prob, _ = self._policy.act(obs_before)
+                self._t_model_play += _pt() - t0
+
                 with torch.no_grad():
+                    t0 = _pt()
                     value_norm = self._critic.value_single(obs_before, opp_onehot_t, privileged_t)
+                    self._t_model_play += _pt() - t0
                     value = torch.tensor(
                         self._ret_normalizer.denormalize(value_norm.item()),
                         dtype=torch.float32,
                     ).to(self._device)
 
+                t0 = _pt()
                 my_bases = len(self._env.board.get_controlled_bases(main_pid))
                 opp_bases = len(self._env.board.get_controlled_bases(3 - main_pid))
+                self._t_env += _pt() - t0
                 base_diff = my_bases - opp_bases
                 phi_before = SHAPING_C * base_diff
                 holding_reward = self._holding_reward_rate * base_diff
                 env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
+
+                t0 = _pt()
                 state, reward, terminated, truncated, step_info = self._env.step(env_action)
+                self._t_env += _pt() - t0
 
                 if not step_info['action'].is_valid:
                     invalid_count += 1
                     logger.warning(f'turn={turn} main_pid={main_pid} invalid_action={action} env_action={env_action}')
+                    t0 = _pt()
                     state, reward, terminated, truncated, step_info = self._env.make_random_step()
+                    self._t_env += _pt() - t0
                     log_prob = torch.tensor(0.0).to(self._device)
                     value = torch.tensor(0.0).to(self._device)
 
+                t0 = _pt()
                 phi_after = SHAPING_C * (
                     len(self._env.board.get_controlled_bases(main_pid))
                     - len(self._env.board.get_controlled_bases(3 - main_pid))
                 )
+                self._t_env += _pt() - t0
                 shaped_reward = reward + self._gamma * phi_after - phi_before + holding_reward
                 main_score += shaped_reward
 
@@ -235,11 +264,17 @@ class PPOTrainer:
                 self._buffer.add_step(obs_before, action, log_prob, shaped_reward, value, opp_onehot, privileged)
             else:
                 with torch.no_grad():
+                    t0 = _pt()
                     action, _, _ = opp.act(state)
+                    self._t_model_play += _pt() - t0
                 env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
+                t0 = _pt()
                 state, _, terminated, truncated, step_info = self._env.step(env_action)
+                self._t_env += _pt() - t0
                 if not step_info['action'].is_valid:
+                    t0 = _pt()
                     state, _, terminated, truncated, step_info = self._env.make_random_step()
+                    self._t_env += _pt() - t0
 
             if terminated:
                 outcome = 'win' if acting_pid == main_pid else 'lose'
@@ -507,12 +542,20 @@ class PPOTrainer:
             f"{ep['outcome'][0]}({ep['opp_type'][0]})" for ep in self._batch_eps
         )
 
+        total_t = self._t_env + self._t_model_play + self._t_gradient
         logger.debug(
             f'batch={batch_num} n_actor={s["n_actor_updates"]} n_critic={s["n_critic_updates"]} '
             f'adv mean={self._buffer.raw_adv_mean:.4f} std={self._buffer.raw_adv_std:.4f} '
             f'ret mean={self._buffer.raw_ret_mean:.4f} std={self._buffer.raw_ret_std:.4f} '
             f'critic mean={s["avg_critic_mean"]:.4f} std={s["avg_critic_std"]:.4f} '
             f'clip_frac={s["avg_clip_frac"]:.3f} critic_mae={s["avg_critic_mae"]:.4f}'
+        )
+        logger.info(
+            f'batch={batch_num} timing: '
+            f'env={self._t_env:.2f}s ({100*self._t_env/total_t:.0f}%) '
+            f'model_play={self._t_model_play:.2f}s ({100*self._t_model_play/total_t:.0f}%) '
+            f'gradient={self._t_gradient:.2f}s ({100*self._t_gradient/total_t:.0f}%) '
+            f'total_accounted={total_t:.2f}s'
         )
         logger.info(
             f'batch={batch_num}/{self._n_batches} [{outcomes_str}] '
@@ -544,7 +587,7 @@ class PPOTrainer:
 
 
 if __name__ == '__main__':
-    use_wandb = True
+    use_wandb = False
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     run_id = time.strftime('%Y%m%d-%H%M%S')

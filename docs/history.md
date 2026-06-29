@@ -66,3 +66,20 @@ Consolidated record of all applied fixes and architectural changes. For the reas
 | **No policy/critic edits** | The factored head groups by verb (8), not by type, and reads sizes from env constants — Policy/Critic/RolloutBuffer adapted automatically. |
 | **Renderer + bots** | Coins use per-unit colours/glyphs (2-letter codes) from the roster; GreedyBot verb-offset constants updated; RandomBot unchanged (mask-driven). |
 | **Tests** | `tests/test_phase3.py` (23 total green): disjoint-draft, roster totals, encode/decode round-trips, per-type legality/planes, recruit accounting, and a coin-conservation invariant across full random games. Old `test_phase1*` retired (dead schema); `test_phase2` (factored head) still passes. |
+
+---
+
+## Phase 4 — Tactics, attributes & restrictions (full base game) (2026-06-28)
+
+*Source: `docs/full_game_plan.md` Phase 4. Implemented incrementally (Cavalry → SELECT/Archer →
+clusters 1–4) until all 16 units had their real abilities. Schema-breaking; prior models retired.*
+
+| What changed | Detail |
+|---|---|
+| **Pending sub-turn machine** | Multi-step tactics resolve as masked continuation clicks via `GameState.pending`; the turn does not pass until it clears. A pending-context one-hot (`PENDING_CTX_DIM`) in the globals tells the policy which continuation it is in. 14 pending kinds. |
+| **SELECT primitive** | A spatial verb (`SELECT_VERB`) whose `(r,q)` is an arbitrary *target/destination* cell (not a direction) — the piece the directional move/attack verbs can't express. Drives ranged attacks, move-to destinations, line charges, and friendly-unit grants. |
+| **All 16 units** | Mechanic-named tactics (`move_then_attack`, `move_to`, `line_charge`, `ranged_attack` any/line, `grant_attack`, `grant_move`, `maneuver_each`, `royal_move`) + boolean attribute flags (`counter_when_attacked`, `move_after_attack`, `extra_maneuvers_from_stack`, `bonus_action_after_attack_or_control`, `only_attackable_when_bolstered`, `deploy_adjacent_to_friendly`, `maneuver_after_recruit`, `absorb_from_supply`, Footman `max_on_board=2`). Named by mechanic so they reuse across the roster and DLC. |
+| **Shared resolution** | One `_resolve_attack` (with Pikeman counter + Royal-Guard absorb-from-supply) and `_fire_maneuver_triggers` hook feed every attack/maneuver path; a `_resolve_free_maneuver` powers granted/free/Footman maneuvers. |
+| **Schema** | `N_VERBS` 31→32 (`SELECT`), `N_FACTORED_VERBS` 10→11, `PENDING_CTX_DIM`→15, `GLOBAL_DIM`→189, `ACTION_SPACE_SIZE`→1875, `OBS_VERSION` 5→8. Policy/Critic/buffer/trainer unchanged (head reads sizes from constants). |
+| **Documented simplifications** | A bonus/repeat maneuver (WP drawn coin, Berserker repeat, Footman-tactic maneuver) can't use the TACTIC verb to start a *named* tactic — caps nesting, not the count of maneuvers. Granted attacks/moves (Marshall/Ensign) **do** chain the granted unit's attribute (FAQ). Royal Guard auto-absorbs from supply when able. |
+| **Tests** | Test suite reorganized from phase-named files into domain files (`test_units`, `test_tactics`, `test_attributes`, `test_game_mechanics`, `test_action_space`, `test_bots`, `test_policy` + shared `_helpers`); 63 total. A 400-game random-play stress exercises all pending kinds with zero crashes/softlocks/conservation violations. |

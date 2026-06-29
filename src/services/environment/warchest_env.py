@@ -57,6 +57,9 @@ DECLINE_ACTION = 'decline'    # end an optional pending continuation early
 #   verb 14..29: deploy unit type UNIT_IDS[verb-14] onto this cell
 #   verb 30:     tactic — the unit on this cell uses its tactic (Phase 4); the unit
 #                type determines which tactic, which then opens a pending sub-turn
+#   verb 31:     select — pick the board cell (r,q) as a non-directional target
+#                (ranged-attack target, friendly-grant recipient). Only ever legal
+#                as a pending continuation click; (r,q) is the TARGET, not a source.
 # Face-down actions (no board cell): appended after the spatial block, over the
 # full 17-coin universe (only the player's drafted coins are ever unmasked).
 #   +[0:C):           claim_initiative paying coin c
@@ -80,8 +83,9 @@ DEPLOY_VERB_BASE = 14
 # Deploy verb -> unit id (one verb per deployable unit type).
 DEPLOY_VERBS = {DEPLOY_VERB_BASE + i: t for i, t in enumerate(UNIT_IDS)}
 TACTIC_VERB = DEPLOY_VERB_BASE + NUM_UNIT_TYPES  # 30 — sits just past the deploy block
-N_VERBS = TACTIC_VERB + 1  # 31
-SPATIAL_SIZE = N_VERBS * BOARD_DIM * BOARD_DIM  # 1519
+SELECT_VERB = TACTIC_VERB + 1  # 31 — non-directional target selection (ranged, grants)
+N_VERBS = SELECT_VERB + 1  # 32
+SPATIAL_SIZE = N_VERBS * BOARD_DIM * BOARD_DIM  # 1568
 
 UNIT_CLASS_BY_COIN = UNIT_CLASS_BY_ID
 
@@ -95,7 +99,7 @@ RECRUIT_TYPES = UNIT_IDS  # 16 types
 _RECRUIT_BLOCK = 2 * N_COIN_TYPES  # claim (C) + pass (C) precede recruit
 _DECLINE_OFFSET = _RECRUIT_BLOCK + len(RECRUIT_TYPES) * N_COIN_TYPES  # past recruit
 FACEDOWN_SIZE = _DECLINE_OFFSET + 1  # 34 + 272 + 1 = 307
-ACTION_SPACE_SIZE = SPATIAL_SIZE + FACEDOWN_SIZE  # 1826
+ACTION_SPACE_SIZE = SPATIAL_SIZE + FACEDOWN_SIZE  # 1875
 DECLINE_ACTION_ID = SPATIAL_SIZE + _DECLINE_OFFSET
 
 # ---------------------------------------------------------------------------
@@ -107,8 +111,8 @@ DECLINE_ACTION_ID = SPATIAL_SIZE + _DECLINE_OFFSET
 # ids), disambiguated for the policy by the pending-context one-hot in globals.
 # ---------------------------------------------------------------------------
 (V_MOVE, V_ATTACK, V_CONTROL, V_DEPLOY, V_BOLSTER, V_CLAIM, V_PASS, V_RECRUIT,
- V_TACTIC, V_DECLINE) = range(10)
-N_FACTORED_VERBS = 10
+ V_TACTIC, V_DECLINE, V_SELECT) = range(11)
+N_FACTORED_VERBS = 11
 
 
 def verb_of_action(action_id: int) -> int:
@@ -124,6 +128,8 @@ def verb_of_action(action_id: int) -> int:
             return V_BOLSTER
         if sv == TACTIC_VERB:
             return V_TACTIC
+        if sv == SELECT_VERB:
+            return V_SELECT
         return V_DEPLOY  # 14..29
     off = action_id - SPATIAL_SIZE
     if off < N_COIN_TYPES:
@@ -165,11 +171,26 @@ OWNED_TOTAL = UNITS_PER_PLAYER * MAX_TOTAL + 1  # 21
 # one slot per kind in PENDING_KINDS. This is what lets the policy read an otherwise
 # ambiguous move/attack click as "a Cavalry follow-up" vs "a normal maneuver". Adding
 # a kind extends this vector → bump OBS_VERSION (a schema change), as for any phase.
-PENDING_KINDS = ('cavalry_move', 'cavalry_attack')
-PENDING_CTX_DIM = 1 + len(PENDING_KINDS)  # 3
+PENDING_KINDS = (
+    'move_then_attack:move',   # Cavalry: the move stage
+    'move_then_attack:attack',  # Cavalry: the (optional) attack stage
+    'ranged_attack',            # Archer/Crossbowman: SELECT a ranged target
+    'bonus_move',               # Swordsman: an optional free move after attacking
+    'extra_maneuver',           # Berserker: pay a stack coin to maneuver again
+    'bonus_action',             # Warrior Priest: spend a freshly drawn coin at once
+    'move_to',                  # Light Cavalry / Royal Guard: SELECT a destination ≤N away
+    'line_charge',              # Lancer: SELECT an in-line enemy, then move+attack
+    'grant_attack:select',      # Marshall: SELECT a friendly unit within range
+    'grant_attack:strike',      # Marshall: the chosen unit makes a normal attack
+    'grant_move:select',        # Ensign: SELECT a friendly unit within range
+    'grant_move:step',          # Ensign: the chosen unit makes a normal move
+    'free_maneuver',            # Mercenary: a free maneuver after its coin is recruited
+    'footman_maneuver',         # Footman: one maneuver with each Footman on the board
+)
+PENDING_CTX_DIM = 1 + len(PENDING_KINDS)  # 15
 PENDING_KIND_IDX = {k: i for i, k in enumerate(PENDING_KINDS)}
-GLOBAL_DIM = 7 * N_COIN_TYPES + 3 * NUM_UNIT_TYPES + 7 + PENDING_CTX_DIM  # 177
-OBS_VERSION = 5
+GLOBAL_DIM = 7 * N_COIN_TYPES + 3 * NUM_UNIT_TYPES + 7 + PENDING_CTX_DIM  # 189
+OBS_VERSION = 8
 
 # Privileged critic-only features: the opponent's true hidden split, per coin (C).
 #   [0:C] opp hand   [C:2C] opp bag   [2C:3C] opp face-down discard
@@ -420,10 +441,16 @@ class WarChestEnv(gym.Env):
         # acting and the action is a continuation click, dispatched separately from
         # the normal verb table; the turn only passes once `pending` clears.
         if self.state.pending is not None:
+            # Capture the acting unit before it might move/die during the continuation,
+            # so we can record the correct coin in last_coin for the history display.
+            _cont_unit = self.board.get_unit_at(*self.state.pending.unit_loc)
+            _cont_kind = self.state.pending.kind
             action = self._perform_continuation(action_id)
             action.type = TACTIC_ACTION
             action_args = None
         else:
+            _cont_unit = None
+            _cont_kind = None
             action_type, action_args = self.get_action_info(action_id)
             action = self.action_dict[action_type]['act_function'](*action_args)
             action.type = action_type
@@ -434,6 +461,11 @@ class WarChestEnv(gym.Env):
         if action.is_valid:
             self.action_count += 1
             self.state.last_action_type = action.type
+            # For non-bonus continuations, overwrite last_coin with the acting unit so
+            # the history shows "tactic Me" instead of whatever coin was played earlier.
+            if _cont_unit is not None and _cont_kind != 'bonus_action':
+                self.state.last_coin = _cont_unit.id
+                self.state.last_coin_player = self.active_player
             if not action.finishes_game and self.state.pending is None:
                 self._advance_turn()
             if self.history is not None:
@@ -449,7 +481,7 @@ class WarChestEnv(gym.Env):
             print(f'Got action_id {action.id} type={action.type} args={action.additional_info}')
         return self.generate_observation(), action.reward, action.finishes_game, truncated, {'action': action}
 
-    def render(self, ax=None):
+    def render(self, ax=None, player_labels=None):
         created_ax = False
         if ax is None:
             fig, ax = plt.subplots(figsize=(9, 11))
@@ -500,7 +532,10 @@ class WarChestEnv(gym.Env):
 
         def draw_band(pid, row_y):
             star = ' ★' if self.state.initiative_owner == pid else ''
-            ax.text(block_left, row_y + 0.62, f'Player {pid}{star}', ha='left',
+            label = player_labels.get(pid, '') if player_labels else ''
+            label_str = f'  [{label}]' if label else ''
+            ax.text(block_left, row_y + 0.62,
+                    f'Player {pid}{star}{label_str}', ha='left',
                     va='center', fontsize=12, fontweight='bold', color=UNIT_COLORS[pid])
             counters = (
                 self.state.hands[pid], self.state.bags[pid], self.state.supply[pid],
@@ -508,7 +543,8 @@ class WarChestEnv(gym.Env):
                 self.state.boxed[pid],
             )
             for k, (label, counter) in enumerate(zip(zone_names, counters)):
-                draw_zone(ax, block_left + k * col_w, row_y, label, counter, pid)
+                draw_zone(ax, block_left + k * col_w, row_y, label, counter, pid,
+                          zone_width=col_w)
 
         draw_band(2, y_max + 1.0)
         draw_band(1, y_min - 1.0)
@@ -550,10 +586,10 @@ class WarChestEnv(gym.Env):
             f'{pending}'
         )
 
-    def render_game(self):
+    def render_game(self, player_labels=None):
         if self.history is None:
             raise ValueError('Game history not available. Set save_game_history=True.')
-        GameRenderer(env=self, history=self.history).draw()
+        GameRenderer(env=self, history=self.history, player_labels=player_labels)
 
     @staticmethod
     def convert_hex_grid_to_cartesian(row, column, hex_radius=0.5):
@@ -717,50 +753,52 @@ class WarChestEnv(gym.Env):
 
     def get_possible_actions(self):
         """Return valid action IDs in absolute (non-rotated) frame."""
-        active = self.active_player
         # Mid-tactic: only the legal continuation clicks for the owed sub-turn.
         if self.state.pending is not None:
             return self._continuation_actions()
+        return self._normal_actions()
 
+    def _normal_actions(self):
+        """Legal action IDs for a normal (non-pending) turn, given the current hand."""
+        active = self.active_player
         hand = self.state.hands[active]
         ids = []
 
         units = self.get_active_player_units()
         on_board_types = {u.id for u in units}
 
-        # Maneuvers: gated by holding a coin matching the unit's type.
+        # Maneuvers: move/attack/control/bolster are gated by holding the unit's coin;
+        # a tactic is gated separately because it may be paid by another coin (e.g. the
+        # Royal Guard pays with the Royal coin).
         for u in units:
-            if u.id not in hand:
-                continue
             r, q = u.loc
-            for d, (dr, dq) in enumerate(self.board.offsets):
-                target = (r + dr, q + dq)
-                if target in self.board.get_free_adjacent_cells(r, q):
-                    ids.append(self.encode_action(d, r, q))
-            for d, (dr, dq) in enumerate(self.board.offsets):
-                target = (r + dr, q + dq)
-                enemy = self.board.get_unit_at(*target)
-                if enemy is not None and enemy.player_id != active:
-                    ids.append(self.encode_action(6 + d, r, q))
-            if self.board.is_valid_claim(active, (r, q)):
-                ids.append(self.encode_action(12, r, q))
-            # Bolster: add a matching coin onto this unit's stack (any number of times).
-            ids.append(self.encode_action(BOLSTER_VERB, r, q))
-            # Tactic: the unit's coin pays for the whole tactic; once initiated the
-            # follow-up clicks are gated by `pending`, not enumerated here.
+            if u.id in hand:
+                for d, (dr, dq) in enumerate(self.board.offsets):
+                    target = (r + dr, q + dq)
+                    if target in self.board.get_free_adjacent_cells(r, q):
+                        ids.append(self.encode_action(d, r, q))
+                if UNIT_BY_ID[u.id].can_normal_attack:
+                    for d, (dr, dq) in enumerate(self.board.offsets):
+                        enemy = self.board.get_unit_at(r + dr, q + dq)
+                        if self._can_attack(u, enemy):
+                            ids.append(self.encode_action(6 + d, r, q))
+                if self.board.is_valid_claim(active, (r, q)):
+                    ids.append(self.encode_action(12, r, q))
+                # Bolster: add a matching coin onto this unit's stack (any number of times).
+                ids.append(self.encode_action(BOLSTER_VERB, r, q))
+            # Tactic: once initiated the follow-up clicks are gated by `pending`.
             if self._tactic_startable(u):
                 ids.append(self.encode_action(TACTIC_VERB, r, q))
 
-        # Deploy: a coin in hand whose unit type is not already on the board, onto
-        # any controlled empty location. (One unit of each type at a time.)
-        controlled_empty = [
-            loc for loc in self.board.get_controlled_bases(active)
-            if self.board.get_unit_at(*loc) is None
-        ]
+        # Deploy: a coin in hand whose type has room on the board (one per type, except
+        # Footman allows two), onto a legal cell (a controlled empty base; the Scout may
+        # also deploy onto any empty cell adjacent to a friendly unit).
+        type_counts = Counter(u.id for u in units)
         for verb, coin in DEPLOY_VERBS.items():
-            if coin in hand and coin not in on_board_types and controlled_empty:
-                for loc in controlled_empty:
-                    ids.append(self.encode_action(verb, *loc))
+            if coin not in hand or type_counts[coin] >= UNIT_BY_ID[coin].max_on_board:
+                continue
+            for loc in self._deploy_targets(coin):
+                ids.append(self.encode_action(verb, *loc))
 
         # Face-down actions: any coin in hand may pass; claim_initiative needs the
         # marker held by the opponent and untransferred this round.
@@ -838,6 +876,7 @@ class WarChestEnv(gym.Env):
         moving_unit.move(loc=end)
         self.exploration_map_dict[self.active_player][end] += 1
         self._play_coin(moving_unit.id, 'faceup')
+        self._fire_maneuver_triggers(moving_unit, 'move')
         return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
                       txt_result='Move successful', is_valid=True)
 
@@ -857,18 +896,20 @@ class WarChestEnv(gym.Env):
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                           txt_result='No matching coin in hand', is_valid=False)
 
-        enemy = self.board.get_unit_at(*target)
-        if enemy is None or enemy.player_id == self.active_player:
+        if not UNIT_BY_ID[attacker.id].can_normal_attack:
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
-                          txt_result='No enemy unit at target cell', is_valid=False)
+                          txt_result='Unit cannot make a normal attack', is_valid=False)
 
-        # Remove one coin from the target's stack; it leaves the game (to the box),
-        # not the discard. The unit is destroyed only when its last coin is removed.
-        enemy.stack -= 1
-        self.state.boxed[enemy.player_id][enemy.id] += 1
-        if enemy.stack <= 0:
-            self.board.remove_unit(enemy)
+        enemy = self.board.get_unit_at(*target)
+        if not self._can_attack(attacker, enemy):
+            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                          txt_result='No legal enemy at target cell', is_valid=False)
+
+        # Remove one coin from the target's stack (to the box, not the discard), apply
+        # any defender's counter, then fire the attacker's post-attack attribute.
+        self._resolve_attack(attacker, enemy)
         self._play_coin(attacker.id, 'faceup')
+        self._fire_maneuver_triggers(attacker, 'attack')
         return Action(reward=ATTACK_REWARD, finishes_game=False,
                       txt_result='Attack successful', is_valid=True)
 
@@ -886,10 +927,26 @@ class WarChestEnv(gym.Env):
         self.board.change_base_control(player_id=self.active_player, base_loc=base_loc)
         self._play_coin(unit.id, 'faceup')
         if len(self.board.get_controlled_bases(self.active_player)) < self.winning_base_count:
+            self._fire_maneuver_triggers(unit, 'control')
             return Action(reward=CLAIM_BASE_REWARD, finishes_game=False, is_valid=True,
                           txt_result='Claimed base')
         return Action(reward=WIN_REWARD, finishes_game=True, is_valid=True,
                       txt_result=f'Player {self.active_player} won')
+
+    def _deploy_targets(self, coin: int):
+        """Empty cells where `coin` may be deployed: controlled empty bases, plus — for
+        the Scout — any empty cell adjacent to a friendly unit."""
+        active = self.active_player
+        targets = [loc for loc in self.board.get_controlled_bases(active)
+                   if self.board.get_unit_at(*loc) is None]
+        if UNIT_BY_ID[coin].deploy_adjacent_to_friendly:
+            seen = set(targets)
+            for u in self.get_active_player_units():
+                for cell in self.board.get_free_adjacent_cells(*u.loc):
+                    if cell not in seen:
+                        seen.add(cell)
+                        targets.append(cell)
+        return targets
 
     def perform_deploy_action(self, coin: int, r: int, q: int) -> Action:
         active = self.active_player
@@ -898,20 +955,17 @@ class WarChestEnv(gym.Env):
         if coin not in self.state.hands[active]:
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                           txt_result='No matching coin in hand', is_valid=False)
-        if any(u.id == coin for u in self.get_active_player_units()):
+        on_board = sum(1 for u in self.get_active_player_units() if u.id == coin)
+        if on_board >= UNIT_BY_ID[coin].max_on_board:
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
-                          txt_result='Unit of this type already on board', is_valid=False)
-        if self.board.get_unit_at(*target) is not None:
+                          txt_result='No room on board for another of this type', is_valid=False)
+        if target not in self._deploy_targets(coin):
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
-                          txt_result='Target cell occupied', is_valid=False)
+                          txt_result='Not a legal deploy cell', is_valid=False)
 
-        try:
-            new_unit = UNIT_CLASS_BY_COIN[coin](player_id=active, board=self.board)
-            self.board.deploy_unit(unit=new_unit, place=target)
-        except Exception as e:
-            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
-                          txt_result=f'Deploy failed: {e}', is_valid=False)
-
+        new_unit = UNIT_CLASS_BY_COIN[coin](player_id=active, board=self.board)
+        new_unit.place_on_board(target)
+        self.board.units.append(new_unit)
         self._play_coin(coin, 'board')  # the coin becomes the deployed unit
         return Action(reward=0.0, finishes_game=False, is_valid=True,
                       txt_result='Unit deployed')
@@ -963,13 +1017,170 @@ class WarChestEnv(gym.Env):
                           txt_result='No supply coin of that type', is_valid=False)
 
         self._play_coin(pay, 'facedown')  # the payment is discarded face-down
+        self.state.last_recruited_coin = take
         # The recruited coin is shown to the opponent and enters the discard face-up.
         self.state.supply[active][take] -= 1
         if self.state.supply[active][take] == 0:
             del self.state.supply[active][take]
         self.state.discard_faceup[active][take] += 1
+        # Mercenary attribute: recruiting its coin grants the on-board Mercenary a free maneuver.
+        if UNIT_BY_ID[take].maneuver_after_recruit and self.state.pending is None:
+            merc = next((u for u in self.get_active_player_units() if u.id == take), None)
+            if merc is not None and self._can_free_maneuver(merc):
+                self.state.pending = Pending('free_maneuver', unit_loc=merc.loc, optional=True)
         return Action(reward=0.0, finishes_game=False, is_valid=True,
                       txt_result='Recruited')
+
+    def _can_free_maneuver(self, unit) -> bool:
+        """Whether `unit` has any legal no-coin maneuver (move / attack / control)."""
+        r, q = unit.loc
+        if self.board.get_free_adjacent_cells(r, q):
+            return True
+        if UNIT_BY_ID[unit.id].can_normal_attack and any(
+                self._can_attack(unit, self.board.get_unit_at(*adj))
+                for adj in self.board.get_adjacent_cells(r, q)):
+            return True
+        return self.board.is_valid_claim(self.active_player, (r, q))
+
+    # ------------------------------------------------------------------
+    # Combat resolution + triggered attributes (Phase 4)
+    # ------------------------------------------------------------------
+
+    def _can_attack(self, attacker, target) -> bool:
+        """Whether `attacker` may legally damage `target` (Knight bolster restriction).
+
+        A Knight 'can only be attacked by units that are bolstered' — the attacker's
+        stack must be > 1. Applies to every attack path (normal, tactic, granted).
+        """
+        if target is None or target.player_id == attacker.player_id:
+            return False
+        if UNIT_BY_ID[target.id].only_attackable_when_bolstered and attacker.stack <= 1:
+            return False
+        return True
+
+    def _damage_unit(self, unit):
+        """Remove one coin from a unit's stack to the box; remove the unit if it dies."""
+        unit.stack -= 1
+        self.state.boxed[unit.player_id][unit.id] += 1
+        if unit.stack <= 0:
+            self.board.remove_unit(unit)
+
+    def _apply_hit(self, target):
+        """Apply one attack hit to `target`, honoring the Royal Guard's absorb-from-supply
+        option (auto-used when a supply coin of its type is available — strictly defensive)."""
+        info = UNIT_BY_ID[target.id]
+        supply = self.state.supply[target.player_id]
+        if info.absorb_from_supply and supply[target.id] > 0:
+            supply[target.id] -= 1
+            if supply[target.id] == 0:
+                del supply[target.id]
+            self.state.boxed[target.player_id][target.id] += 1  # the coin came from supply
+            return
+        self._damage_unit(target)
+
+    def _resolve_attack(self, attacker, target):
+        """Apply one hit to `target`, plus a Pikeman counter on an adjacent attacker.
+
+        Pikeman's attribute ('when attacked by an adjacent unit, remove a coin from
+        that unit') is simultaneous and not itself an attack, so it can even kill an
+        attacking Knight (and is not absorbable). Ranged attacks (attacker not adjacent)
+        do not trigger it. Used by every attack path (normal, tactic, granted, bonus).
+        """
+        adjacent = attacker.loc in self.board.get_adjacent_cells(*target.loc)
+        self._apply_hit(target)
+        if (UNIT_BY_ID[target.id].counter_when_attacked
+                and adjacent and attacker in self.board.units):
+            self._damage_unit(attacker)
+
+    def _draw_bonus_coin(self):
+        """Draw one coin from the active player's bag (reshuffling if needed); None if empty."""
+        active = self.active_player
+        if not self.state.bags[active]:
+            self._reshuffle(active)
+            if not self.state.bags[active]:
+                return None
+        return self._draw_one(active)
+
+    def _fire_maneuver_triggers(self, unit, kind: str):
+        """After a PRIMARY maneuver by `unit`, open any owed triggered-attribute sub-turn.
+
+        No-op while a pending sub-turn is already active (triggers never nest) or if the
+        unit died during resolution (e.g. to a Pikeman counter). `kind` is one of
+        'move' / 'attack' / 'control'.
+        """
+        if self.state.pending is not None:
+            return
+        if unit not in self.board.units:
+            return
+        attrs = UNIT_BY_ID[unit.id]
+        if attrs.extra_maneuvers_from_stack and unit.stack >= 2:
+            # Berserker: spend a stack coin to maneuver again, repeatable down to 1 coin.
+            self.state.pending = Pending('extra_maneuver', unit_loc=unit.loc, optional=True)
+        elif attrs.move_after_attack and kind == 'attack' \
+                and self.board.get_free_adjacent_cells(*unit.loc):
+            # Swordsman: an optional free move after attacking.
+            self.state.pending = Pending('bonus_move', unit_loc=unit.loc, optional=True)
+        elif attrs.bonus_action_after_attack_or_control and kind in ('attack', 'control'):
+            # Warrior Priest: draw a coin and immediately use it for one action.
+            coin = self._draw_bonus_coin()
+            if coin is not None:
+                self.state.hands[self.active_player][coin] += 1
+                self.state.pending = Pending('bonus_action', unit_loc=unit.loc,
+                                             optional=False, data={'coin': int(coin)})
+
+    def _bonus_actions(self, coin: int):
+        """Legal actions for a Warrior-Priest bonus turn: spend exactly the drawn coin
+        on one normal action. Tactic-initiation is excluded so the bonus cannot nest a
+        second pending sub-turn (a documented simplification of 'use it for any action').
+        """
+        active = self.active_player
+        saved = self.state.hands[active]
+        self.state.hands[active] = Counter({coin: saved[coin]})
+        try:
+            ids = [a for a in self._normal_actions() if VERB_OF_ACTION[a] != V_TACTIC]
+        finally:
+            self.state.hands[active] = saved
+        return ids
+
+    def _resolve_free_maneuver(self, loc, verb: int):
+        """Resolve a no-coin move / attack / control by the unit at `loc` (used by
+        granted, free, and Footman-tactic maneuvers). Returns (action, new_loc); an
+        invalid action leaves the board untouched. Does not touch `pending`.
+        """
+        active = self.active_player
+        r, q = loc
+        unit = self.board.get_unit_at(r, q)
+        invalid = Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                         txt_result='Illegal maneuver', is_valid=False)
+        if unit is None:
+            return invalid, loc
+        if 0 <= verb <= 5:
+            offset = self.board.offsets[verb]
+            end = (r + offset[0], q + offset[1])
+            if end not in self.board.get_free_adjacent_cells(r, q):
+                return invalid, loc
+            unit.move(loc=end)
+            self.exploration_map_dict[active][end] += 1
+            return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
+                          txt_result='Maneuver: move', is_valid=True), end
+        if 6 <= verb <= 11:
+            offset = self.board.offsets[verb - 6]
+            enemy = self.board.get_unit_at(r + offset[0], q + offset[1])
+            if not self._can_attack(unit, enemy):
+                return invalid, loc
+            self._resolve_attack(unit, enemy)
+            return Action(reward=ATTACK_REWARD, finishes_game=False,
+                          txt_result='Maneuver: attack', is_valid=True), (r, q)
+        if verb == CONTROL_VERB:
+            if not self.board.is_valid_claim(active, (r, q)):
+                return invalid, loc
+            self.board.change_base_control(player_id=active, base_loc=(r, q))
+            if len(self.board.get_controlled_bases(active)) >= self.winning_base_count:
+                return Action(reward=WIN_REWARD, finishes_game=True, is_valid=True,
+                              txt_result=f'Player {active} won'), (r, q)
+            return Action(reward=CLAIM_BASE_REWARD, finishes_game=False, is_valid=True,
+                          txt_result='Maneuver: control'), (r, q)
+        return invalid, loc
 
     # ------------------------------------------------------------------
     # Tactics (Phase 4): a tactic initiates here, then resolves over one or
@@ -978,13 +1189,28 @@ class WarChestEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _tactic_startable(self, unit) -> bool:
-        """Can this unit begin its tactic right now? (Coin-in-hand checked by caller.)"""
-        tac = UNIT_BY_ID[unit.id].tactic
-        if tac is None:
+        """Can this unit begin its tactic right now (pay coin in hand + a legal target)?"""
+        info = UNIT_BY_ID[unit.id]
+        tac = info.tactic
+        if tac is None or self._tactic_pay_coin(unit) not in self.state.hands[self.active_player]:
             return False
-        if tac == 'cavalry':
-            # "Move and then attack" — needs at least one cell to move into.
-            return bool(self.board.get_free_adjacent_cells(*unit.loc))
+        params = info.tactic_params or {}
+        loc = unit.loc
+        if tac == 'move_then_attack':
+            return bool(self.board.get_free_adjacent_cells(*loc))
+        if tac == 'ranged_attack':
+            return bool(self._ranged_targets(loc, **params))
+        if tac in ('move_to', 'royal_move'):
+            return bool(self._move_to_targets(loc, params.get('max_dist', 2),
+                                              controlled=(tac == 'royal_move')))
+        if tac == 'line_charge':
+            return bool(self._line_charge_targets(loc, params.get('max_dist', 2)))
+        if tac == 'grant_attack':
+            return bool(self._grant_attack_targets(loc, params.get('range', 2)))
+        if tac == 'grant_move':
+            return bool(self._grant_move_targets(loc, params.get('range', 2)))
+        if tac == 'maneuver_each':
+            return bool(self._footman_queue(unit))
         return False
 
     def perform_tactic_action(self, r: int, q: int) -> Action:
@@ -993,23 +1219,189 @@ class WarChestEnv(gym.Env):
         if unit is None or unit.player_id != active:
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                           txt_result='No own unit to use a tactic', is_valid=False)
-        tac = UNIT_BY_ID[unit.id].tactic
-        if tac is None or unit.id not in self.state.hands[active]:
+        info = UNIT_BY_ID[unit.id]
+        tac = info.tactic
+        if tac is None or not self._tactic_startable(unit):
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
-                          txt_result='No matching coin or unit has no tactic', is_valid=False)
+                          txt_result='Tactic not available', is_valid=False)
 
-        if tac == 'cavalry':
-            if not self.board.get_free_adjacent_cells(r, q):
-                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
-                              txt_result='Cavalry has nowhere to move', is_valid=False)
-            # The coin pays for the whole move-then-attack; discard it face-up now.
-            self._play_coin(unit.id, 'faceup')
-            self.state.pending = Pending('cavalry_move', unit_loc=(r, q), optional=False)
-            return Action(reward=0.0, finishes_game=False, is_valid=True,
-                          txt_result='Cavalry tactic: choose a move')
+        params = info.tactic_params or {}
+        # The pay coin (the unit's, or the Royal coin for the Royal Guard) is spent
+        # face-up now; the tactic then resolves over its pending sub-turn clicks.
+        self._play_coin(self._tactic_pay_coin(unit), 'faceup')
 
-        return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
-                      txt_result=f'Unknown tactic {tac!r}', is_valid=False)
+        if tac == 'move_then_attack':
+            self.state.pending = Pending('move_then_attack:move', unit_loc=(r, q), optional=False)
+        elif tac == 'ranged_attack':
+            self.state.pending = Pending('ranged_attack', unit_loc=(r, q), optional=False,
+                                         data=dict(params))
+        elif tac in ('move_to', 'royal_move'):
+            self.state.pending = Pending('move_to', unit_loc=(r, q), optional=False,
+                                         data={'max_dist': params.get('max_dist', 2),
+                                               'controlled': tac == 'royal_move'})
+        elif tac == 'line_charge':
+            self.state.pending = Pending('line_charge', unit_loc=(r, q), optional=False,
+                                         data={'max_dist': params.get('max_dist', 2)})
+        elif tac == 'grant_attack':
+            self.state.pending = Pending('grant_attack:select', unit_loc=(r, q), optional=False,
+                                         data={'origin': (r, q), 'range': params.get('range', 2)})
+        elif tac == 'grant_move':
+            self.state.pending = Pending('grant_move:select', unit_loc=(r, q), optional=False,
+                                         data={'origin': (r, q), 'range': params.get('range', 2)})
+        elif tac == 'maneuver_each':
+            queue = self._footman_queue(unit)
+            self.state.pending = Pending('footman_maneuver', unit_loc=queue[0], optional=True,
+                                         data={'queue': queue})
+        return Action(reward=0.0, finishes_game=False, is_valid=True,
+                      txt_result=f'Tactic {tac} initiated')
+
+    def _hex_distances(self, start: Tuple[int, int], max_dist: int) -> Dict[Tuple[int, int], int]:
+        """BFS hex distance from `start` over valid cells (occupancy ignored).
+
+        On the gap-free hexagon board, graph distance equals hex distance, so this
+        gives the 'N spaces away' count the rulebook uses for ranged tactics.
+        """
+        dist = {start: 0}
+        frontier = [start]
+        for d in range(1, max_dist + 1):
+            nxt = []
+            for cell in frontier:
+                for adj in self.board.get_adjacent_cells(*cell):
+                    if adj not in dist:
+                        dist[adj] = d
+                        nxt.append(adj)
+            frontier = nxt
+        return dist
+
+    def _ranged_targets(self, loc: Tuple[int, int], distance: int = 2, straight_line: bool = False):
+        """Enemy-occupied cells a ranged_attack tactic from `loc` may legally select.
+
+        distance:       how many spaces away the target sits.
+        straight_line:  if True the target must be exactly `distance` along one of
+                        the 6 hex directions with every intervening cell empty
+                        (Crossbowman); if False any enemy at hex-distance `distance`
+                        is eligible (Archer). The SELECT mask is built from this, so
+                        each ranged unit supplies its own targeting rule via
+                        tactic_params while reusing the one SELECT primitive.
+        """
+        attacker = self.board.get_unit_at(*loc)
+        targets = []
+        if straight_line:
+            r, q = loc
+            for dr, dq in self.board.offsets:
+                blocked = any(
+                    self.board.get_unit_at(r + dr * step, q + dq * step) is not None
+                    for step in range(1, distance)
+                )
+                if blocked:
+                    continue
+                far = (r + dr * distance, q + dq * distance)
+                if self._can_attack(attacker, self.board.get_unit_at(*far)):
+                    targets.append(far)
+        else:
+            for cell, d in self._hex_distances(loc, distance).items():
+                if d == distance and self._can_attack(attacker, self.board.get_unit_at(*cell)):
+                    targets.append(cell)
+        return targets
+
+    # --- targeting helpers for the remaining tactics ---
+
+    def _is_empty_cell(self, cell) -> bool:
+        r, q = cell
+        return (0 <= r < BOARD_DIM and 0 <= q < BOARD_DIM
+                and self.board.board[r, q] != INVALID_CELL_ID
+                and self.board.get_unit_at(r, q) is None)
+
+    def _reachable(self, start, max_dist):
+        """Cells reachable from `start` by moving up to `max_dist` steps through empty
+        cells (BFS over free neighbours); returns {cell: distance}, distance >= 1."""
+        dist = {start: 0}
+        frontier = [start]
+        for d in range(1, max_dist + 1):
+            nxt = []
+            for cell in frontier:
+                for adj in self.board.get_free_adjacent_cells(*cell):
+                    if adj not in dist:
+                        dist[adj] = d
+                        nxt.append(adj)
+            frontier = nxt
+        return {c: d for c, d in dist.items() if d >= 1}
+
+    def _move_to_targets(self, loc, max_dist, controlled):
+        """Empty destinations for a move-to tactic; if `controlled`, restricted to the
+        active player's own control locations (Royal Guard)."""
+        cells = list(self._reachable(loc, max_dist))
+        if controlled:
+            own = set(self.board.get_controlled_bases(self.active_player))
+            cells = [c for c in cells if c in own]
+        return cells
+
+    def _line_charge_targets(self, loc, max_dist):
+        """Lancer: {enemy_cell: move_destination}. Move 1..max_dist in a straight hex
+        line through empty cells, then attack the enemy immediately beyond."""
+        attacker = self.board.get_unit_at(*loc)
+        out = {}
+        for dr, dq in self.board.offsets:
+            for k in range(1, max_dist + 1):
+                path = [(loc[0] + dr * s, loc[1] + dq * s) for s in range(1, k + 1)]
+                if not all(self._is_empty_cell(c) for c in path):
+                    break  # blocked; no farther charge in this direction
+                enemy_cell = (loc[0] + dr * (k + 1), loc[1] + dq * (k + 1))
+                if self._can_attack(attacker, self.board.get_unit_at(*enemy_cell)):
+                    out[enemy_cell] = path[-1]  # end adjacent to the enemy, then strike
+        return out
+
+    def _grant_attack_targets(self, origin, rng):
+        """Friendly units within `rng` that could make a normal attack (Marshall)."""
+        active = self.active_player
+        out = []
+        for cell, d in self._hex_distances(origin, rng).items():
+            if d == 0:
+                continue
+            u = self.board.get_unit_at(*cell)
+            if u is None or u.player_id != active or not UNIT_BY_ID[u.id].can_normal_attack:
+                continue
+            if any(self._can_attack(u, self.board.get_unit_at(*adj))
+                   for adj in self.board.get_adjacent_cells(*cell)):
+                out.append(cell)
+        return out
+
+    def _grant_move_targets(self, origin, rng):
+        """Friendly units within `rng` with a free move to a cell also within `rng` (Ensign)."""
+        active = self.active_player
+        dists = self._hex_distances(origin, rng)
+        out = []
+        for cell, d in dists.items():
+            if d == 0:
+                continue
+            u = self.board.get_unit_at(*cell)
+            if u is None or u.player_id != active:
+                continue
+            if any(adj in dists for adj in self.board.get_free_adjacent_cells(*cell)):
+                out.append(cell)
+        return out
+
+    def _footman_queue(self, unit):
+        """Locations of friendly units sharing `unit`'s type that have a legal maneuver."""
+        active = self.active_player
+        out = []
+        for u in self.get_active_player_units():
+            if u.id != unit.id:
+                continue
+            r, q = u.loc
+            can_move = bool(self.board.get_free_adjacent_cells(r, q))
+            can_attack = UNIT_BY_ID[u.id].can_normal_attack and any(
+                self._can_attack(u, self.board.get_unit_at(*adj))
+                for adj in self.board.get_adjacent_cells(r, q))
+            can_control = self.board.is_valid_claim(active, (r, q))
+            if can_move or can_attack or can_control:
+                out.append((r, q))
+        return out
+
+    def _tactic_pay_coin(self, unit) -> int:
+        """Coin spent to use `unit`'s tactic — normally its own, but the Royal coin
+        for the Royal Guard (whose tactic is the Royal coin's only face-up use)."""
+        return ROYAL_ID if UNIT_BY_ID[unit.id].tactic == 'royal_move' else unit.id
 
     def _continuation_actions(self):
         """Legal continuation ids for the current pending sub-turn (absolute frame)."""
@@ -1018,15 +1410,88 @@ class WarChestEnv(gym.Env):
         r, q = p.unit_loc
         ids = []
 
-        if p.kind == 'cavalry_move':
+        if p.kind == 'move_then_attack:move':
             for d, (dr, dq) in enumerate(self.board.offsets):
                 if (r + dr, q + dq) in self.board.get_free_adjacent_cells(r, q):
                     ids.append(self.encode_action(d, r, q))  # reuse move verbs 0-5
-        elif p.kind == 'cavalry_attack':
+        elif p.kind == 'move_then_attack:attack':
+            mover = self.board.get_unit_at(r, q)
             for d, (dr, dq) in enumerate(self.board.offsets):
                 enemy = self.board.get_unit_at(r + dr, q + dq)
-                if enemy is not None and enemy.player_id != active:
+                if self._can_attack(mover, enemy):
                     ids.append(self.encode_action(6 + d, r, q))  # reuse attack verbs 6-11
+        elif p.kind == 'ranged_attack':
+            # SELECT each legal ranged target; (tr,tq) is the TARGET cell, not the source.
+            for tr, tq in self._ranged_targets((r, q), **p.data):
+                ids.append(self.encode_action(SELECT_VERB, tr, tq))
+        elif p.kind == 'bonus_move':
+            # Swordsman's free post-attack move: a single move from its cell.
+            for d, (dr, dq) in enumerate(self.board.offsets):
+                if (r + dr, q + dq) in self.board.get_free_adjacent_cells(r, q):
+                    ids.append(self.encode_action(d, r, q))
+        elif p.kind == 'extra_maneuver':
+            # Berserker repeat: move / attack / control from its cell (each paid by a coin).
+            mover = self.board.get_unit_at(r, q)
+            for d, (dr, dq) in enumerate(self.board.offsets):
+                if (r + dr, q + dq) in self.board.get_free_adjacent_cells(r, q):
+                    ids.append(self.encode_action(d, r, q))
+                if self._can_attack(mover, self.board.get_unit_at(r + dr, q + dq)):
+                    ids.append(self.encode_action(6 + d, r, q))
+            if self.board.is_valid_claim(active, (r, q)):
+                ids.append(self.encode_action(CONTROL_VERB, r, q))
+        elif p.kind == 'bonus_action':
+            ids.extend(self._bonus_actions(p.data['coin']))
+        elif p.kind == 'move_to':
+            # Light Cavalry / Royal Guard: SELECT a reachable destination cell.
+            for tr, tq in self._move_to_targets((r, q), p.data['max_dist'], p.data['controlled']):
+                ids.append(self.encode_action(SELECT_VERB, tr, tq))
+        elif p.kind == 'line_charge':
+            # Lancer: SELECT an in-line enemy (the move destination is implied).
+            for tr, tq in self._line_charge_targets((r, q), p.data['max_dist']):
+                ids.append(self.encode_action(SELECT_VERB, tr, tq))
+        elif p.kind == 'grant_attack:select':
+            for tr, tq in self._grant_attack_targets(p.data['origin'], p.data['range']):
+                ids.append(self.encode_action(SELECT_VERB, tr, tq))
+        elif p.kind == 'grant_move:select':
+            for tr, tq in self._grant_move_targets(p.data['origin'], p.data['range']):
+                ids.append(self.encode_action(SELECT_VERB, tr, tq))
+        elif p.kind == 'grant_attack:strike':
+            # The chosen unit makes a normal adjacent attack.
+            mover = self.board.get_unit_at(r, q)
+            for d, (dr, dq) in enumerate(self.board.offsets):
+                if self._can_attack(mover, self.board.get_unit_at(r + dr, q + dq)):
+                    ids.append(self.encode_action(6 + d, r, q))
+        elif p.kind == 'grant_move:step':
+            # The chosen unit moves one space, ending within range of the granter.
+            origin, rng = p.data['origin'], p.data['range']
+            within = self._hex_distances(origin, rng)
+            for d, (dr, dq) in enumerate(self.board.offsets):
+                dest = (r + dr, q + dq)
+                if dest in self.board.get_free_adjacent_cells(r, q) and dest in within:
+                    ids.append(self.encode_action(d, r, q))
+        elif p.kind == 'free_maneuver':
+            # Mercenary: one free move / attack / control from its cell.
+            mover = self.board.get_unit_at(r, q)
+            for d, (dr, dq) in enumerate(self.board.offsets):
+                if (r + dr, q + dq) in self.board.get_free_adjacent_cells(r, q):
+                    ids.append(self.encode_action(d, r, q))
+                if mover is not None and UNIT_BY_ID[mover.id].can_normal_attack \
+                        and self._can_attack(mover, self.board.get_unit_at(r + dr, q + dq)):
+                    ids.append(self.encode_action(6 + d, r, q))
+            if self.board.is_valid_claim(active, (r, q)):
+                ids.append(self.encode_action(CONTROL_VERB, r, q))
+        elif p.kind == 'footman_maneuver':
+            # The Footman currently at the front of the queue makes one maneuver.
+            mover = self.board.get_unit_at(r, q)
+            if mover is not None:
+                for d, (dr, dq) in enumerate(self.board.offsets):
+                    if (r + dr, q + dq) in self.board.get_free_adjacent_cells(r, q):
+                        ids.append(self.encode_action(d, r, q))
+                    if UNIT_BY_ID[mover.id].can_normal_attack \
+                            and self._can_attack(mover, self.board.get_unit_at(r + dr, q + dq)):
+                        ids.append(self.encode_action(6 + d, r, q))
+                if self.board.is_valid_claim(active, (r, q)):
+                    ids.append(self.encode_action(CONTROL_VERB, r, q))
 
         if p.optional:
             ids.append(DECLINE_ACTION_ID)
@@ -1037,6 +1502,15 @@ class WarChestEnv(gym.Env):
         p = self.state.pending
         active = self.active_player
 
+        if action_id == DECLINE_ACTION_ID and p.kind == 'footman_maneuver':
+            # Declining only skips the current Footman; advance to the next in the queue.
+            queue = p.data['queue'][1:]
+            self.state.pending = (
+                Pending('footman_maneuver', unit_loc=queue[0], optional=True, data={'queue': queue})
+                if queue else None)
+            return Action(reward=0.0, finishes_game=False, is_valid=True,
+                          txt_result='Skipped a Footman')
+
         if action_id == DECLINE_ACTION_ID:
             if not p.optional:
                 return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
@@ -1045,18 +1519,36 @@ class WarChestEnv(gym.Env):
             return Action(reward=0.0, finishes_game=False, is_valid=True,
                           txt_result='Declined continuation')
 
+        if p.kind == 'bonus_action':
+            # Warrior Priest: spend the freshly drawn coin on one normal action now.
+            # Handled before the spatial guard because the bonus may be a face-down
+            # action (pass / recruit / claim-initiative), not just a spatial one.
+            if action_id not in self._bonus_actions(p.data['coin']):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Not a legal bonus action', is_valid=False)
+            action_type, action_args = self.get_action_info(action_id)
+            action = self.action_dict[action_type]['act_function'](*action_args)
+            action.type = action_type
+            action.additional_info = action_args
+            if action.is_valid:
+                self.state.pending = None
+            return action
+
         if action_id >= SPATIAL_SIZE:
             return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                           txt_result='Not a legal continuation', is_valid=False)
         verb, r, q = self.decode_action(action_id)
-        if (r, q) != p.unit_loc:
-            return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
-                          txt_result='Continuation must act on the pending unit', is_valid=False)
 
-        if p.kind == 'cavalry_move':
+        # Directional continuations (move/attack) act FROM the pending unit's cell, so
+        # (r,q) must equal unit_loc. SELECT continuations point AT a target cell, so
+        # that invariant does not apply and each kind validates its own target below.
+        if p.kind == 'move_then_attack:move':
+            if (r, q) != p.unit_loc:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Continuation must act on the pending unit', is_valid=False)
             if not (0 <= verb <= 5):
                 return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
-                              txt_result='Cavalry must move first', is_valid=False)
+                              txt_result='Must move first', is_valid=False)
             offset = self.board.offsets[verb]
             end = (r + offset[0], q + offset[1])
             if end not in self.board.get_free_adjacent_cells(r, q):
@@ -1067,27 +1559,220 @@ class WarChestEnv(gym.Env):
             self.exploration_map_dict[active][end] += 1
             # Then attack — optional so a move into a position with no enemy adjacent
             # is not a softlock (matches "attack, if able").
-            self.state.pending = Pending('cavalry_attack', unit_loc=end, optional=True)
+            self.state.pending = Pending('move_then_attack:attack', unit_loc=end, optional=True)
             return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
-                          txt_result='Cavalry moved; choose an attack', is_valid=True)
+                          txt_result='Moved; choose an attack', is_valid=True)
 
-        if p.kind == 'cavalry_attack':
+        if p.kind == 'move_then_attack:attack':
+            if (r, q) != p.unit_loc:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Continuation must act on the pending unit', is_valid=False)
             if not (6 <= verb <= 11):
                 return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
                               txt_result='Expected an attack', is_valid=False)
             offset = self.board.offsets[verb - 6]
             target = (r + offset[0], q + offset[1])
+            mover = self.board.get_unit_at(r, q)
             enemy = self.board.get_unit_at(*target)
-            if enemy is None or enemy.player_id == active:
+            if not self._can_attack(mover, enemy):
                 return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
-                              txt_result='No enemy unit at target cell', is_valid=False)
-            enemy.stack -= 1
-            self.state.boxed[enemy.player_id][enemy.id] += 1
-            if enemy.stack <= 0:
-                self.board.remove_unit(enemy)
+                              txt_result='No legal enemy at target cell', is_valid=False)
+            self._resolve_attack(mover, enemy)
             self.state.pending = None
             return Action(reward=ATTACK_REWARD, finishes_game=False,
-                          txt_result='Cavalry attacked', is_valid=True)
+                          txt_result='Moved and attacked', is_valid=True)
+
+        if p.kind == 'ranged_attack':
+            # SELECT a ranged target; (r,q) is the target cell, not the unit's cell.
+            if verb != SELECT_VERB:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Expected a target selection', is_valid=False)
+            if (r, q) not in self._ranged_targets(p.unit_loc, **p.data):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Not a legal ranged target', is_valid=False)
+            # Ranged attacker is 2 cells away, so a Pikeman counter never applies here.
+            self._resolve_attack(self.board.get_unit_at(*p.unit_loc), self.board.get_unit_at(r, q))
+            self.state.pending = None
+            return Action(reward=ATTACK_REWARD, finishes_game=False,
+                          txt_result='Archer attacked', is_valid=True)
+
+        if p.kind == 'bonus_move':
+            # Swordsman's free post-attack move (no coin cost).
+            if (r, q) != p.unit_loc:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Continuation must act on the pending unit', is_valid=False)
+            if not (0 <= verb <= 5):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Expected a move', is_valid=False)
+            offset = self.board.offsets[verb]
+            end = (r + offset[0], q + offset[1])
+            if end not in self.board.get_free_adjacent_cells(r, q):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Target cell not free', is_valid=False)
+            self.board.get_unit_at(r, q).move(loc=end)
+            self.exploration_map_dict[active][end] += 1
+            self.state.pending = None
+            return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
+                          txt_result='Bonus move', is_valid=True)
+
+        if p.kind == 'extra_maneuver':
+            # Berserker: each extra maneuver is paid by removing one of its own coins.
+            if (r, q) != p.unit_loc:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Continuation must act on the pending unit', is_valid=False)
+            unit = self.board.get_unit_at(r, q)
+            if unit is None or unit.stack < 2:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='No coin to pay for an extra maneuver', is_valid=False)
+            if 0 <= verb <= 5:  # move
+                offset = self.board.offsets[verb]
+                end = (r + offset[0], q + offset[1])
+                if end not in self.board.get_free_adjacent_cells(r, q):
+                    return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                                  txt_result='Target cell not free', is_valid=False)
+                self._damage_unit(unit)  # pay from the stack (stack >= 2, so it survives)
+                unit.move(loc=end)
+                self.exploration_map_dict[active][end] += 1
+                reward, new_loc = MOVE_NEG_REWARD_PER_TURN, end
+            elif 6 <= verb <= 11:  # attack
+                offset = self.board.offsets[verb - 6]
+                enemy = self.board.get_unit_at(r + offset[0], q + offset[1])
+                if not self._can_attack(unit, enemy):
+                    return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                                  txt_result='No legal enemy at target cell', is_valid=False)
+                self._damage_unit(unit)  # pay first
+                self._resolve_attack(unit, enemy)  # may kill the Berserker via a counter
+                reward, new_loc = ATTACK_REWARD, (r, q)
+            elif verb == CONTROL_VERB:  # control
+                if not self.board.is_valid_claim(active, (r, q)):
+                    return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                                  txt_result='Invalid claim', is_valid=False)
+                self._damage_unit(unit)  # pay
+                self.board.change_base_control(player_id=active, base_loc=(r, q))
+                if len(self.board.get_controlled_bases(active)) >= self.winning_base_count:
+                    self.state.pending = None
+                    return Action(reward=WIN_REWARD, finishes_game=True, is_valid=True,
+                                  txt_result=f'Player {active} won')
+                reward, new_loc = CLAIM_BASE_REWARD, (r, q)
+            else:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Expected a maneuver', is_valid=False)
+            # Re-open the chain if the Berserker survived and can still pay; else end it.
+            survivor = self.board.get_unit_at(*new_loc)
+            if survivor is not None and survivor is unit and survivor.stack >= 2:
+                self.state.pending = Pending('extra_maneuver', unit_loc=new_loc, optional=True)
+            else:
+                self.state.pending = None
+            return Action(reward=reward, finishes_game=False, is_valid=True,
+                          txt_result='Berserker extra maneuver')
+
+        if p.kind == 'move_to':
+            if verb != SELECT_VERB:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Expected a destination selection', is_valid=False)
+            if (r, q) not in self._move_to_targets(p.unit_loc, p.data['max_dist'], p.data['controlled']):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Not a legal destination', is_valid=False)
+            unit = self.board.get_unit_at(*p.unit_loc)
+            unit.move(loc=(r, q))
+            self.exploration_map_dict[active][(r, q)] += 1
+            self.state.pending = None
+            return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
+                          txt_result='Moved', is_valid=True)
+
+        if p.kind == 'line_charge':
+            if verb != SELECT_VERB:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Expected a target selection', is_valid=False)
+            targets = self._line_charge_targets(p.unit_loc, p.data['max_dist'])
+            if (r, q) not in targets:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Not a legal charge target', is_valid=False)
+            unit = self.board.get_unit_at(*p.unit_loc)
+            unit.move(loc=targets[(r, q)])
+            self.exploration_map_dict[active][targets[(r, q)]] += 1
+            self._resolve_attack(unit, self.board.get_unit_at(r, q))
+            self.state.pending = None
+            return Action(reward=ATTACK_REWARD, finishes_game=False,
+                          txt_result='Lancer charge', is_valid=True)
+
+        if p.kind == 'grant_attack:select':
+            if verb != SELECT_VERB or (r, q) not in self._grant_attack_targets(
+                    p.data['origin'], p.data['range']):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Not a grantable unit', is_valid=False)
+            self.state.pending = Pending('grant_attack:strike', unit_loc=(r, q), optional=False)
+            return Action(reward=0.0, finishes_game=False, is_valid=True,
+                          txt_result='Chosen unit will attack')
+
+        if p.kind == 'grant_attack:strike':
+            if (r, q) != p.unit_loc:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Strike must come from the chosen unit', is_valid=False)
+            if not (6 <= verb <= 11):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Expected an attack', is_valid=False)
+            action, new_loc = self._resolve_free_maneuver((r, q), verb)
+            if action.is_valid:
+                self.state.pending = None
+                # The granted unit's own on-attack attribute still triggers (FAQ:
+                # Swordsman / Berserker / Warrior Priest fire off a Marshall-granted attack).
+                self._fire_maneuver_triggers(self.board.get_unit_at(*new_loc), 'attack')
+            return action
+
+        if p.kind == 'grant_move:select':
+            if verb != SELECT_VERB or (r, q) not in self._grant_move_targets(
+                    p.data['origin'], p.data['range']):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Not a grantable unit', is_valid=False)
+            self.state.pending = Pending('grant_move:step', unit_loc=(r, q), optional=False,
+                                         data=dict(p.data))
+            return Action(reward=0.0, finishes_game=False, is_valid=True,
+                          txt_result='Chosen unit will move')
+
+        if p.kind == 'grant_move:step':
+            if (r, q) != p.unit_loc or not (0 <= verb <= 5):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Expected a move from the chosen unit', is_valid=False)
+            offset = self.board.offsets[verb]
+            dest = (r + offset[0], q + offset[1])
+            within = self._hex_distances(p.data['origin'], p.data['range'])
+            if dest not in self.board.get_free_adjacent_cells(r, q) or dest not in within:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Destination not free or out of range', is_valid=False)
+            self.board.get_unit_at(r, q).move(loc=dest)
+            self.exploration_map_dict[active][dest] += 1
+            self.state.pending = None
+            # The granted unit's own attribute still triggers (FAQ: a Berserker may
+            # continue with stack-paid maneuvers after an Ensign-granted move).
+            self._fire_maneuver_triggers(self.board.get_unit_at(*dest), 'move')
+            return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
+                          txt_result='Granted move', is_valid=True)
+
+        if p.kind == 'free_maneuver':
+            if (r, q) != p.unit_loc:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Continuation must act on the pending unit', is_valid=False)
+            action, _ = self._resolve_free_maneuver((r, q), verb)
+            if action.is_valid:
+                self.state.pending = None
+            return action
+
+        if p.kind == 'footman_maneuver':
+            if (r, q) != p.unit_loc:
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Maneuver must act on the queued Footman', is_valid=False)
+            action, _ = self._resolve_free_maneuver((r, q), verb)
+            if not action.is_valid:
+                return action
+            if action.finishes_game:
+                self.state.pending = None
+                return action
+            queue = p.data['queue'][1:]
+            self.state.pending = (
+                Pending('footman_maneuver', unit_loc=queue[0], optional=True, data={'queue': queue})
+                if queue else None)
+            return action
 
         # Unknown pending kind — clear it to avoid a stuck turn.
         self.state.pending = None

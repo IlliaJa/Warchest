@@ -19,9 +19,12 @@ renderer, not their art.
 - **Glyph reliability:** ✅ monochrome BMP (renders in matplotlib's default font);
   ⚠ color emoji (needs an emoji font — may show as a box; use the letter fallback). The
   implementer may instead draw simple original icons.
-- **Currently implemented:** Swordsman and Knight exist but as **vanilla** units (no
-  attributes yet) and with placeholder glyphs (`♖`, `♞`). Their real attributes/glyphs
-  below should replace those in Phase 4. `Swordsman.id = 1`, `Knight.id = 2`, Royal coin `= 3`.
+- **Currently implemented (2026-06-28):** **all 16 units have their tactics, attributes, and
+  restrictions** (Phase 4 complete — see `docs/full_game_plan.md`). Coin ids run 1..16 for the
+  units (in the table order below: Swordsman=1, Knight=2, … Warrior Priest=16) and 17 for the
+  Royal coin. Mechanics are named generically in `roster.py` (`tactic` + `tactic_params` and the
+  boolean attribute flags) so they are reused across units and future DLC; the renderer still
+  uses the short letter glyphs (`Sw`, `Kn`, …) rather than the card art.
 
 ---
 

@@ -299,7 +299,55 @@ non-trivial type preference; freeze `baseline_multiunit_v4`.
 
 ---
 
-## Phase 4 — Tactics & attributes (incremental, a few units at a time)
+## Phase 4 — Tactics & attributes (incremental, a few units at a time) ✅ complete (2026-06-28)
+
+**Status: all 16 units now have their tactics / attributes / restrictions.** A 400-game
+random-play stress (every drafted composition) exercises all 14 pending kinds with zero
+crashes, softlocks, or coin-conservation violations, and training runs clean on the final
+schema. Final schema: `N_VERBS=32` (`TACTIC`, `SELECT`), `N_FACTORED_VERBS=11`,
+`PENDING_CTX_DIM=15` (no-pending + 14 continuation kinds), `GLOBAL_DIM=189`,
+`ACTION_SPACE_SIZE=1875`, `OBS_VERSION=8`. Policy/Critic/buffer/trainer stayed shape-agnostic
+throughout (the head reads sizes from constants). Tests live in domain files
+(`test_tactics.py`, `test_attributes.py`, `test_units.py`, …; 63 total).
+
+What each unit does (see `docs/UNITS.md` for the card text):
+
+| Unit | Mechanic | Notes |
+|---|---|---|
+| Cavalry | `move_then_attack` | move (mandatory) → attack (optional) |
+| Light Cavalry | `move_to` (≤2) | SELECT a reachable destination |
+| Lancer | `line_charge` (≤2) | SELECT an in-line enemy → move + strike; no normal attack |
+| Archer | `ranged_attack` any@2 | SELECT a distance-2 enemy; no normal attack |
+| Crossbowman | `ranged_attack` line@2 | clear straight line; may also normal-attack |
+| Berserker | `extra_maneuvers_from_stack` | pay own stack coins to keep maneuvering |
+| Footman | `maneuver_each` + 2 copies | one maneuver per Footman; two may be on board |
+| Pikeman | `counter_when_attacked` | adjacent attacker loses a coin (not absorbable) |
+| Ensign | `grant_move` | SELECT a friendly ≤2 → it moves, ending ≤2 from the Ensign |
+| Marshall | `grant_attack` | SELECT a friendly ≤2 → it makes a normal attack |
+| Mercenary | `maneuver_after_recruit` | recruiting its coin grants a free maneuver |
+| Scout | `deploy_adjacent_to_friendly` | deploys next to any friendly unit |
+| Royal Guard | `royal_move` + `absorb_from_supply` | Royal-coin move ≤2 to a controlled loc; soaks hits from supply |
+| Swordsman | `move_after_attack` | optional free move after attacking |
+| Knight | `only_attackable_when_bolstered` | a stack-1 attacker cannot hit it |
+| Warrior Priest | `bonus_action_after_attack_or_control` | draw a coin and use it at once |
+
+**Documented simplifications** (faithful to ~all real positions; avoid a pending-inside-a-pending):
+
+- A bonus / repeat maneuver — the Warrior-Priest's drawn-coin action, a Berserker's stack-paid
+  repeat, or a Footman-tactic maneuver — can do move / attack / control / deploy / etc. but
+  **cannot use the TACTIC verb to start a *named* tactic.** This does **not** limit how many
+  maneuvers a unit gets (a Berserker still chains one per stack coin); it only forbids nesting a
+  second multi-step tactic inside one. Rarely binds (e.g. a WP drawing a Cavalry coin can't launch
+  Cavalry's move-then-attack with it).
+- The WP's bonus action does not re-fire the acting unit's on-attack attribute.
+- The Royal Guard auto-absorbs from supply when able (a strictly-beneficial "may").
+
+(Granted attacks/moves from Marshall/Ensign **do** chain the granted unit's own attribute — a
+granted Berserker keeps maneuvering, a granted Swordsman gets its free move — per the FAQ.)
+
+---
+
+### Implementation history
 
 **Scaffolding + Cavalry slice implemented (2026-06-02).** The variety of tactics is kept
 *out* of the action space via a **pending sub-turn** state machine: a multi-step tactic
@@ -318,30 +366,45 @@ Critic/buffer/trainer are shape-agnostic — only the constants changed; GreedyB
 range was capped below `TACTIC_VERB` so it stays a tactic-ignoring yardstick. Tests:
 `tests/test_phase4.py` (16: schema/encode/remap, the full + declined + mandatory sub-turn,
 context one-hot, P2-via-remap, coin-conservation-with-tactics, no-softlock, bots, nets).
-Remaining clusters below add a `Pending` kind + a continuation branch + a roster flag per unit;
-the `SELECT` verb (non-directional targets: ranged, friendly-unit grants) is the next primitive.
+Remaining clusters below add a `Pending` kind + a continuation branch + a roster flag per unit.
+
+**SELECT primitive + Archer slice implemented (2026-06-28).** Added the `SELECT` verb (a
+spatial verb whose `(r,q)` is an arbitrary *target* cell, not a direction) — the primitive the
+directional move/attack verbs can't express, needed for ranged attacks and friendly-unit
+grants. It is only ever legal as a pending continuation click. First consumer: the **Archer**'s
+ranged attack (`TACTIC@unit → SELECT a distance-2 enemy`, mandatory), plus the Archer's
+*restriction* `can_normal_attack=False` (rulebook p.16). Tactics are now named by **mechanic,
+not unit**, so they reuse across the roster/DLC: Cavalry's tactic is `move_then_attack`; Archer's
+is `ranged_attack` with `tactic_params={'distance':2,'straight_line':False}`. The same
+`_ranged_targets` already supports Crossbowman's `straight_line=True` (clear-line range 2) — only
+the roster entry is missing. Schema bump: `N_VERBS` 31→**32** (`SELECT_VERB`), `N_FACTORED_VERBS`
+10→**11** (`V_SELECT`), `PENDING_KINDS` +`ranged_attack` → `PENDING_CTX_DIM` 3→**4**, `GLOBAL_DIM`
+177→**178**, `ACTION_SPACE_SIZE` 1826→**1875**, `OBS_VERSION=6`. Policy/Critic/buffer/trainer
+unchanged (head reads sizes from constants). The test suite was also reorganized from phase-named
+files into domain files (`tests/test_units.py`, `test_tactics.py`, `test_game_mechanics.py`,
+`test_action_space.py`, `test_bots.py`, `test_policy.py` + shared `_helpers.py`; 42 total). New
+tactic coverage (SELECT remap, mechanic-naming, full ranged flow, the no-normal-attack restriction,
+target-in-range gating, mandatory-select, P2-via-remap) lives in `test_tactics.py`/`test_units.py`.
+
+**Then clusters 1–4 completed (2026-06-28)** — the remaining grant flavor of SELECT (select a
+friendly unit → a nested granted maneuver), the `move_to` / `line_charge` destination tactics,
+and all the passive/triggered attributes. See the table above.
 
 **Goal.** Add the `tactic` verb branch + conditional masks and passive `attributes`,
 one cluster of units per sub-step so failures stay localized.
 
-Suggested clusters by complexity (each its own trainable sub-step):
-1. **Simple movement/attack tactics:** Cavalry (move-then-attack), Light Cavalry (move 2),
-   Lancer (move 2 then attack).
-2. **Ranged tactics + restrictions:** Archer (attack 2 away via tactic only — restriction:
-   no normal attack), Crossbowman (tactic attack 2 away, *and* may normal-attack).
-3. **Repeating / passive-on-attack:** Berserker (consecutive maneuvers paid by removing
-   coins), Swordsman/Pikeman/Footman/Warrior-Priest attack-trigger attributes.
-4. **Force-multipliers:** Marshall (grant a normal attack to a nearby unit), Ensign (grant
-   a move), Mercenary (free maneuver while on board), Scout, Knight (deploy/defense
-   attribute), Royal Guard (royal-coin tactic), Footman (two units on board).
+Clusters by complexity (each implemented end-to-end with focused tests):
+1. **Simple movement/attack tactics:** Cavalry (move-then-attack) ✅, Light Cavalry (move 2) ✅,
+   Lancer (move 2 then attack) ✅.
+2. **Ranged tactics + restrictions:** Archer (attack 2 away via tactic only) ✅,
+   Crossbowman (straight clear line, may also normal-attack) ✅.
+3. **Repeating / passive-on-attack:** Berserker ✅, Swordsman ✅, Pikeman ✅, Warrior Priest ✅.
+4. **Force-multipliers / special:** Marshall ✅, Ensign ✅, Mercenary ✅, Scout ✅, Knight ✅,
+   Royal Guard ✅, Footman ✅.
 
-Each sub-step: add the unit's `tactic`/`attribute` hook, extend the `tactic` mask, add a
-focused test, train, eval, freeze a baseline. Watch the FAQ section of the rulebook — many
-edge cases (Berserker payment, Marshall scope, Lancer must-move-and-attack, Pikeman timing)
-are spelled out there and should become test cases.
-
-**Exit criteria.** All tactics/attributes implemented and individually tested; agent uses
-tactics at non-trivial rates; freeze `baseline_tactics_v5`.
+**Exit criteria.** ✅ All tactics/attributes implemented and tested; the random-play stress
+confirms legality/conservation across every drafted composition. (Re-baselining `baseline_tactics_v5`
+via a training run is the remaining step before Phase 5.)
 
 ---
 
