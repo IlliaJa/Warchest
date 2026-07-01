@@ -78,4 +78,3 @@ Use the **Previous / Next** buttons or keyboard shortcuts `←` / `→` (or `A` 
 - [Metrics reference](docs/METRICS.md)
 - [Ideas / open issues](docs/IDEAS.md)
 - [Training history](docs/history.md)
-- [Full-game implementation plan](docs/full_game_plan.md)

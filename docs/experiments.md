@@ -55,3 +55,43 @@ The full coin economy is learnable end-to-end: the agent masters the much larger
 **Caveats.** (1) `GreedyBot` ignores bolster and recruit, so "WR vs greedy" is a softer bar than full-economy play — the agent is beating an economy-blind, myopic bot. (2) The privileged critic is in use but **not yet A/B'd** against a public-only critic, so its contribution to this result is unmeasured. Both are open items before reading too much into the 90%.
 
 ![Phase 1c training curves](assets/2026-05-31-phase1c.png)
+
+---
+
+## 2026-06-30 — Full base game, long run (run: `ppo_20260630-060400`, ~710/1000 batches)
+
+**Changes:** First long training run on the **complete base game** — all 16 units with their
+tactics/attributes/restrictions and per-game disjoint drafting (`OBS_VERSION=8`,
+`ACTION_SPACE_SIZE=1875`). This is the culmination of Phases 3–4. Hyperparameters:
+`collect_episodes=64, ppo_epochs=4, ppo_eps=0.2, gamma=0.99, lam=0.95, entropy_coeff=0.025,
+lr_actor=lr_critic=3e-4, hidden_dim=64, minibatch=64`; opponent schedule `random/greedy/pool`
+`0.4/0.2/0.4` → `0/0.4/0.6` (finetune triggered almost immediately once `wr_random` hit 1.0).
+`GreedyBot.RANDOM_ACTION_PROB=0.0`, so greedy eval is now the **true** bot (idea C9 resolved) —
+this WR is honest, not softened.
+
+**Results:** the agent learns the full ruleset and beats greedy, but **plateaus early and then
+oscillates for ~10 h with no real gain**. Reading the panels (see image):
+
+- **`elo_policy`** ramps ~1050 → ~1400 by batch ~130–250, then oscillates 1350–1420 flat for
+  the entire second half (peaks 1426 at batches 230/360, never beaten). `wr_greedy` (not in this
+  panel set) mirrors it: ~0.72 mean, no trend; `wr_random` ≈ 1.0 throughout.
+- **`entropy`** falls only 1.75 → ~1.25 and stalls — that's ~70% of the *measured* max entropy
+  (mean legal-action count is just 7.8, so max ≈ 1.84). The policy never commits; it keeps
+  spreading mass over ~half the legal moves.
+- **`score_main`** keeps climbing (~0.9 → ~1.4–1.5) across the whole run **while WR/Elo stay
+  flat** — the agent is optimizing the dense shaping signal, not wins. `avg_turns` sits flat
+  ~125–140 (the analysis log notes a mild 127→150 drift), i.e. games aren't getting more
+  decisive as score rises. This score-vs-win decoupling is the headline problem.
+- **Training-health signals are all clean:** `critic_loss` drops ~0.5 → ~0.12 and stays low;
+  `critic_mae` flat ~0.05–0.07; `approx_kl` ~0.005; `clip_frac` steady ~0.06–0.08;
+  `advantage_std` stable ~0.3; `actor_loss` ~0; grad norms low with only occasional spikes
+  (actor ≤8, critic ≤3). Nothing is diverging — this is **not** an optimization-instability or
+  train-longer problem.
+
+**Takeaway.** The full game is learnable end-to-end and the agent reaches ~70% vs true greedy,
+but the last ~580 batches (~10 h) bought nothing. Root cause is **reward design + exploration
+pressure**, not compute or stability. Full diagnosis and prioritized action points:
+`docs/analysis_ppo_20260630.md`. (Also: `docs/METRICS.md`'s entropy band is stale — written for
+the old 14-action head; recalibrate to the current max ≈ 1.84.)
+
+![Full base game — long run W&B panels (ppo_20260630-060400)](assets/2026-07-01-full-game-implemented.png)

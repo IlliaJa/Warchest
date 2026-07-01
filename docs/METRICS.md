@@ -83,9 +83,45 @@ the data. Epoch terminates early when this exceeds `KL_TARGET = 0.015`.
 
 ### `entropy` — policy entropy
 
-**What it measures:** mean `−Σ p log p` over the action distribution. For 14 actions, maximum entropy ≈ 2.64.
+**What it measures:** mean `−Σ p log p` over the *masked* action distribution (only legal
+actions). The ceiling is therefore set by how many moves are legal per turn, **not** by the
+1875-wide raw action space.
 
-**Trend:** should start high (near-uniform policy) and decrease as the policy becomes more decisive. A collapse to near 0 early in training means premature convergence — the entropy coefficient is too low.
+**Reference scale (current env).** Measured over 8000 random self-play decision points: legal
+actions per turn average **7.8** (median 6, p10 3, p90 16). The mean per-state maximum entropy
+(`mean of log(n_legal)`) is therefore **≈ 1.84**, not the 2.64 quoted for the old 14-action
+version. Read entropy *relative to 1.84*:
+
+- ~1.84 → uniform-random over legal moves (no policy);
+- ~1.3 → still ~70 % of max; the policy is barely committing (see
+  `docs/analysis_ppo_20260630.md`);
+- ~0.7–0.9 (≈40–50 % of max) → a healthily decisive policy for this game.
+
+**Trend:** should start near 1.84 and decrease as the policy becomes decisive. The entropy
+coefficient is now linearly annealed (`entropy_coeff` 0.025 → 0.003 over the run,
+`src/app/ppo.py`), so expect a steady downward drift; a flat entropy near 1.3 for the whole run
+is a warning sign (over-weighted entropy bonus and/or a reward the policy can't sharpen
+against). A collapse to near 0 *early* still means premature convergence.
+
+**Now logged directly (no mental math):**
+- `max_entropy` — the batch's own ceiling, `mean(log(n_legal))` over all main-player
+  decisions. Watch for drift: if the env changes what's legal, "high entropy" means something
+  different.
+- `entropy_frac` = `entropy / max_entropy` — the decisive-ness ratio. 1.0 = random, target
+  ~0.4–0.5 by end of run. This is the number to watch instead of raw entropy.
+
+### `score_attack` / `score_shaping` / `score_holding` / `score_terminal` / `score_other`
+
+**What it measures:** the per-episode-mean decomposition of `score` into its reward sources
+(attack rewards, potential shaping `γφ′−φ`, the non-potential holding reward, terminal
+win/loss/truncation, and everything else — move penalties etc.). The five sum to `score`.
+
+**Why it matters:** catches **proxy/objective decoupling** — the failure mode in
+`docs/analysis_ppo_20260630.md` where `score` rose +50 % while win rate stayed flat. If
+`score_attack`/`score_shaping` climb while `score_terminal` (≈ wins) is flat, the policy is
+farming dense reward instead of learning to win. `score_terminal` should be the component that
+rises over training; watch `score_holding` for stalling (persistently positive + rising
+`avg_turns` = sitting on a lead instead of closing).
 
 ---
 
@@ -170,6 +206,6 @@ Std of GAE advantages before normalisation. Should be non-zero (> 0.05) — near
 | `critic_mean` | noisy | converging to `return_mean` | ≈ `return_mean` | diverging from `return_mean` |
 | `critic_std` | near 0 | rising | > 0.1 | stays near 0 |
 | `advantage_std` | any | > 0.05 | > 0.1 | near 0 (actor gradient dies) |
-| `entropy` | ~2.5 | decreasing | 0.5 – 1.5 | collapses to 0 early |
+| `entropy` | ~1.8 (≈ max) | decreasing | 0.7 – 0.9 | flat near 1.3, or collapses to 0 early |
 | `wr_vs_random_eval` | 0 | rising | > 0.90 | not rising by batch 50 |
 | `wr_vs_greedy_eval` | 0 | rising | > 0.60 | flat after finetune phase |

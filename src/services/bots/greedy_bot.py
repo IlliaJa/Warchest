@@ -34,7 +34,7 @@ class GreedyBot(Bot):
     with the Royal coin so unit coins are not wasted.
     """
 
-    RANDOM_ACTION_PROB = 0.30
+    RANDOM_ACTION_PROB = 0.0
 
     def act(self, obs: dict) -> tuple[int, None, None]:
         valid = list(np.where(obs['valid_action_mask'])[0])

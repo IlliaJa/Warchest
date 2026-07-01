@@ -1,8 +1,8 @@
 # Unit reference
 
-Transcription of all 16 War Chest unit cards, for implementing the full roster
-(Phase 3 = vanilla unit variety, Phase 4 = tactics & attributes — see
-`docs/full_game_plan.md`). Rules text is reproduced as a development reference only;
+Transcription of all 16 War Chest unit cards (the full roster — vanilla units in
+Phase 3, tactics & attributes in Phase 4; implementation history in
+`docs/history.md`). Rules text is reproduced as a development reference only;
 **do not embed the original coin artwork** (it's AEG / Brigette Indelicato's IP — see the
 visualisation discussion). The "glyph" column is an *original look-alike* symbol for the
 renderer, not their art.
@@ -20,7 +20,7 @@ renderer, not their art.
   ⚠ color emoji (needs an emoji font — may show as a box; use the letter fallback). The
   implementer may instead draw simple original icons.
 - **Currently implemented (2026-06-28):** **all 16 units have their tactics, attributes, and
-  restrictions** (Phase 4 complete — see `docs/full_game_plan.md`). Coin ids run 1..16 for the
+  restrictions** (Phase 4 complete — see `docs/history.md`). Coin ids run 1..16 for the
   units (in the table order below: Swordsman=1, Knight=2, … Warrior Priest=16) and 17 for the
   Royal coin. Mechanics are named generically in `roster.py` (`tactic` + `tactic_params` and the
   boolean attribute flags) so they are reused across units and future DLC; the renderer still
@@ -198,5 +198,5 @@ small config on top):
 8. **Special deploy rules** (Scout adjacency, Footman two-copies).
 9. **Restrictions** (Archer/Lancer: no normal attack — only via tactic).
 
-These map onto the Phase 4 sub-step clusters in `docs/full_game_plan.md`; add a few units per
-step, each with a focused test drawn from the FAQ edge cases (rulebook pp. 16–18).
+These mapped onto the Phase 4 sub-step clusters (see `docs/history.md` for the build order);
+each unit landed with a focused test drawn from the FAQ edge cases (rulebook pp. 16–18).

@@ -56,7 +56,7 @@ Consolidated record of all applied fixes and architectural changes. For the reas
 
 ## Phase 3 — 16-unit roster + per-game disjoint drafting (2026-06-01)
 
-*Source: `docs/full_game_plan.md` Phase 3 (with Phase-5 drafting pulled forward). Schema-breaking — a new obs/action generation (`OBS_VERSION=4`); prior saved models retired.*
+*Phase 3 of the (now-retired) full-game roadmap, with Phase-5 drafting pulled forward. Schema-breaking — a new obs/action generation (`OBS_VERSION=4`); prior saved models retired.*
 
 | What changed | Detail |
 |---|---|
@@ -71,8 +71,48 @@ Consolidated record of all applied fixes and architectural changes. For the reas
 
 ## Phase 4 — Tactics, attributes & restrictions (full base game) (2026-06-28)
 
-*Source: `docs/full_game_plan.md` Phase 4. Implemented incrementally (Cavalry → SELECT/Archer →
-clusters 1–4) until all 16 units had their real abilities. Schema-breaking; prior models retired.*
+*Phase 4 of the (now-retired) full-game roadmap. Implemented incrementally (Cavalry → SELECT/Archer →
+clusters 1–4) over ~4 weeks until all 16 units had their real abilities. Schema-breaking; prior models retired.*
+
+**Why a new state machine instead of new action ids.** Tactics are multi-step and heterogeneous
+(move-then-attack, ranged, line charges, friendly-unit grants, stack-paid repeats). Encoding each as
+an atomic action would have exploded the action space and needed a bespoke mask per tactic. Instead a
+tactic resolves as a *sequence of masked clicks* through a `GameState.pending` continuation: while
+`pending` is set the turn does **not** pass, `get_possible_actions` returns only the legal next clicks,
+and those clicks reuse the existing move/attack/SELECT verbs. The policy tells "normal maneuver" apart
+from "tactic follow-up" via a **pending-context one-hot** appended to the globals. Net action-space
+cost across all 16 units: one spatial `TACTIC` verb (initiate), one `SELECT` verb (arbitrary target/
+destination cell), and one non-spatial `DECLINE` slot (end an optional continuation) — everything else
+is masking.
+
+### Incremental slices (the order it was actually built)
+
+| Date | Slice | Schema move | Proof |
+|---|---|---|---|
+| 2026-06-02 | **Scaffolding + Cavalry** (`move_then_attack`) — the pending sub-turn machine, `TACTIC` verb, `DECLINE` slot, context one-hot | `N_VERBS` 30→31, `N_FACTORED_VERBS` 8→10, `GLOBAL_DIM` 174→177, `OBS_VERSION`→5 | `TACTIC@unit → move-dir (mandatory) → attack-dir (optional)`, coin paid once at initiation; optional attack ⇒ no softlock when no enemy adjacent |
+| 2026-06-28 | **SELECT primitive + Archer** (`ranged_attack` any@2) + restriction `can_normal_attack=False` | `N_VERBS` 31→32, `N_FACTORED_VERBS` 10→11, `PENDING_CTX_DIM` 3→4, `GLOBAL_DIM`→178, `OBS_VERSION`→6 | tactics renamed by **mechanic not unit** so they reuse (`ranged_attack` covers Archer any-target and Crossbowman straight-line); test suite reorganized phase-files → domain-files |
+| 2026-06-28 | **Clusters 1–4** — the remaining movement/ranged tactics, grant-flavor SELECT (friendly → nested granted maneuver), and all passive/triggered attributes | → `PENDING_CTX_DIM=15`, `GLOBAL_DIM=189`, `N_VERBS=32`, `ACTION_SPACE_SIZE=1875`, `OBS_VERSION=8` | 400-game random-play stress across every drafted composition: zero crashes / softlocks / conservation violations |
+
+Per-unit mechanics (card text in `docs/UNITS.md`):
+
+| Unit | Mechanic | Notes |
+|---|---|---|
+| Cavalry | `move_then_attack` | move (mandatory) → attack (optional) |
+| Light Cavalry | `move_to` (≤2) | SELECT a reachable destination |
+| Lancer | `line_charge` (≤2) | SELECT an in-line enemy → move + strike; no normal attack |
+| Archer | `ranged_attack` any@2 | SELECT a distance-2 enemy; no normal attack |
+| Crossbowman | `ranged_attack` line@2 | clear straight line; may also normal-attack |
+| Berserker | `extra_maneuvers_from_stack` | pay own stack coins to keep maneuvering |
+| Footman | `maneuver_each` + 2 copies | one maneuver per Footman; two may be on board |
+| Pikeman | `counter_when_attacked` | adjacent attacker loses a coin (not absorbable) |
+| Ensign | `grant_move` | SELECT a friendly ≤2 → it moves, ending ≤2 from the Ensign |
+| Marshall | `grant_attack` | SELECT a friendly ≤2 → it makes a normal attack |
+| Mercenary | `maneuver_after_recruit` | recruiting its coin grants a free maneuver |
+| Scout | `deploy_adjacent_to_friendly` | deploys next to any friendly unit |
+| Royal Guard | `royal_move` + `absorb_from_supply` | Royal-coin move ≤2 to a controlled loc; soaks hits from supply |
+| Swordsman | `move_after_attack` | optional free move after attacking |
+| Knight | `only_attackable_when_bolstered` | a stack-1 attacker cannot hit it |
+| Warrior Priest | `bonus_action_after_attack_or_control` | draw a coin and use it at once |
 
 | What changed | Detail |
 |---|---|

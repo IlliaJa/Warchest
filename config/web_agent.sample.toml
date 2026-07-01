@@ -1,0 +1,14 @@
+[site]
+url      = ""
+username = ""
+password = ""
+
+[agent]
+games            = 10
+action_delay_min = 1.0   # seconds, lower bound of random delay between actions
+action_delay_max = 2.5   # seconds, upper bound
+game_pause       = 45    # seconds to wait between games
+
+[model]
+checkpoint = ""          # path to .pt file, e.g. "runs/best.pt"
+device     = "cpu"       # "cpu" or "cuda"

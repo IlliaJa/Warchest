@@ -14,6 +14,7 @@ Turn-based hex-grid strategy game with a reinforcement learning agent (REINFORCE
 - [Training history](docs/history.md) — implemented fixes and their observed effects
 - [RL algorithms](docs/rl_algorithms.md) — GAE, PPO, DQN, and alternatives with Warchest-specific trade-offs
 - [Metrics reference](docs/METRICS.md) — W&B metrics explained: ideal ranges, trends, warning signs
+- [Run analysis: ppo_20260630](docs/analysis_ppo_20260630.md) — plateau + high-entropy diagnosis, prioritized action points
 
 ## Quick orientation
 

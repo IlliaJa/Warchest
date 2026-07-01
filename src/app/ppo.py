@@ -11,7 +11,9 @@ import time
 import wandb
 
 from src.services.policy.policy import Policy, Critic
-from src.services.environment.warchest_env import WarChestEnv, WIN_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION
+from src.services.environment.warchest_env import (
+    WarChestEnv, WIN_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION, ATTACK_ACTION,
+)
 from src.services.environment.game_state import HAND_SIZE
 from src.services.opponent_pool import OpponentPool
 from src.utils.rollout_buffer import RolloutBuffer
@@ -99,7 +101,15 @@ class PPOTrainer:
         self._lam = hp['lam']
         self._ppo_epochs = hp['ppo_epochs']
         self._ppo_eps = hp['ppo_eps']
-        self._entropy_coeff = hp['entropy_coeff']
+        # entropy coefficient is linearly annealed init -> final over training so the
+        # policy is free to explore early and commits to a plan late.
+        self._entropy_coeff_init = hp['entropy_coeff']
+        self._entropy_coeff_final = hp.get('entropy_coeff_final', hp['entropy_coeff'])
+        self._entropy_coeff = self._entropy_coeff_init
+        # learning rates are linearly decayed init -> init*lr_final_frac (0 => decay to 0)
+        self._lr_actor_init = hp['lr_actor']
+        self._lr_critic_init = hp['lr_critic']
+        self._lr_final_frac = hp.get('lr_final_frac', 0.0)
         self._holding_reward_rate = hp['holding_reward_rate']
         self._minibatch_size = hp['minibatch_size']
         self._print_every = hp['print_every']
@@ -117,10 +127,15 @@ class PPOTrainer:
             'p_pool': hp['p_pool_finetune'],
         }
 
-        # training-lifetime state (persists across batches)
+        # training-lifetime state (persists across batches).
+        # Snapshotting rarely (vs every batch) makes the fixed-size pool span a wide skill
+        # range — old/weak to recent/strong — instead of 20 near-identical recent copies.
+        # The current policy then beats the weak snapshots (positive advantage) and ties the
+        # strong ones, so self-play games carry a real learning signal instead of ~0-advantage
+        # mirror matches. Pool spans roughly max_size * snapshot_every batches.
         self._pool = OpponentPool(
-            max_size=20,
-            snapshot_every=3,
+            max_size=hp.get('pool_max_size', 20),
+            snapshot_every=hp.get('pool_snapshot_every', 15),
             p_random=hp['p_random_initial'],
             p_greedy=hp['p_greedy_initial'],
             p_pool=hp['p_pool_initial'],
@@ -148,8 +163,25 @@ class PPOTrainer:
     # Public entry point
     # ------------------------------------------------------------------
 
+    def _update_schedules(self, batch_num: int):
+        """Linearly anneal the entropy coefficient and both learning rates.
+
+        ``frac`` runs 0.0 (first batch) -> 1.0 (last batch).
+        """
+        frac = (batch_num - 1) / max(self._n_batches - 1, 1)
+        self._entropy_coeff = (
+            self._entropy_coeff_init
+            + frac * (self._entropy_coeff_final - self._entropy_coeff_init)
+        )
+        lr_scale = 1.0 - frac * (1.0 - self._lr_final_frac)
+        for group in self._actor_optimizer.param_groups:
+            group['lr'] = self._lr_actor_init * lr_scale
+        for group in self._critic_optimizer.param_groups:
+            group['lr'] = self._lr_critic_init * lr_scale
+
     def train(self):
         for batch_num in range(1, self._n_batches + 1):
+            self._update_schedules(batch_num)
             self._batch_start = time.time()
             self._policy.to('cpu')
             self._critic.to('cpu')
@@ -196,6 +228,10 @@ class PPOTrainer:
         claims = 0
         main_score = 0.0
         turns = 0
+        # score decomposition (sums to main_score) + entropy-ceiling tracking
+        r_attack = r_shaping = r_holding = r_terminal = r_other = 0.0
+        sum_log_nlegal = 0.0
+        n_decisions = 0
 
         collect_device = self._policy.device
         opp_onehot = np.zeros(len(OPP_TYPE_IDX), dtype=np.float32)
@@ -216,12 +252,12 @@ class PPOTrainer:
                 privileged_t = torch.from_numpy(privileged).unsqueeze(0)
 
                 t0 = _pt()
-                action, log_prob, _, feat_t, global_t = self._policy.act_with_encoded(obs_before)
+                action, log_prob, _ = self._policy.act(obs_before)
                 self._t_model_play += _pt() - t0
 
                 with torch.no_grad():
                     t0 = _pt()
-                    value_norm = self._critic.value_from_features(feat_t, global_t, opp_onehot_t, privileged_t)
+                    value_norm = self._critic.value_single(obs_before, opp_onehot_t, privileged_t)
                     self._t_model_play += _pt() - t0
                     value = torch.tensor(
                         self._ret_normalizer.denormalize(value_norm.item()),
@@ -256,6 +292,19 @@ class PPOTrainer:
                 shaped_reward = reward + self._gamma * phi_after - phi_before + holding_reward
                 main_score += shaped_reward
 
+                # decompose the reward so score/win decoupling is visible in the logs
+                r_shaping += self._gamma * phi_after - phi_before
+                r_holding += holding_reward
+                if terminated:
+                    r_terminal += reward  # dominated by WIN_REWARD on a winning move
+                elif step_info['action'].type == ATTACK_ACTION:
+                    r_attack += reward
+                else:
+                    r_other += reward
+                n_legal = int(obs_before['valid_action_mask'].sum())
+                sum_log_nlegal += float(np.log(max(n_legal, 1)))
+                n_decisions += 1
+
                 if step_info['action'].type == CLAIM_BASE_ACTION and step_info['action'].is_valid:
                     claims += 1
 
@@ -279,6 +328,7 @@ class PPOTrainer:
                 if acting_pid != main_pid:
                     self._buffer.append_terminal_reward(LOSS_REWARD)
                     main_score += LOSS_REWARD
+                    r_terminal += LOSS_REWARD
                 break
 
             if truncated:
@@ -295,6 +345,7 @@ class PPOTrainer:
                     trunc_reward = LOSS_REWARD
                 self._buffer.append_terminal_reward(trunc_reward)
                 main_score += trunc_reward
+                r_terminal += trunc_reward
                 break
 
         self._buffer.end_episode()
@@ -306,6 +357,13 @@ class PPOTrainer:
             'main_score': main_score,
             'main_pid': main_pid,
             'opp_type': opp_type,
+            'r_attack': r_attack,
+            'r_shaping': r_shaping,
+            'r_holding': r_holding,
+            'r_terminal': r_terminal,
+            'r_other': r_other,
+            'sum_log_nlegal': sum_log_nlegal,
+            'n_decisions': n_decisions,
         }
 
     # ------------------------------------------------------------------
@@ -538,6 +596,20 @@ class PPOTrainer:
         s = update_stats
         avg_turns = float(np.mean([ep['turns'] for ep in self._batch_eps]))
         total_invalid = sum(ep['invalid_count'] for ep in self._batch_eps)
+
+        # per-episode mean of each score component (sums to score)
+        r_attack = float(np.mean([ep['r_attack'] for ep in self._batch_eps]))
+        r_shaping = float(np.mean([ep['r_shaping'] for ep in self._batch_eps]))
+        r_holding = float(np.mean([ep['r_holding'] for ep in self._batch_eps]))
+        r_terminal = float(np.mean([ep['r_terminal'] for ep in self._batch_eps]))
+        r_other = float(np.mean([ep['r_other'] for ep in self._batch_eps]))
+        # entropy ceiling: mean over all main-player decisions of log(n_legal).
+        # ent_frac = entropy / max_entropy makes "how decisive" readable without mental math.
+        tot_dec = sum(ep['n_decisions'] for ep in self._batch_eps)
+        max_entropy = (
+            sum(ep['sum_log_nlegal'] for ep in self._batch_eps) / tot_dec if tot_dec else 0.0
+        )
+        entropy_frac = s['avg_entropy'] / max_entropy if max_entropy > 0 else 0.0
         outcomes_str = ' '.join(
             f"{ep['outcome'][0]}({ep['opp_type'][0]})" for ep in self._batch_eps
         )
@@ -563,9 +635,16 @@ class PPOTrainer:
             f'wr_pool={wr_pool:.3f} wr_greedy={wr_greedy:.3f} '
             f'actor={s["avg_actor"]:.3e} critic={s["avg_critic"]:.4f} '
             f'kl={s["avg_kl"]:.4f} ent={s["avg_entropy"]:.3f} '
+            f'ent_max={max_entropy:.3f} ent_frac={entropy_frac:.2f} '
+            f'ent_c={self._entropy_coeff:.4f} lr={self._actor_optimizer.param_groups[0]["lr"]:.2e} '
             f'grad_a={s["last_actor_grad"]:.3f} grad_c={s["last_critic_grad"]:.3f} '
             f'pool={len(self._pool)} turns={avg_turns:.0f} invalid={total_invalid} '
             f't={time.time() - self._batch_start:.2f}s'
+        )
+        logger.info(
+            f'batch={batch_num} score_parts (per-ep mean): '
+            f'attack={r_attack:.3f} shaping={r_shaping:.3f} holding={r_holding:.3f} '
+            f'terminal={r_terminal:.3f} other={r_other:.3f}'
         )
 
         if use_wandb:
@@ -583,11 +662,20 @@ class PPOTrainer:
                 'critic_mae': s['avg_critic_mae'],
                 'advantage_std': self._buffer.raw_adv_std,
                 'avg_turns': avg_turns,
+                'entropy_coeff': self._entropy_coeff,
+                'lr': self._actor_optimizer.param_groups[0]['lr'],
+                'max_entropy': max_entropy,
+                'entropy_frac': entropy_frac,
+                'score_attack': r_attack,
+                'score_shaping': r_shaping,
+                'score_holding': r_holding,
+                'score_terminal': r_terminal,
+                'score_other': r_other,
             })
 
 
 if __name__ == '__main__':
-    use_wandb = False
+    use_wandb = True
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     run_id = time.strftime('%Y%m%d-%H%M%S')
@@ -608,30 +696,37 @@ if __name__ == '__main__':
     )
 
     hp = {
-        'n_batches': 600,
-        'collect_episodes': 32,
+        'n_batches': 1000,
+        'collect_episodes': 64,
         'max_t': 1000,
         'gamma': 0.99,
         'lam': 0.95,
         'ppo_epochs': 4,
         'ppo_eps': 0.2,
         'entropy_coeff': 0.025,
+        'entropy_coeff_final': 0.003,  # linearly annealed from entropy_coeff over the run
         'holding_reward_rate': holding_reward_rate,
         'minibatch_size': 64,
         'lr_actor': 3e-4,
         'lr_critic': 3e-4,
+        'lr_final_frac': 0.0,  # LR decays linearly to lr_*_init * this (0.0 => to zero)
         'hidden_dim': 64,
         'print_every': 10,
         # opponent sampling weights — initial phase (random opponent included)
         'p_random_initial': 0.40,
         'p_greedy_initial': 0.20,
         'p_pool_initial': 0.40,
-        # opponent sampling weights — fine-tune phase (random removed from training)
+        # opponent sampling weights — fine-tune phase (random removed from training).
+        # Greedy is a small fixed anchor (0.1); the rest is self-play against the wide-skill pool.
         'p_random_finetune': 0.00,
-        'p_greedy_finetune': 0.40,
-        'p_pool_finetune': 0.60,
+        'p_greedy_finetune': 0.10,
+        'p_pool_finetune': 0.90,
         # win-rate vs random that triggers the phase switch
         'wr_random_finetune_threshold': 0.90,
+        # self-play pool cadence: snapshot rarely so the max_size-slot pool spans a wide
+        # skill range (~pool_max_size * pool_snapshot_every batches) rather than near-copies.
+        'pool_max_size': 20,
+        'pool_snapshot_every': 15,
     }
     logger.info(f'hyperparameters={hp}')
 
