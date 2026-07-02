@@ -51,7 +51,7 @@ Opens an interactive matplotlib window with Previous / Next buttons and keyboard
 }
 ```
 
-The board is encoded into 6 channels by `Policy.encode_board()` before being fed to the network (the raw grid is returned in the obs; encoding happens in the policy forward pass).
+The board is encoded into `BOARD_CHANNELS` planes (46: 6 base/terrain + 32 per-type unit stacks + 6 threat + 2 coordinate — see `docs/policy_network.md`) by `generate_observation()` in `warchest_env.py`.
 
 ## Action IDs
 

@@ -610,9 +610,6 @@ class PPOTrainer:
             sum(ep['sum_log_nlegal'] for ep in self._batch_eps) / tot_dec if tot_dec else 0.0
         )
         entropy_frac = s['avg_entropy'] / max_entropy if max_entropy > 0 else 0.0
-        outcomes_str = ' '.join(
-            f"{ep['outcome'][0]}({ep['opp_type'][0]})" for ep in self._batch_eps
-        )
 
         total_t = self._t_env + self._t_model_play + self._t_gradient
         logger.debug(
@@ -630,7 +627,7 @@ class PPOTrainer:
             f'total_accounted={total_t:.2f}s'
         )
         logger.info(
-            f'batch={batch_num}/{self._n_batches} [{outcomes_str}] '
+            f'batch={batch_num}/{self._n_batches} '
             f'score={np.mean(self._score_deque):.2f} '
             f'wr_pool={wr_pool:.3f} wr_greedy={wr_greedy:.3f} '
             f'actor={s["avg_actor"]:.3e} critic={s["avg_critic"]:.4f} '
@@ -696,7 +693,7 @@ if __name__ == '__main__':
     )
 
     hp = {
-        'n_batches': 1000,
+        'n_batches': 400,
         'collect_episodes': 64,
         'max_t': 1000,
         'gamma': 0.99,

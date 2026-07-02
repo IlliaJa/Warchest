@@ -38,6 +38,19 @@ class HexConv2d(nn.Module):
         return self.conv(x)
 
 
+def _split_pool(feat: torch.Tensor) -> torch.Tensor:
+    """[B,C,7,7] -> [B,2C] location-preserving pool, split along the flank (q) axis.
+
+    A single global mean pool is location-blind — it can tell a threat exists
+    somewhere but not which flank (see docs/IDEAS.md "the agent can't see the
+    board as one position"). Column 3 (the board's true center) is included in
+    both halves so the contested middle stays visible to each side.
+    """
+    left = feat[..., 0:4].mean(dim=(-2, -1))
+    right = feat[..., 3:7].mean(dim=(-2, -1))
+    return torch.cat([left, right], dim=-1)
+
+
 class Policy(nn.Module):
     """Actor with a factored (verb-level) action head — Phase 2.
 
@@ -60,11 +73,18 @@ class Policy(nn.Module):
     inside the within-verb softmax, so there is no loss of expressiveness vs the
     flat head.
 
-    Board trunk: HexConv2d stack on BOARD_CHANNELS input planes → [B, Cf, 7, 7].
-    Input planes (BOARD_CHANNELS, ego-centric):
+    Board trunk: HexConv2d stack on BOARD_CHANNELS input planes → [B, Cf, 7, 7],
+    3 layers deep (receptive-field radius 3 — exactly covers the Lancer's
+    distance-3 charge; see docs/IDEAS.md "the agent can't see the board as one
+    position"). Input planes (BOARD_CHANNELS, ego-centric):
         0: invalid  1: empty  2: uncontrolled base
         3: own base  4: opp base  5: exploration
-        6: own sword  7: own knight  8: opp sword  9: opp knight
+        6-21: own unit-type stack planes (index = unit id - 1)
+        22-37: opponent unit-type stack planes (index = unit id - 1)
+        38-40: own threat (melee, ranged, charge) — graded hit-count this side
+               could land on each cell this turn
+        41-43: enemy threat (melee, ranged, charge)
+        44: row_coord  45: col_coord — static ego-centric position planes
     """
 
     def __init__(self, device, hidden_dim=64):
@@ -75,14 +95,18 @@ class Policy(nn.Module):
             nn.ReLU(),
             HexConv2d(in_channels=32, out_channels=hidden_dim),
             nn.ReLU(),
+            HexConv2d(in_channels=hidden_dim, out_channels=hidden_dim),
+            nn.ReLU(),
         )
 
         # Within-verb logits: 1×1 conv → N_VERBS spatial planes (flattened) plus a
-        # linear head for the face-down actions.
+        # linear head for the face-down actions. The spatial head sees the full
+        # per-cell feature map directly, so it was never location-blind; only the
+        # pooled path (facedown_head/verb_head) needed the split pool below.
         self.policy_head = nn.Conv2d(hidden_dim + GLOBAL_DIM, N_VERBS, kernel_size=1)
-        self.facedown_head = nn.Linear(hidden_dim + GLOBAL_DIM, FACEDOWN_SIZE)
+        self.facedown_head = nn.Linear(2 * hidden_dim + GLOBAL_DIM, FACEDOWN_SIZE)
         # Top-level verb head.
-        self.verb_head = nn.Linear(hidden_dim + GLOBAL_DIM, N_FACTORED_VERBS)
+        self.verb_head = nn.Linear(2 * hidden_dim + GLOBAL_DIM, N_FACTORED_VERBS)
 
         # Static flat-id -> verb-index map, and a per-verb membership matrix.
         verb_index = torch.tensor(VERB_OF_ACTION, dtype=torch.long)
@@ -104,7 +128,7 @@ class Policy(nn.Module):
         B = feat.shape[0]
         g = global_feats.view(B, GLOBAL_DIM, 1, 1).expand(B, GLOBAL_DIM, BOARD_DIM, BOARD_DIM)
         spatial = self.policy_head(torch.cat([feat, g], dim=1)).flatten(1)  # [B, SPATIAL_SIZE]
-        pooled = feat.mean(dim=(-2, -1))  # [B, hidden_dim]
+        pooled = _split_pool(feat)  # [B, 2*hidden_dim]
         pg = torch.cat([pooled, global_feats], dim=-1)
         facedown = self.facedown_head(pg)  # [B, FACEDOWN_SIZE]
         flat_logits = torch.cat([spatial, facedown], dim=1)  # [B, ACTION_SPACE_SIZE]
@@ -199,8 +223,8 @@ class Critic(nn.Module):
         (opp hand / bag / face-down discard per coin). Discarded at inference.
 
     Board trunk: same HexConv2d stack as Policy → [B, Cf, 7, 7].
-    Global average pool → [B, Cf]. Concatenate with global features, opp_onehot and
-    the privileged vector → scalar value.
+    Split flank pool (see `_split_pool`) → [B, 2*Cf]. Concatenate with global
+    features, opp_onehot and the privileged vector → scalar value.
     """
 
     OPP_DIM = 3
@@ -212,8 +236,10 @@ class Critic(nn.Module):
             nn.ReLU(),
             HexConv2d(32, hidden_dim),
             nn.ReLU(),
+            HexConv2d(hidden_dim, hidden_dim),
+            nn.ReLU(),
         )
-        head_in = hidden_dim + GLOBAL_DIM + self.OPP_DIM + PRIV_DIM
+        head_in = 2 * hidden_dim + GLOBAL_DIM + self.OPP_DIM + PRIV_DIM
         self.head = nn.Sequential(
             nn.Linear(head_in, hidden_dim),
             nn.ReLU(),
@@ -230,7 +256,7 @@ class Critic(nn.Module):
 
     def _forward(self, board_enc, global_feats, opp_onehot, privileged):
         feat = self.board_encoder(board_enc)  # [B, hidden_dim, 7, 7]
-        pooled = feat.mean(dim=(-2, -1))  # global avg pool → [B, hidden_dim]
+        pooled = _split_pool(feat)  # [B, 2*hidden_dim]
         combined = torch.cat([pooled, global_feats, opp_onehot, privileged], dim=-1)
         return self.head(combined).squeeze(-1)
 
@@ -254,7 +280,7 @@ class Critic(nn.Module):
         Used during rollout collection to avoid running the board encoder twice per step.
         The critic's own board_encoder is still used (and trained) via value_batch.
         """
-        pooled = feat.mean(dim=(-2, -1))  # [B, hidden_dim]
+        pooled = _split_pool(feat)  # [B, 2*hidden_dim]
         combined = torch.cat([pooled, global_t, opp_onehot, privileged], dim=-1)
         return self.head(combined).squeeze(-1).squeeze(0)
 

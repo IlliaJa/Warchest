@@ -1,10 +1,10 @@
 # Training history — implemented improvements
 
-Consolidated record of all applied fixes and architectural changes. For the reasoning behind each item see the source doc noted in each section header.
+Consolidated record of all applied fixes and architectural changes, oldest first. For the reasoning behind each item see the source doc noted in each section header.
 
 ---
 
-## Phase 1 — REINFORCE era: correctness fixes
+## REINFORCE era: correctness fixes (~2026-05-22 to 05-25, pre-PPO)
 
 *Source: `docs/IDEAS.md`. These unblocked training from producing a policy worse than random.*
 
@@ -22,7 +22,7 @@ Consolidated record of all applied fixes and architectural changes. For the reas
 
 ---
 
-## Phase 2 — Architecture migration
+## Architecture migration: REINFORCE → PPO (2026-05-26 to 05-29)
 
 *Source: `docs/IDEAS.md`. Large structural changes that moved the project from REINFORCE to PPO.*
 
@@ -32,11 +32,11 @@ Consolidated record of all applied fixes and architectural changes. For the reas
 
 **Opponent pool (#16).** `src/services/opponent_pool.py` — weighted sampler over random / greedy / past policy snapshots. Breaks the co-adaptation cycle that caused WR to *decline* over training under pure self-play.
 
-**Hex-aware encoder (#15 / C13).** Replaced the standard 2D `Conv2d` with `HexConv2d` (custom kernel using the 6 hex-direction offsets). Removed the false-diagonal / missing-neighbour bias of the 3×3 square kernel on a hex grid. See `docs/decision.md`.
+**Hex-aware encoder (#15).** Replaced the standard 2D `Conv2d` with `HexConv2d` (custom kernel using the 6 hex-direction offsets). Removed the false-diagonal / missing-neighbour bias of the 3×3 square kernel on a hex grid. See `docs/decision.md`.
 
 ---
 
-## Phase 3 — PPO era: stability and tuning fixes
+## PPO stability and tuning fixes (2026-05-27 to 05-28)
 
 *Source: `docs/improvement_ideas.md` run `ppo_20260527-191432`. Starting point: WR vs greedy ~5–15%, critic MAE growing, entropy collapsing. Ending point: WR ~49%.*
 
@@ -50,17 +50,17 @@ Consolidated record of all applied fixes and architectural changes. For the reas
 | C6 | **180° board rotation for P2.** The spatial encoder saw absolute board orientation — player 2's units always in the bottom-right corner. Added `np.rot90(board, 2)` (and action remapping) when `active_player==2`. | Lifted WR vs greedy from ~33% to ~49%. Effectively doubled spatial data efficiency. |
 | C7 | **Entropy coefficient.** Was 0.005 — quickly outscaled by actor loss. Raised to 0.025. | Maintained exploration deeper into training; prevented premature commitment to the first "good enough" move. |
 | C11 | **`hidden_dim=128`.** Was 64 — a 49× spatial compression bottleneck. Doubled to 128. | Modest convergence speed improvement; meaningful with the separate-encoder design. |
-| C13 | **`HexConv2d` board encoder.** Already done as part of phase 2 (see above), confirmed in `src/services/policy/policy.py`. | — |
+| C13 | **`HexConv2d` board encoder.** Already done as part of the PPO architecture migration above, confirmed in `src/services/policy/policy.py`. | — |
 
 ---
 
-## Phase 3 — 16-unit roster + per-game disjoint drafting (2026-06-01)
+## 16-unit roster + per-game disjoint drafting (2026-06-01 to 06-02)
 
-*Phase 3 of the (now-retired) full-game roadmap, with Phase-5 drafting pulled forward. Schema-breaking — a new obs/action generation (`OBS_VERSION=4`); prior saved models retired.*
+*Originally a later milestone on the (now-retired) full-game roadmap; the drafting mechanic (planned even later on that roadmap) was pulled forward into this same change, so the old `full_game_plan.md` is retired. Schema-breaking — a new obs/action generation (`OBS_VERSION=4`); prior saved models retired.*
 
 | What changed | Detail |
 |---|---|
-| **Full 16-unit vanilla roster** | `environment/roster.py` is the single source of truth (id/icon/colour/total-coins); unit classes are generated from it in `units/__init__.py`. All units share move/attack/control/deploy/bolster (tactics/attributes are Phase 4). |
+| **Full 16-unit vanilla roster** | `environment/roster.py` is the single source of truth (id/icon/colour/total-coins); unit classes are generated from it in `units/__init__.py`. All units share move/attack/control/deploy/bolster (tactics/attributes land in "Tactics, attributes & restrictions" below). |
 | **Per-game disjoint draft** | `set_init_state` samples 8 distinct types and gives 4 to each player, disjoint, + the shared Royal coin. Per-player `build_bag`/`build_supply` replace the old global `INITIAL_BAG/SUPPLY/INITIAL_OWNED`; `GameState.owned()` is per-composition. |
 | **Full-roster sizing** | Action space 796→1776 (16 deploy verbs → `N_VERBS=30`; claim/pass over 17 coins; recruit 16×17). Board planes 10→38 (6 terrain + 16 own + 16 opp, stack-valued). `GLOBAL_DIM` 28→174, `PRIV_DIM` 9→51. |
 | **No policy/critic edits** | The factored head groups by verb (8), not by type, and reads sizes from env constants — Policy/Critic/RolloutBuffer adapted automatically. |
@@ -69,9 +69,9 @@ Consolidated record of all applied fixes and architectural changes. For the reas
 
 ---
 
-## Phase 4 — Tactics, attributes & restrictions (full base game) (2026-06-28)
+## Tactics, attributes & restrictions — full base game (2026-06-28 to 06-29)
 
-*Phase 4 of the (now-retired) full-game roadmap. Implemented incrementally (Cavalry → SELECT/Archer →
+*The last milestone of the (now-retired) full-game roadmap. Implemented incrementally (Cavalry → SELECT/Archer →
 clusters 1–4) over ~4 weeks until all 16 units had their real abilities. Schema-breaking; prior models retired.*
 
 **Why a new state machine instead of new action ids.** Tactics are multi-step and heterogeneous
@@ -90,7 +90,7 @@ is masking.
 | Date | Slice | Schema move | Proof |
 |---|---|---|---|
 | 2026-06-02 | **Scaffolding + Cavalry** (`move_then_attack`) — the pending sub-turn machine, `TACTIC` verb, `DECLINE` slot, context one-hot | `N_VERBS` 30→31, `N_FACTORED_VERBS` 8→10, `GLOBAL_DIM` 174→177, `OBS_VERSION`→5 | `TACTIC@unit → move-dir (mandatory) → attack-dir (optional)`, coin paid once at initiation; optional attack ⇒ no softlock when no enemy adjacent |
-| 2026-06-28 | **SELECT primitive + Archer** (`ranged_attack` any@2) + restriction `can_normal_attack=False` | `N_VERBS` 31→32, `N_FACTORED_VERBS` 10→11, `PENDING_CTX_DIM` 3→4, `GLOBAL_DIM`→178, `OBS_VERSION`→6 | tactics renamed by **mechanic not unit** so they reuse (`ranged_attack` covers Archer any-target and Crossbowman straight-line); test suite reorganized phase-files → domain-files |
+| 2026-06-28 | **SELECT primitive + Archer** (`ranged_attack` any@2) + restriction `can_normal_attack=False` | `N_VERBS` 31→32, `N_FACTORED_VERBS` 10→11, `PENDING_CTX_DIM` 3→4, `GLOBAL_DIM`→178, `OBS_VERSION`→6 | tactics renamed by **mechanic not unit** so they reuse (`ranged_attack` covers Archer any-target and Crossbowman straight-line); test suite reorganized phase-named files → domain-named files |
 | 2026-06-28 | **Clusters 1–4** — the remaining movement/ranged tactics, grant-flavor SELECT (friendly → nested granted maneuver), and all passive/triggered attributes | → `PENDING_CTX_DIM=15`, `GLOBAL_DIM=189`, `N_VERBS=32`, `ACTION_SPACE_SIZE=1875`, `OBS_VERSION=8` | 400-game random-play stress across every drafted composition: zero crashes / softlocks / conservation violations |
 
 Per-unit mechanics (card text in `docs/UNITS.md`):
@@ -123,3 +123,26 @@ Per-unit mechanics (card text in `docs/UNITS.md`):
 | **Schema** | `N_VERBS` 31→32 (`SELECT`), `N_FACTORED_VERBS` 10→11, `PENDING_CTX_DIM`→15, `GLOBAL_DIM`→189, `ACTION_SPACE_SIZE`→1875, `OBS_VERSION` 5→8. Policy/Critic/buffer/trainer unchanged (head reads sizes from constants). |
 | **Documented simplifications** | A bonus/repeat maneuver (WP drawn coin, Berserker repeat, Footman-tactic maneuver) can't use the TACTIC verb to start a *named* tactic — caps nesting, not the count of maneuvers. Granted attacks/moves (Marshall/Ensign) **do** chain the granted unit's attribute (FAQ). Royal Guard auto-absorbs from supply when able. |
 | **Tests** | Test suite reorganized from phase-named files into domain files (`test_units`, `test_tactics`, `test_attributes`, `test_game_mechanics`, `test_action_space`, `test_bots`, `test_policy` + shared `_helpers`); 63 total. A 400-game random-play stress exercises all pending kinds with zero crashes/softlocks/conservation violations. |
+
+---
+
+## Threat/position-aware observation + deeper trunk (2026-07-02)
+
+*Source: `docs/IDEAS.md` "Architectural note — the agent can't see the board as
+one position". Schema-breaking (`OBS_VERSION` 8→9, `BOARD_CHANNELS` 38→46);
+prior saved models/pool snapshots retired.*
+
+Three complementary fixes for the same underlying limit — a radius-2
+receptive field, a location-blind global pool, and reach that isn't a fixed
+radius (a single coin can chain into several hits):
+
+| What changed | Detail |
+|---|---|
+| **Threat/reach planes** | 6 new board planes (`own_melee/ranged/charge`, `enemy_melee/ranged/charge`) give each cell a *graded* hit-count — how many hits a side could land there this turn — instead of asking the CNN to re-derive tactic geometry. Reuses the env's existing legal-move geometry (`_hex_distances`, `_reachable`, `_can_attack`-adjacent patterns) via new side-effect-free `_threat_*` helpers that (unlike the legal-action helpers) don't depend on `self.active_player`, since they run for both sides regardless of whose turn it is. |
+| **Berserker closed form** | `extra_maneuvers_from_stack` pays 1 stack coin per *extra* maneuver (the initiating hand coin is free); solving for hits landable at hex-distance `D` from a stack-`S` Berserker gives `hits(D) = max(0, S - D + 1)` — a stack-3 Berserker threatens distance 1/2/3 for 3/2/1 hits, not just its adjacent cells. Implemented in `_threat_berserker_reach` via one `_reachable` BFS plus a per-cell neighbor lookup. |
+| **Marshall grant-chaining** | A friendly unit within hex-distance 2 of a Marshall can be activated by the Marshall's coin instead of its own (`_threat_grids`'s single boolean activation gate, avoiding double-counting) — including triggering a granted Berserker's full chain, since the attribute fires on any attack regardless of which coin paid for it. Ensign's `grant_move`→Berserker-reposition combo is a documented gap (narrow reach gain, not worth the added complexity). |
+| **Coordinate planes** | `row_coord`/`col_coord`, static ego-centric position — `col_coord` is the flank axis (confirmed via `Board.default_bases`), the substrate for "which side is under threat" reasoning. |
+| **Split flank pooling** | `verb_head`/`facedown_head` read a two-way mean pool split along the flank axis (`_split_pool`) instead of a single location-blind global mean — doubles the pooled dim to `2*hidden_dim`. The spatial `policy_head` was untouched (never location-blind). |
+| **Deeper trunk** | A 3rd `HexConv2d` layer in both `Policy` and `Critic` → receptive-field radius 3, exactly covering the Lancer's charge. |
+| **Tests** | New `tests/test_threat_planes.py` (11 tests): Berserker formula (unblocked + path-blocked), Cavalry/Lancer charge geometry, Archer/Crossbowman ranged targeting, Marshall grant activation (plain unit + chained Berserker), and end-to-end `generate_observation` rotation/normalization wiring. Full suite: 86 passed. |
+| **First training run** | `ppo_20260702-082214` (400 batches, same hyperparameters and same `n_batches=400` as the correct pre-change baseline `ppo_20260701-191923`). Final `wandb` summaries are nearly identical (`score_main` matches to 3 decimals; WR/Elo/critic_mae/avg_turns all close), and comparing full eval-checkpoint distributions puts `wr_vs_greedy_eval`/`elo_policy` within ~0.3 pooled standard deviations — **no measurable difference**. Full numbers and what a real test would need: `docs/experiments.md` → "Threat/position-aware observation + deeper trunk (run: `ppo_20260702-082214`)". |

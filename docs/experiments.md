@@ -95,3 +95,41 @@ pressure**, not compute or stability. Full diagnosis and prioritized action poin
 the old 14-action head; recalibrate to the current max ≈ 1.84.)
 
 ![Full base game — long run W&B panels (ppo_20260630-060400)](assets/2026-07-01-full-game-implemented.png)
+
+---
+
+## 2026-07-02 — Threat/position-aware observation + deeper trunk (run: `ppo_20260702-082214`)
+
+*Design/implementation: `docs/history.md` → "Threat/position-aware observation + deeper trunk".*
+
+**Changes:** Implemented the `docs/IDEAS.md` "the agent can't see the board as one position" note in full: 6 graded threat/reach planes (`own`/`enemy` × `melee`/`ranged`/`charge`, with an exact Berserker closed-form and Marshall grant-chaining), 2 static ego-centric coordinate planes, a flank-split pool feeding `verb_head`/`facedown_head` in place of the old location-blind global mean, and a 3rd `HexConv2d` trunk layer (receptive field radius 2→3). `BOARD_CHANNELS` 38→46, `OBS_VERSION` 8→9 — schema-breaking, fresh run. Same hyperparameters and **same `n_batches=400`** as the correct pre-change baseline, run `ppo_20260701-191923` (`collect_episodes=64, ppo_epochs=4, gamma=0.99, lam=0.95, entropy_coeff=0.025→0.003, lr=3e-4, hidden_dim=64`) — a genuinely equal-length comparison.
+
+**Note on an earlier version of this entry:** the first two drafts compared against `ppo_20260630-060400` (`n_batches=1000`, manually interrupted at batch 711) — the wrong run, with unequal length, that happened to be the most recently-documented baseline in this file. The correct comparison is against `ppo_20260701-191923` (wandb `f3oyn0sb`), the run actually shown alongside this one in the panel image below, which used the identical `n_batches=400` schedule. All numbers below use the correct run.
+
+**Results — headline: no measurable difference.** The W&B panel image overlays both runs: **orange = this new run (`ppo_20260702-082214`)**, **magenta = the correct baseline (`ppo_20260701-191923`)**. The two final `wandb` summaries:
+
+| Metric | Baseline (`f3oyn0sb`) | This run (`u62wwlnc`) |
+|---|---|---|
+| `wr_vs_greedy_train` | 0.880 | 0.890 |
+| `wr_vs_greedy_eval` | 0.700 | 0.800 |
+| `elo_policy` | 1433 | 1457 |
+| `entropy` (raw) | 0.632 | 0.508 |
+| `entropy_frac` | 0.256 | 0.195 |
+| `critic_mae` | 0.341 | 0.312 |
+| `avg_turns` | 72.8 | 60.7 |
+| `score_main` | 0.708 | 0.708 |
+
+`score_main` is identical to three decimal places; `critic_mae` and `avg_turns` are in the same range either way. Comparing the full **distribution** of the two metrics with the widest apparent gap, over each run's eval checkpoints from batch 200 on (not just the two final numbers):
+
+| Metric | New run: mean ± std (n=21) | Baseline: mean ± std (n=18) | Gap in pooled std |
+|---|---|---|---|
+| `wr_vs_greedy_eval` | 0.783 ± 0.143 | 0.747 ± 0.092 | **0.31σ** — noise |
+| `elo_policy` | 1410 ± 62 | 1396 ± 37 | **0.29σ** — noise |
+
+A ~0.3 pooled-std gap, from a single run per architecture, is indistinguishable from noise. **These two runs play about the same.** This matches what the panel image shows directly — the two curves track each other closely across every panel, not just on average. Retracting both earlier drafts' framings in full: neither "every number favors the new run" nor even the more hedged "weak, and n=1" reading survive comparison against the correct baseline — the previous drafts' entire premise (that there was a gap worth explaining away) was built on the wrong reference run.
+
+**Attribution caveat.** Moot given no measurable effect either way, but worth remembering if a future run does show one: three sub-changes (threat/reach planes, coordinate planes + split pooling, deeper trunk) shipped together in one pass rather than being A/B'd separately as the originating note suggested, so a future confirmed gain still couldn't be attributed to a specific piece without an ablation.
+
+**Implication.** This run provides no evidence the architecture change helped or hurt. The entropy/critic numbers hint the new network isn't obviously worse, but nothing here clears the noise bar. To actually test the hypothesis: 2–3 seeds per architecture, same `n_batches`, comparing distributions (as above) rather than single runs or endpoints.
+
+![Threat/position-aware observation vs. correct baseline — W&B comparison panels, orange=ppo_20260702-082214 (new) vs magenta=ppo_20260701-191923 (baseline, same n_batches=400)](assets/2026-07-02-spacial-awareness.png)

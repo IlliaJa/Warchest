@@ -147,9 +147,36 @@ VERB_OF_ACTION = np.array([verb_of_action(a) for a in range(ACTION_SPACE_SIZE)],
 # Board planes: 6 terrain/base/exploration + one stack-valued plane per unit type
 # per side (own then opp). Only the ~4 drafted types per side are ever nonzero.
 N_BASE_PLANES = 6
-BOARD_CHANNELS = N_BASE_PLANES + 2 * NUM_UNIT_TYPES  # 6 + 32 = 38
 OWN_UNIT_PLANE_BASE = N_BASE_PLANES               # 6
 OPP_UNIT_PLANE_BASE = N_BASE_PLANES + NUM_UNIT_TYPES  # 22
+
+# Threat planes (C16/architectural note in docs/IDEAS.md): graded hit-count a
+# side could land on each cell *this turn*, split by delivery mechanism so the
+# CNN doesn't have to re-derive tactic geometry from raw unit-type identity.
+#   melee  — adjacent (hex-distance 1) attacks, incl. Marshall-granted ones
+#            and the Berserker chain's distance-1 contribution
+#   ranged — Archer/Crossbowman's ranged_attack tactic (no movement)
+#   charge — a move-then-strike mechanic landing at hex-distance >= 2
+#            (Lancer's line_charge, Cavalry's move_then_attack, and the
+#            Berserker chain's distance->=2 contribution)
+# See WarChestEnv._threat_contributions / _threat_grids for the derivation.
+THREAT_KINDS = ('melee', 'ranged', 'charge')
+N_THREAT_KINDS = len(THREAT_KINDS)
+N_THREAT_PLANES = 2 * N_THREAT_KINDS  # own_* + enemy_* per kind = 6
+OWN_THREAT_PLANE_BASE = OPP_UNIT_PLANE_BASE + NUM_UNIT_TYPES     # 38
+ENEMY_THREAT_PLANE_BASE = OWN_THREAT_PLANE_BASE + N_THREAT_KINDS  # 41
+THREAT_NORM = MAX_TOTAL  # 5 — same normaliser as unit stacks; clipped to 1.0
+
+# Coordinate planes: ego-centric row/col index, static (no per-step compute).
+# Board geometry (Board.default_bases) confirms `q` (column) is the flank axis
+# — P1's bases sit at low q, P2's at high q — so col_coord is what lets the
+# pooled/verb-level features distinguish "which side" a threat is on.
+N_COORD_PLANES = 2
+COORD_PLANE_BASE = ENEMY_THREAT_PLANE_BASE + N_THREAT_KINDS  # 44
+ROW_COORD_PLANE = COORD_PLANE_BASE       # 44
+COL_COORD_PLANE = COORD_PLANE_BASE + 1   # 45
+
+BOARD_CHANNELS = COORD_PLANE_BASE + N_COORD_PLANES  # 6 + 32 + 6 + 2 = 46
 
 # Unit coin types (deployable); the royal coin has no board unit.
 UNIT_COINS = UNIT_IDS
@@ -190,7 +217,7 @@ PENDING_KINDS = (
 PENDING_CTX_DIM = 1 + len(PENDING_KINDS)  # 15
 PENDING_KIND_IDX = {k: i for i, k in enumerate(PENDING_KINDS)}
 GLOBAL_DIM = 7 * N_COIN_TYPES + 3 * NUM_UNIT_TYPES + 7 + PENDING_CTX_DIM  # 189
-OBS_VERSION = 8
+OBS_VERSION = 9  # bumped for threat + coordinate board planes (BOARD_CHANNELS 38 -> 46)
 
 # Privileged critic-only features: the opponent's true hidden split, per coin (C).
 #   [0:C] opp hand   [C:2C] opp bag   [2C:3C] opp face-down discard
@@ -642,6 +669,9 @@ class WarChestEnv(gym.Env):
                 r, q = s - r, s - q
             owner_base = OWN_UNIT_PLANE_BASE if u.player_id == active else OPP_UNIT_PLANE_BASE
             board_enc[owner_base + (u.id - 1), r, q] = u.stack / STACK_NORM
+        # Coordinate planes: static, ego-centric row/col index (see COORD_PLANE_BASE).
+        board_enc[ROW_COORD_PLANE] = _ROW_COORD_ROT if active == 2 else _ROW_COORD_RAW
+        board_enc[COL_COORD_PLANE] = _COL_COORD_ROT if active == 2 else _COL_COORD_RAW
         # Global features [GLOBAL_DIM] — ego-centric coin-counting (OBS_VERSION 4).
         my_bases = len(self.board.get_controlled_bases(active))
         opp_bases = len(self.board.get_controlled_bases(opponent))
@@ -667,6 +697,23 @@ class WarChestEnv(gym.Env):
 
         own_owned = in_play(active)
         opp_owned = in_play(opponent)
+
+        # Threat planes: opponent coin-availability is bounded (hand+bag+facedown
+        # discard, unknown split) since only the aggregate is observable; own
+        # availability is exact (own_hand, above). See _threat_grids.
+        opp_hidden = Counter({
+            c: opp_owned[c] - opp_on_board[c] - opp_faceup[c] - opp_supply[c] for c in UNIT_IDS
+        })
+        threat_grids = self._threat_grids(active, own_hand, opp_hidden)
+        for i, kind in enumerate(THREAT_KINDS):
+            own_grid = threat_grids[(active, kind)]
+            enemy_grid = threat_grids[(opponent, kind)]
+            if active == 2:
+                own_grid = np.rot90(own_grid, 2)
+                enemy_grid = np.rot90(enemy_grid, 2)
+            board_enc[OWN_THREAT_PLANE_BASE + i] = np.clip(own_grid / THREAT_NORM, 0.0, 1.0)
+            board_enc[ENEMY_THREAT_PLANE_BASE + i] = np.clip(enemy_grid / THREAT_NORM, 0.0, 1.0)
+
         # Convert all counters to dense numpy vectors; remaining ops are vectorised.
         hand_v    = _counter_to_deck_vec(own_hand)
         bag_v     = _counter_to_deck_vec(own_bag)
@@ -1402,6 +1449,162 @@ class WarChestEnv(gym.Env):
         for the Royal Guard (whose tactic is the Royal coin's only face-up use)."""
         return ROYAL_ID if UNIT_BY_ID[unit.id].tactic == 'royal_move' else unit.id
 
+    # ------------------------------------------------------------------
+    # Threat map (observation-only). Graded "hits this cell could take this
+    # turn" planes — see docs/IDEAS.md "the agent can't see the board as one
+    # position" for the motivation. These helpers are side-effect-free and,
+    # unlike the legal-action targeting helpers above, must NOT read
+    # `self.active_player`: they are evaluated for units on both sides
+    # regardless of whose turn it actually is. `_ranged_targets`,
+    # `_line_charge_targets`, `_hex_distances`, `_reachable`, `_can_attack`
+    # are player-agnostic and safe to mirror; `_grant_attack_targets` /
+    # `_grant_move_targets` bake in `self.active_player` and are not reused
+    # here. Target-cell validity also can't reuse `_can_attack` (it requires
+    # a live enemy and returns False for empty cells) — a threat map must
+    # answer "would a unit standing here get hit", independent of whether
+    # anyone is standing there right now.
+    # ------------------------------------------------------------------
+
+    def _is_valid_cell(self, cell) -> bool:
+        r, q = cell
+        return (0 <= r < BOARD_DIM and 0 <= q < BOARD_DIM
+                and self.board.board[r, q] != INVALID_CELL_ID)
+
+    def _threat_ranged_cells(self, loc, distance, straight_line):
+        """Cells a ranged_attack tactic from `loc` could hit (validity, not legality)."""
+        targets = []
+        if straight_line:
+            r, q = loc
+            for dr, dq in self.board.offsets:
+                blocked = any(
+                    self.board.get_unit_at(r + dr * step, q + dq * step) is not None
+                    for step in range(1, distance)
+                )
+                if blocked:
+                    continue
+                far = (r + dr * distance, q + dq * distance)
+                if self._is_valid_cell(far):
+                    targets.append(far)
+        else:
+            for cell, d in self._hex_distances(loc, distance).items():
+                if d == distance:
+                    targets.append(cell)
+        return targets
+
+    def _threat_charge_cells(self, loc, max_dist):
+        """Lancer: cells reachable by charging 1..max_dist through empty cells in a
+        straight hex line, then striking immediately beyond."""
+        out = []
+        for dr, dq in self.board.offsets:
+            for k in range(1, max_dist + 1):
+                path = [(loc[0] + dr * s, loc[1] + dq * s) for s in range(1, k + 1)]
+                if not all(self._is_empty_cell(c) for c in path):
+                    break  # blocked; no farther charge in this direction
+                enemy_cell = (loc[0] + dr * (k + 1), loc[1] + dq * (k + 1))
+                if self._is_valid_cell(enemy_cell):
+                    out.append(enemy_cell)
+        return out
+
+    def _threat_cavalry_cells(self, loc):
+        """Cavalry: move exactly 1 step in any direction, then a normal adjacent
+        attack from the new cell — unlike the Lancer's charge, the follow-up attack
+        is not constrained to continue in the move's direction."""
+        out = []
+        for cell in self.board.get_free_adjacent_cells(*loc):
+            out.extend(self.board.get_adjacent_cells(*cell))
+        return out
+
+    def _threat_berserker_reach(self, unit):
+        """{cell: hits} a Berserker of `unit.stack` could land this turn.
+
+        Each *extra* maneuver (move/attack/control) costs 1 stack coin, checked
+        and paid before the maneuver (see the 'extra_maneuver' pending handling);
+        the initial hand-coin activation is free. Chaining continues while
+        stack >= 2. Spending the minimum moves needed to close to hex-distance D
+        then converting all remaining chain capacity into attacks gives a closed
+        form: hits(D) = max(0, stack - D + 1) for 1 <= D <= stack.
+        """
+        stack = unit.stack
+        reach = dict(self._reachable(unit.loc, stack - 1))
+        reach[unit.loc] = 0
+        out = {}
+        for cell in self.board.all_cells_list:
+            if cell == unit.loc:
+                continue
+            neighbor_dists = [reach[a] for a in self.board.get_adjacent_cells(*cell) if a in reach]
+            if not neighbor_dists:
+                continue
+            d = 1 + min(neighbor_dists)
+            if d <= stack:
+                out[cell] = stack - d + 1
+        return out
+
+    def _threat_contributions(self, unit):
+        """[(cell, kind, hits), ...] this unit could produce with a single
+        enabling coin this turn. kind is one of THREAT_KINDS."""
+        info = UNIT_BY_ID[unit.id]
+        origin = unit.loc
+        out = []
+        if info.tactic == 'ranged_attack':
+            p = info.tactic_params
+            out += [(c, 'ranged', 1)
+                    for c in self._threat_ranged_cells(origin, p['distance'], p['straight_line'])]
+            return out  # Archer/Crossbowman: can_normal_attack=False
+        if info.tactic == 'line_charge':
+            out += [(c, 'charge', 1)
+                    for c in self._threat_charge_cells(origin, info.tactic_params['max_dist'])]
+            return out  # Lancer: can_normal_attack=False
+        if info.tactic == 'move_then_attack':
+            out += [(c, 'charge', 1) for c in self._threat_cavalry_cells(origin)]
+            # falls through: Cavalry also keeps its normal adjacent attack option
+        if info.extra_maneuvers_from_stack:
+            for cell, hits in self._threat_berserker_reach(unit).items():
+                is_adjacent = cell in self.board.get_adjacent_cells(*origin)
+                out.append((cell, 'melee' if is_adjacent else 'charge', hits))
+            return out  # Berserker formula already covers its D=1 (melee) case
+        if info.can_normal_attack:
+            out += [(c, 'melee', 1) for c in self.board.get_adjacent_cells(*origin)]
+        return out
+
+    def _threat_grids(self, active, own_hand, opp_hidden):
+        """{(player_id, kind): np.ndarray[BOARD_DIM,BOARD_DIM]} raw hit-count grids,
+        in ABSOLUTE board coordinates (not yet ego-rotated for player 2).
+
+        Computed for BOTH physical players regardless of whose turn it is.
+        `own_hand`/`opp_hidden` give exact vs. bounded coin-availability for
+        whichever side is `active` vs. its opponent (see generate_observation).
+
+        Known simplification: Ensign's grant_move can reposition a friendly
+        Berserker before its chain would be evaluated (extending its reach by
+        up to 1 hex in a narrow set of directions); not modeled here — the
+        added complexity isn't justified by that marginal reach gain.
+        """
+        opponent = 3 - active
+
+        def coin_gate(side, coin_id):
+            return (own_hand[coin_id] >= 1) if side == active else (opp_hidden[coin_id] >= 1)
+
+        grids = {(side, kind): np.zeros((BOARD_DIM, BOARD_DIM), dtype=np.float32)
+                 for side in (1, 2) for kind in THREAT_KINDS}
+
+        for side in (1, 2):
+            marshalls = [u for u in self.board.units if u.player_id == side
+                         and UNIT_BY_ID[u.id].tactic == 'grant_attack']
+            for u in self.board.units:
+                if u.player_id != side:
+                    continue
+                info = UNIT_BY_ID[u.id]
+                own_ok = coin_gate(side, u.id)
+                grant_ok = bool(marshalls) and info.can_normal_attack and any(
+                    coin_gate(side, m.id) and self._hex_distances(m.loc, 2).get(u.loc, 0) > 0
+                    for m in marshalls
+                )
+                if not (own_ok or grant_ok):
+                    continue
+                for cell, kind, hits in self._threat_contributions(u):
+                    grids[(side, kind)][cell] += hits
+        return grids
+
     def _continuation_actions(self):
         """Legal continuation ids for the current pending sub-turn (absolute frame)."""
         p = self.state.pending
@@ -1786,6 +1989,17 @@ class WarChestEnv(gym.Env):
 # Shape (ACTION_SPACE_SIZE,); face-down actions are identity, spatial actions are
 # rotated 180°. Built once at import time (~400 µs), reused every observation call.
 _REMAP_TABLE = np.array([WarChestEnv.remap_action(a) for a in range(ACTION_SPACE_SIZE)], dtype=np.int64)
+
+# Coordinate planes (row_coord, col_coord): static per-cell values, so both the
+# raw and P2-rotated variants are built once at import time. Rotating a raw
+# index grid 180° automatically yields the correctly-flipped ego-centric values
+# (cell (r,q) of the rotated array holds the raw value at (s-r, s-q)), the same
+# trick already used for raw_board/expl in generate_observation.
+_COORD_NORM = BOARD_DIM - 1  # 6
+_ROW_COORD_RAW = (np.arange(BOARD_DIM, dtype=np.float32)[:, None] / _COORD_NORM).repeat(BOARD_DIM, axis=1)
+_COL_COORD_RAW = (np.arange(BOARD_DIM, dtype=np.float32)[None, :] / _COORD_NORM).repeat(BOARD_DIM, axis=0)
+_ROW_COORD_ROT = np.rot90(_ROW_COORD_RAW, 2).copy()
+_COL_COORD_ROT = np.rot90(_COL_COORD_RAW, 2).copy()
 
 # ---------------------------------------------------------------------------
 # Vectorised obs_global helpers.

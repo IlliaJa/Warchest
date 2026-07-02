@@ -6,9 +6,9 @@
 
 ### Board encoder (CNN)
 
-The raw board `[7,7]` is first expanded into 6 channels by `encode_board()`:
+The board is encoded into `BOARD_CHANNELS` (46) planes by `generate_observation()` in `warchest_env.py` (not by the policy — the policy consumes the pre-encoded tensor directly):
 
-| Channel | Content |
+| Planes | Content |
 |---|---|
 | 0 | Invalid cells |
 | 1 | Empty cells |
@@ -16,49 +16,37 @@ The raw board `[7,7]` is first expanded into 6 channels by `encode_board()`:
 | 3 | Active player's own bases |
 | 4 | Opponent's bases |
 | 5 | Exploration map (normalised visit counts, from active player's perspective) |
+| 6–21 | Own unit-type stack planes (index = unit id − 1; stack height / `STACK_NORM`) |
+| 22–37 | Opponent unit-type stack planes (same indexing) |
+| 38–40 | Own threat: melee, ranged, charge — graded hit-count this side could land on each cell *this turn*, clipped to 1.0 |
+| 41–43 | Enemy threat: melee, ranged, charge |
+| 44 | `row_coord` — static ego-centric row index / 6 |
+| 45 | `col_coord` — static ego-centric column index / 6 (the flank axis — see `docs/IDEAS.md` "the agent can't see the board as one position") |
 
-Channels 3 and 4 are always ego-centric (own vs opponent) regardless of which player is active. Two conv layers process the `[6,7,7]` input:
-
-```
-Conv2d(6→32, kernel=3, padding=1) + ReLU
-Conv2d(32→64, kernel=3, padding=1) + ReLU
-Flatten → Linear(64*7*7 → hidden_dim)
-```
-
-### Unit encoder (MLP)
-
-Unit positions are shaped `[2, 2, 2]` (2 player slots × 2 units × (row, col)). Each unit's 2D position is encoded independently:
+Planes 3/4, 6–37, 38–43 are all ego-centric (own vs opponent) regardless of which player is active; the P2 view rotates the whole board 180° so "own"/"forward" always mean the same thing. Three `HexConv2d` layers (3×3 hex-masked kernel, so the two non-hex-adjacent corners are always zero) process the `[BOARD_CHANNELS,7,7]` input — receptive-field radius 3, exactly covering the Lancer's distance-3 charge:
 
 ```
-Linear(2 → 16) + ReLU
-Linear(16 → 32)
+HexConv2d(BOARD_CHANNELS→32) + ReLU
+HexConv2d(32→hidden_dim) + ReLU
+HexConv2d(hidden_dim→hidden_dim) + ReLU
 ```
-
-The two units per player slot are averaged, then the two player slots are concatenated, giving a 64-dimensional unit feature vector.
 
 ### Global features
 
-`global[3]` is passed directly:
-- `turn // 2` (half-turn counter)
-- Active player's base count
-- Opponent's base count
+`global[GLOBAL_DIM]` (189) carries round/base/initiative counters and ego-centric coin-counting per type (own hand/bag/discard/supply/owned exactly; opponent's on-board/faceup/supply/owned exactly, with a bounded `hidden` pool standing in for what can't be observed) plus the pending-tactic-continuation one-hot — see the constant block above `GLOBAL_DIM` in `warchest_env.py` for the exact layout.
 
 ## Feature fusion and heads
 
-All encoded features are concatenated: `[hidden_dim + 3 + 64]`.
+The spatial `policy_head` (1×1 conv → per-cell verb logits) reads the full `[hidden_dim,7,7]` feature map directly, so it was never location-blind. The `verb_head`/`facedown_head` previously read a single global mean pool, which *is* location-blind — it can tell a threat exists somewhere but not which flank. They now read `_split_pool(feat)`: a two-way mean pool along the flank (column) axis, columns 0–3 and 3–6 (column 3, the board's true center, deliberately shared by both halves), concatenated to `[2*hidden_dim]`.
 
-**Actor head** — outputs action logits:
-```
-Linear(fused → hidden_dim*2) + ReLU
-Linear(hidden_dim*2 → hidden_dim) + ReLU
-Linear(hidden_dim → action_space)
-```
-Invalid actions are masked with −1e9 before softmax.
+**Actor** — `policy_head`: `Conv2d(hidden_dim + GLOBAL_DIM → N_VERBS, kernel=1)` for the spatial/within-verb logits; `facedown_head`/`verb_head`: `Linear(2*hidden_dim + GLOBAL_DIM → ...)` on the split-pooled features. Invalid actions are masked with −1e9 before softmax.
 
-**Critic (separate network)** — same board and unit encoders, then:
+**Critic (separate network)** — same 3-layer board encoder and split pool, concatenated with global features, a 3-d opponent one-hot, and a privileged (critic-only) hidden-coin vector, then:
 ```
-Linear(hidden_dim + 3 + 64 → hidden_dim) + ReLU
-Linear(hidden_dim → 1)
+Linear(2*hidden_dim + GLOBAL_DIM + OPP_DIM + PRIV_DIM → hidden_dim) + ReLU
+Linear(hidden_dim → hidden_dim) + ReLU
+Linear(hidden_dim → hidden_dim // 2) + ReLU
+Linear(hidden_dim // 2 → 1)
 ```
 
 ## Key methods
@@ -68,15 +56,17 @@ Linear(hidden_dim → 1)
 | Method | Returns | Notes |
 |---|---|---|
 | `act(obs)` | `(action, log_prob, entropy)` | Sample from policy; used during rollout |
+| `act_with_encoded(obs)` | `(action, log_prob, entropy, feat)` | Also returns encoded board features, so `Critic.value_from_features` can reuse them and skip a second board-encoder pass |
 | `evaluate_actions_batch(batch)` | `(log_probs, entropies)` | Batched re-evaluation; used in PPO update |
-| `encode_board(board, exploration_map, active_player)` | `[6,7,7]` array | Static encoding, single observation |
-| `encode_board_batch(boards, maps, players)` | `[N,6,7,7]` array | Vectorised encoding for a full batch |
+
+Board/global encoding itself happens in `generate_observation()` (env), not in `Policy` — there is no separate `encode_board` step on the policy side.
 
 ### Critic
 
 | Method | Returns | Notes |
 |---|---|---|
-| `value_single(obs)` | scalar tensor | Used during rollout collection |
+| `value_single(obs, opp_onehot, privileged)` | scalar tensor | Used during rollout collection |
+| `value_from_features(feat, ...)` | scalar tensor | Reuses `Policy.act_with_encoded`'s board features, skipping the critic's own board encoder |
 | `value_batch(batch)` | `[N]` tensor | Used during PPO update |
 
 ## Hyperparameters (defaults in `src/app/ppo.py`)
