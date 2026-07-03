@@ -93,8 +93,8 @@ actions per turn average **7.8** (median 6, p10 3, p90 16). The mean per-state m
 version. Read entropy *relative to 1.84*:
 
 - ~1.84 → uniform-random over legal moves (no policy);
-- ~1.3 → still ~70 % of max; the policy is barely committing (see
-  `docs/analysis_ppo_20260630.md`);
+- ~1.3 → still ~70 % of max; the policy is barely committing (as seen on the
+  `ppo_20260630-060400` plateau — see `docs/history.md`);
 - ~0.7–0.9 (≈40–50 % of max) → a healthily decisive policy for this game.
 
 **Trend:** should start near 1.84 and decrease as the policy becomes decisive. The entropy
@@ -110,14 +110,16 @@ against). A collapse to near 0 *early* still means premature convergence.
 - `entropy_frac` = `entropy / max_entropy` — the decisive-ness ratio. 1.0 = random, target
   ~0.4–0.5 by end of run. This is the number to watch instead of raw entropy.
 
-### `score_attack` / `score_shaping` / `score_holding` / `score_terminal` / `score_other`
+### `score_attack` / `score_shaping` / `score_holding` / `score_material` / `score_terminal` / `score_other`
 
 **What it measures:** the per-episode-mean decomposition of `score` into its reward sources
-(attack rewards, potential shaping `γφ′−φ`, the non-potential holding reward, terminal
-win/loss/truncation, and everything else — move penalties etc.). The five sum to `score`.
+(attack rewards, base-diff potential shaping `γφ′−φ`, the annealed holding reward, the annealed
+material-PBRS term, terminal win/loss/truncation, and everything else — move penalties etc.).
+The six sum to `score`.
 
-**Why it matters:** catches **proxy/objective decoupling** — the failure mode in
-`docs/analysis_ppo_20260630.md` where `score` rose +50 % while win rate stayed flat. If
+**Why it matters:** catches **proxy/objective decoupling** — the failure mode on the
+`ppo_20260630-060400` run (see `docs/history.md`) where `score` rose +50 % while win rate
+stayed flat. If
 `score_attack`/`score_shaping` climb while `score_terminal` (≈ wins) is flat, the policy is
 farming dense reward instead of learning to win. `score_terminal` should be the component that
 rises over training; watch `score_holding` for stalling (persistently positive + rising

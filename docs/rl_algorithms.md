@@ -4,7 +4,9 @@ Reference for RL algorithm choices in Warchest. Current trainer: **PPO** (`src/a
 
 ---
 
-## Current: REINFORCE + GAE
+## Legacy: REINFORCE + GAE
+
+*(Superseded by PPO below — kept as the GAE reference and comparison baseline; `src/app/reinforce.py` is retained but is not the primary trainer.)*
 
 **Generalized Advantage Estimation** is not an algorithm on its own — it is a variance-reduction technique for computing the advantage signal used in the policy gradient update.
 
@@ -81,7 +83,9 @@ You could in principle share `board_encoder + unit_encoder` and fork only at the
 
 ### 2. Different learning rates and gradient scales
 
-`lr_actor=1e-4`, `lr_critic=3e-4` (3× ratio). A single optimiser over a shared trunk can only honour one LR for those weights — parameter groups can patch this, but the trunk has to pick one. The historic gradient magnitudes you observed (critic 10–100× actor, pre-clip) tell you what would happen at any single trunk LR: the trunk would be driven almost entirely by critic signal, with actor gradients washed out. The framing of "shared trunk as auxiliary value-prediction task" assumes the two gradients are comparable in scale; when they aren't, the smaller signal effectively trains zero.
+`lr_actor=1e-4`, `lr_critic=3e-4` (3× ratio) at the time of this decision — both are `3e-4` in
+the current `ppo.py` hyperparameters, but the *argument* (separate optimisers can honour
+different LRs; a shared trunk could not) is unaffected by the specific values. A single optimiser over a shared trunk can only honour one LR for those weights — parameter groups can patch this, but the trunk has to pick one. The historic gradient magnitudes you observed (critic 10–100× actor, pre-clip) tell you what would happen at any single trunk LR: the trunk would be driven almost entirely by critic signal, with actor gradients washed out. The framing of "shared trunk as auxiliary value-prediction task" assumes the two gradients are comparable in scale; when they aren't, the smaller signal effectively trains zero.
 
 The recent flip (actor ≈ 5× critic post-changes) is consistent with the entropy bonus growing into the actor loss (`ENTROPY_COEFF=0.025`, raised from 0.005) and the critic loss tightening (value-loss clipping + return normalisation). Both gradients are clipped to norm 1.0 per `clip_grad_norm_` before stepping, so the downstream optimiser sees the same effective scale either way. The pre-clip ratio is informative about which head currently carries the richer signal — it is not a measure of which head is "winning" a shared trunk, because there is no shared trunk to win.
 

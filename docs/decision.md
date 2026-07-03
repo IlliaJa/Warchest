@@ -107,8 +107,8 @@ class lever.** If `V` is under-capacity or poorly bootstrapped, the terminal
 reward propagates badly and one is *tempted* to paper over it with hand-crafted
 shaping. Strengthening the critic (`hidden_dim`, smoother/lower-variance value
 targets, GAE-λ tuning) is the principled alternative to adding reward terms, and
-it's why the critic-strengthening step (`rewards_improvements.md` Step 5;
-implemented 2026-07-03 as a critic-only widening) is not cosmetic. This is the same reason
+it's why the critic-strengthening step (implemented 2026-07-03 as a critic-only
+widening, `critic_hidden_dim=128` — see `docs/rewards.md`) is not cosmetic. This is the same reason
 TD-Gammon (self-play, no search, TD(λ)) learned expert backgammon from a purely
 terminal reward: eligibility traces + a value net did the densifying.
 
@@ -120,8 +120,8 @@ terminal reward: eligibility traces + a value net did the densifying.
 - **It also used a *small* material shaping reward**, not a purely terminal one:
   per secondary write-ups (deeplearning.ai) it received a small reward for
   capturing an opponent piece and a larger reward for winning. This *supports*
-  Warchest's material-PBRS direction (`rewards.md` §9): even the RL flagship
-  propped the rare terminal signal with a small material term.
+  Warchest's material-PBRS direction (`docs/rewards.md` § *Material potential-based
+  shaping*): even the RL flagship propped the rare terminal signal with a small material term.
 - **No search at play time.** Unlike AlphaZero, DeepNash uses no MCTS at all —
   expert play is compiled entirely into the network weights during training, so
   every bit of credit assignment happens at train time via value + policy
@@ -142,8 +142,8 @@ terminal reward: eligibility traces + a value net did the densifying.
   stack. So the plateau is not "reward too sparse in principle."
 - Therefore the reward-side work is *targeted* (fix the non-PBRS `holding_reward`
   distortion; add material PBRS on the dark coin/economy axis — see
-  `rewards_improvements.md`), **not** "add generic dense reward," and the
-  highest-leverage non-reward lever is **critic capacity/quality** (Step 5).
+  `docs/rewards.md`), **not** "add generic dense reward," and the
+  highest-leverage non-reward lever is **critic capacity/quality**.
 - Warchest is compute-limited relative to DeepNash, which is exactly why modest
   explicit shaping is more justified here than the AlphaZero/DeepNash "terminal-
   first" precedent alone would suggest — but it stays *targeted and policy-
@@ -153,7 +153,7 @@ terminal reward: eligibility traces + a value net did the densifying.
 [DeepMind blog](https://deepmind.google/blog/mastering-stratego-the-classic-game-of-imperfect-information/),
 [deeplearning.ai summary](https://www.deeplearning.ai/the-batch/deepnash-the-rl-system-that-plays-stratego-like-a-master/).
 TD-Gammon: [Tesauro 1995](https://www.csd.uwo.ca/~xling/cs346a/extra/tdgammon.pdf).
-Full comparative analysis: `docs/rewards_improvements.md`.
+Full comparative analysis: `docs/rewards.md` § *What is discussed*.
 
 ---
 

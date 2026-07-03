@@ -21,7 +21,7 @@ The board is encoded into `BOARD_CHANNELS` (46) planes by `generate_observation(
 | 38–40 | Own threat: melee, ranged, charge — graded hit-count this side could land on each cell *this turn*, clipped to 1.0 |
 | 41–43 | Enemy threat: melee, ranged, charge |
 | 44 | `row_coord` — static ego-centric row index / 6 |
-| 45 | `col_coord` — static ego-centric column index / 6 (the flank axis — see `docs/IDEAS.md` "the agent can't see the board as one position") |
+| 45 | `col_coord` — static ego-centric column index / 6 (the flank axis — see `docs/history.md` → "Threat/position-aware observation + deeper trunk") |
 
 Planes 3/4, 6–37, 38–43 are all ego-centric (own vs opponent) regardless of which player is active; the P2 view rotates the whole board 180° so "own"/"forward" always mean the same thing. Three `HexConv2d` layers (3×3 hex-masked kernel, so the two non-hex-adjacent corners are always zero) process the `[BOARD_CHANNELS,7,7]` input — receptive-field radius 3, exactly covering the Lancer's distance-3 charge:
 
@@ -73,9 +73,10 @@ Board/global encoding itself happens in `generate_observation()` (env), not in `
 
 | Parameter | Default |
 |---|---|
-| `hidden_dim` | 64 |
-| `action_space` | 14 |
-| Actor LR | 3e-4 (Adam) |
-| Critic LR | 3e-4 (Adam) |
-| `ENTROPY_COEFF` | 0.001 |
+| `hidden_dim` (Policy) | 64 |
+| `critic_hidden_dim` (Critic) | 128 — widened alone first; see `docs/decision.md`, 2026-07-03 |
+| `action_space` (`ACTION_SPACE_SIZE`) | 1875 |
+| Actor LR | 3e-4 (Adam), linearly decayed to `lr_final_frac * init` over the run |
+| Critic LR | 3e-4 (Adam), same decay schedule |
+| `entropy_coeff` | 0.025, linearly annealed to `entropy_coeff_final = 0.003` over the run |
 | Gradient clip max_norm | 1.0 (applied separately to actor-side and critic parameters) |

@@ -90,9 +90,10 @@ oscillates for ~10 h with no real gain**. Reading the panels (see image):
 
 **Takeaway.** The full game is learnable end-to-end and the agent reaches ~70% vs true greedy,
 but the last ~580 batches (~10 h) bought nothing. Root cause is **reward design + exploration
-pressure**, not compute or stability. Full diagnosis and prioritized action points:
-`docs/analysis_ppo_20260630.md`. (Also: `docs/METRICS.md`'s entropy band is stale — written for
-the old 14-action head; recalibrate to the current max ≈ 1.84.)
+pressure**, not compute or stability. This diagnosis drove the entropy/LR annealing, sparser
+pool snapshots, `ATTACK_REWARD` cut, critic widening, and material-PBRS fixes recorded in
+`docs/history.md`. (`docs/METRICS.md`'s entropy band has since been recalibrated to the
+current max ≈ 1.84.)
 
 ![Full base game — long run W&B panels (ppo_20260630-060400)](assets/2026-07-01-full-game-implemented.png)
 

@@ -146,3 +146,34 @@ radius (a single coin can chain into several hits):
 | **Deeper trunk** | A 3rd `HexConv2d` layer in both `Policy` and `Critic` → receptive-field radius 3, exactly covering the Lancer's charge. |
 | **Tests** | New `tests/test_threat_planes.py` (11 tests): Berserker formula (unblocked + path-blocked), Cavalry/Lancer charge geometry, Archer/Crossbowman ranged targeting, Marshall grant activation (plain unit + chained Berserker), and end-to-end `generate_observation` rotation/normalization wiring. Full suite: 86 passed. |
 | **First training run** | `ppo_20260702-082214` (400 batches, same hyperparameters and same `n_batches=400` as the correct pre-change baseline `ppo_20260701-191923`). Final `wandb` summaries are nearly identical (`score_main` matches to 3 decimals; WR/Elo/critic_mae/avg_turns all close), and comparing full eval-checkpoint distributions puts `wr_vs_greedy_eval`/`elo_policy` within ~0.3 pooled standard deviations — **no measurable difference**. Full numbers and what a real test would need: `docs/experiments.md` → "Threat/position-aware observation + deeper trunk (run: `ppo_20260702-082214`)". |
+
+---
+
+## PPO tuning: attack-reward cut, entropy/LR anneal, sparser pool snapshots (2026-07-01)
+
+*Source: the diagnosis of the `ppo_20260630-060400` plateau (score/WR decoupling, flat entropy, self-play treadmill) — action points P0–P3.*
+
+| What changed | Detail |
+|---|---|
+| **`ATTACK_REWARD` cut 0.1 → 0.02** (P0, partial) | A raw per-attack bonus of 0.1 let a game's worth of attacks rival a full win (+1.0), the leading suspect for the measured score/WR decoupling. `CLAIM_BASE_REWARD` stayed at 0.0 (the circular-claim exploit risk) and `holding_reward` was kept, not dropped — see the annealing fix below and 2026-07-03 entry. |
+| **Entropy coefficient annealed** (P1) | `entropy_coeff` linearly decays `0.025 → 0.003` over the run (`entropy_coeff_final`, `ppo.py`) instead of staying constant, so late-training exploration pressure no longer holds entropy at a high floor. |
+| **LR decay** (P2, idea C8) | `lr_actor`/`lr_critic` linearly decay to `lr_*_init * lr_final_frac` (`lr_final_frac=0.0` ⇒ decay to 0) over the run, stepped once per batch in `_update_schedules`. Targets the late-run `wr_greedy` oscillation the analysis flagged. |
+| **Sparser opponent-pool snapshots** (P3) | `snapshot_every` 3 → 15 (`pool_snapshot_every`), so pool opponents span a wider skill range instead of near-copies of the current policy — fewer near-zero-advantage mirror matches. |
+| **`METRICS.md` entropy reference recalibrated** | Replaced the stale 14-action-era "max entropy ≈ 2.64" with the measured current-env ceiling (mean `log(n_legal)` ≈ 1.84) and added `max_entropy` / `entropy_frac` as directly-logged metrics. |
+
+P4 (capacity) and P5 (economy shaping) from the same analysis followed on 2026-07-03, below.
+
+---
+
+## Reward hygiene + material PBRS + critic widening (2026-07-03)
+
+*Source: `docs/rewards.md` (current reward table + rationale) and `docs/decision.md` (2026-07-03 entry). Non-schema-breaking (no `OBS_VERSION` bump) — existing pool snapshots remain loadable, but the reward scale changed enough that a fresh baseline run is the correct comparison.*
+
+| What changed | Detail |
+|---|---|
+| **Material PBRS** | New potential `phi_material = C_MAT * (boxed_total(opp) - boxed_total(me))`, `C_MAT = 0.015`, telescoped into the reward the same way as base-diff shaping via a new `WarChestEnv.boxed_total(pid)` helper. Densifies the coin/material economy axis, which previously had zero reward gradient (a 200-game bucketed eval found the policy essentially never bolsters and never triggers a stack chain — see `docs/rewards.md`). |
+| **Shaping annealing** | The holding reward and the material term are multiplied by `shaping_anneal`, linearly decayed `1.0 → 0.1` over the first half of the run then held at the floor (`SHAPING_ANNEAL_INIT/FINAL/HALF_FRAC`, `_update_schedules`). Keeps early dense guidance while the critic is weak, then hands the final policy back toward the terminal objective — the annealed-`team_spirit` pattern from OpenAI Five. Base-diff PBRS (`SHAPING_C`) is deliberately left constant. `holding_reward` was **annealed, not removed**, to preserve the base-flip-exploit tie-break it was added for. |
+| **Truncation reward smoothed (C17)** | Replaced the 0 / −0.5 / −1.0 step function with a base-diff-*proportional* value (`LOSS_REWARD * (0.5 + 0.5 * deficit_frac)`), lowering critic-target variance at the truncation states the agent spends most of its time near, while preserving the old anchor values. |
+| **Critic-only widening (Step 5)** | `critic_hidden_dim` 64 → 128, policy left at `hidden_dim=64`. Applied to the critic alone first — the critic's board encoder is independent of the policy's during PPO rollout — so any capacity gain is attributable to the densifier, not conflated with policy capacity. |
+| **Logging** | `score_material` and `shaping_anneal` added to per-batch logs and W&B. |
+| **Explicitly deferred** | `ATTACK_REWARD` (0.02) was **kept, not subsumed** into material PBRS — both currently fire on the same box-a-coin event, flagged for the next A/B (`docs/rewards.md`, `docs/IDEAS.md`). Widening the *policy* `hidden_dim` (not just the critic) is untested. The controlled A/B against the pre-change baseline is still owed (`docs/IDEAS.md` #3): a run started 2026-07-03 (`ppo_20260703-142941`) was in progress at time of writing. |

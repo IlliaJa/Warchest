@@ -1,6 +1,9 @@
 # WarChestEnv API
 
-`WarChestEnv` follows the [Gymnasium](https://gymnasium.farama.org/) interface.
+`WarChestEnv` follows the [Gymnasium](https://gymnasium.farama.org/) interface. This
+describes the current full-base-game schema (`OBS_VERSION = 9`, `ACTION_SPACE_SIZE = 1875`).
+All named constants below are defined in `src/services/environment/warchest_env.py` unless
+noted otherwise.
 
 ## Construction
 
@@ -19,15 +22,20 @@ env = WarChestEnv(save_game_history=True, debug_mode=False)
 
 ### `reset() → (obs, info)`
 
-Resets board to initial state, deploys units, clears exploration maps.
-Returns observation dict and empty info dict.
+Starts a new game: builds a fresh `Board` (control markers only, no units on it yet),
+samples 8 distinct unit types and gives 4 disjoint types to each player (`set_init_state`),
+builds each player's bag/supply from their drafted composition, randomly assigns initiative,
+and draws each player's opening hand. Returns the observation dict and an empty info dict.
 
 ### `step(action_id) → (obs, reward, terminated, truncated, info)`
 
-Executes the action for the current player, swaps `active_player`, returns next observation.
+Executes the action for the current player. Multi-step tactics do **not** advance the turn
+while `state.pending` is set — `step()` keeps returning to the same acting player with a
+narrowed legal-action set until the continuation resolves (see "Pending tactics" below).
 
-- `terminated=True` when a player reaches 6 bases.
-- `truncated=True` when `action_count >= max_actions` (200).
+- `terminated=True` when a player controls `winning_base_count = 6` bases.
+- `truncated=True` when `state.round_number >= max_rounds` (50). A round is one full pass
+  where both players empty their 3-coin hand — **not** a fixed action count.
 
 ### `render()`
 
@@ -35,44 +43,86 @@ Displays the current board with matplotlib (non-blocking).
 
 ### `render_game()`
 
-Opens an interactive matplotlib window with Previous / Next buttons and keyboard shortcuts (`←`/`→` or `A`/`D`) to step through recorded game history. Requires `save_game_history=True`.
+Opens an interactive matplotlib window with Previous / Next buttons and keyboard shortcuts
+(`←`/`→` or `A`/`D`) to step through recorded game history. Requires `save_game_history=True`.
 
 ## Observation dict
 
 ```python
 {
-    'board':             np.ndarray (7, 7)    # raw cell-id grid (INVALID=-1, EMPTY=0, ...)
-    'exploration_map':   np.ndarray (7, 7)    # visit counts for active player
-    'units':             np.ndarray (2, 2, 2) # [player_slot, unit_idx, (row, col)]
-                                              # slot 0 = active player, slot 1 = opponent
-    'global':            np.ndarray (3,)      # [turn // 2, my_bases, opp_bases]
-    'valid_action_mask': np.ndarray (14,)     # 1 = legal action
-    'active_player':     int                  # 1 or 2
+    'board':             np.ndarray (BOARD_CHANNELS, 7, 7)  # float32, [0,1] — see below
+    'global':            np.ndarray (GLOBAL_DIM,)           # float32, [0,1] — coin/round/pending features
+    'valid_action_mask': np.ndarray (ACTION_SPACE_SIZE,)    # 1.0 = legal action, else 0.0
+    'active_player':     int                                # 1 or 2
 }
 ```
 
-The board is encoded into `BOARD_CHANNELS` planes (46: 6 base/terrain + 32 per-type unit stacks + 6 threat + 2 coordinate — see `docs/policy_network.md`) by `generate_observation()` in `warchest_env.py`.
+`BOARD_CHANNELS = 46`, `GLOBAL_DIM = 189`, `ACTION_SPACE_SIZE = 1875` for the current schema
+(bump `OBS_VERSION` — currently `9` — whenever any of these change). Board planes and global
+layout are documented in full in `docs/policy_network.md` (board encoder / global features
+sections); in short: 6 base/terrain planes, 16 own + 16 opponent per-unit-type stack planes,
+6 threat planes (own/enemy × melee/ranged/charge), 2 static coordinate planes, and a
+`PRIV_DIM = 51`-wide privileged (critic-only) opponent hidden-coin vector obtained separately
+(not part of the public `generate_observation()` dict — see `Critic.value_single`).
 
-## Action IDs
+For `active_player == 2` the whole observation is rotated 180° (board planes, `row_coord`/
+`col_coord`, base/initiative feature order) so the network always sees "my units" as player 1
+would — `WarChestEnv.remap_action` performs the matching inverse remap on any action id chosen
+against a P2 observation before calling `step()`.
 
-```
-0– 5   unit 0 → move in hex directions 0–5
-6–11   unit 1 → move in hex directions 0–5
-12     unit 0 → claim base at its current location
-13     unit 1 → claim base at its current location
-```
+## Action space
 
-`get_possible_actions()` returns the list of currently legal action IDs.
+The action space is **factored**: a spatial block (verb × cell) followed by a face-down
+(non-spatial) block, flattened into a single `Discrete(ACTION_SPACE_SIZE)` for Gymnasium
+compatibility. `get_possible_actions()` returns the list of currently legal flat ids (this is
+what `valid_action_mask` is built from); `VERB_OF_ACTION[action_id]` gives the verb group (one
+of `N_FACTORED_VERBS = 11`) that the factored policy head reads.
+
+### Spatial block — `action_id = verb * 49 + r * 7 + q` (`SPATIAL_SIZE = 1568`)
+
+| Verb(s) | Meaning |
+|---|---|
+| 0–5 | Move the unit on this cell in hex direction 0–5 |
+| 6–11 | Attack from this cell in hex direction 0–5 |
+| 12 | `control` — claim/steal the base at this cell |
+| 13 | `bolster` — add a coin to the stack of the unit on this cell |
+| 14–29 | `deploy` — one verb per deployable unit type (`DEPLOY_VERBS`, 16 types); target cell must be a controlled, empty base |
+| 30 | `tactic` — the unit on this cell initiates its tactic (opens a pending sub-turn; see below) |
+| 31 | `select` — pick cell `(r, q)` as a non-directional **target** (ranged-attack target, friendly-grant recipient); only ever legal mid-tactic |
+
+### Face-down block (no board cell) — appended after the spatial block, over the full 17-coin universe (16 units + Royal)
+
+| Offset (from `SPATIAL_SIZE`) | Meaning |
+|---|---|
+| `[0, 17)` | `claim_initiative`, paying hand coin `c` |
+| `[17, 34)` | `pass`, discarding hand coin `c` |
+| `[34, 34 + 16·17)` | `recruit` — take supply unit type `t`, paying hand coin `c` |
+| last slot | `decline` — end an optional pending continuation (no coin) |
+
+Only the player's actually-drafted coins/types are ever unmasked at runtime; the full
+17/16-wide blocks exist so the schema doesn't change per composition.
+
+### Pending tactics (multi-step actions)
+
+Tactics with a follow-up (Cavalry's move-then-attack, Archer's ranged attack, Marshall's
+grant, etc.) are **not** single atomic ids. `tactic` (verb 30) only *initiates* — the
+follow-up click(s) reuse verbs 0–11/31 and are gated by `state.pending` inside
+`get_possible_actions()`, so the turn does not pass until the continuation resolves. The
+`global` observation carries a `PENDING_CTX_DIM = 15`-wide one-hot (14 named pending kinds +
+"no pending") telling the policy which continuation, if any, is in progress — this is what
+disambiguates "a Cavalry follow-up move" from an ordinary maneuver using the same verb 0–5 ids.
+See `docs/history.md` → "Tactics, attributes & restrictions" for the full per-unit mechanic
+list and `PENDING_KINDS` in `warchest_env.py` for the exact kind names.
 
 ## Useful properties
 
 | Property | Type | Description |
 |---|---|---|
-| `board` | `Board` | Current board object |
+| `board` | `Board` | Current board object (`state.board`) |
 | `active_player` | `int` (1 or 2) | Whose turn it is |
 | `action_count` | `int` | Total valid actions taken this episode |
-| `action_space` | `gym.spaces.Discrete(14)` | Action space |
-| `observation_space` | `gym.spaces.Dict` | Full observation schema |
+| `boxed_total(player_id)` | `int` | Coins `player_id` has permanently lost to the box (used by the material PBRS term — `docs/rewards.md`) |
+| `get_observation_space()` | `gym.spaces.Dict` | Full observation schema (see above) |
 
 ## Board API
 

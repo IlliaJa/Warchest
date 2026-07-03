@@ -45,14 +45,10 @@ An epoch is stopped early when the per-minibatch approximate KL exceeds `KL_TARG
 
 ### Reward shaping
 
-Raw environment rewards are augmented with potential-based shaping before being stored:
-
-```python
-shaped_r = r + gamma * phi(s_next) - phi(s)
-phi(s)   = SHAPING_C * (my_bases - opp_bases)   # SHAPING_C = 0.05
-```
-
-This fires a positive pulse on gaining a base and a negative pulse on losing one without distorting the optimal policy.
+Raw environment rewards are augmented with potential-based shaping (base-diff **and**
+material), a per-turn holding reward, and per-run annealing of the holding + material terms
+before being stored — see [Reward Design](rewards.md) for the full, current reward table and
+rationale (this section previously duplicated it and had drifted out of sync).
 
 ---
 
@@ -63,14 +59,14 @@ This fires a positive pulse on gaining a base and a negative pulse on losing one
 | Type | Description |
 |---|---|
 | `random` | Uniform over valid actions |
-| `greedy` | BFS toward nearest unclaimed or enemy base (30% random handicap) |
-| `pool` | Frozen snapshot of the policy from a past batch (rolling window of 20) |
+| `greedy` | Priority: attack → control → move toward nearest base → deploy → pass (no random handicap; `RANDOM_ACTION_PROB = 0.0`) |
+| `pool` | Frozen snapshot of the policy from a past batch (rolling window of `pool_max_size=20`, snapshotted every `pool_snapshot_every=15` batches so pool opponents span a wide skill range instead of near-copies) |
 
 ### Finetune phase
 
 After each eval block, pool weights are set automatically:
 
-- If eval WR vs random ≥ `wr_random_finetune_threshold` (0.90) → switch to finetune weights (random removed from training)
+- If eval WR vs random ≥ `wr_random_finetune_threshold` (0.90) → switch to finetune weights (random removed from training; greedy kept as a small fixed anchor)
 - Otherwise → restore initial weights
 
 This raises the training bar automatically as the policy matures, without any one-way flag.
@@ -78,7 +74,7 @@ This raises the training bar automatically as the policy matures, without any on
 | Phase | `p_random` | `p_greedy` | `p_pool` |
 |---|---|---|---|
 | Initial | 0.40 | 0.20 | 0.40 |
-| Finetune | 0.00 | 0.40 | 0.60 |
+| Finetune | 0.00 | 0.10 | 0.90 |
 
 ---
 
@@ -86,20 +82,22 @@ This raises the training bar automatically as the policy matures, without any on
 
 | Parameter | Value | Effect |
 |---|---|---|
-| `n_batches` | 300 | Total batch updates |
-| `collect_episodes` | 16 | Episodes collected per batch before update |
+| `n_batches` | 400 | Total batch updates |
+| `collect_episodes` | 64 | Episodes collected per batch before update |
 | `max_t` | 1000 | Hard cap on steps per episode |
-| `ppo_epochs` | 1 | Inner gradient epochs per batch (KL early stop active) |
+| `ppo_epochs` | 4 | Inner gradient epochs per batch (KL early stop active) |
 | `ppo_eps` | 0.2 | PPO clip parameter |
 | `KL_TARGET` | 0.015 | Approx-KL threshold for early stopping an epoch |
 | `gamma` | 0.99 | Discount factor |
 | `lam` | 0.95 | GAE trace decay |
-| `lr_actor` | 3e-4 | Adam LR for encoder + actor head |
-| `lr_critic` | 3e-4 | Adam LR for critic |
-| `hidden_dim` | 64 | Network width |
-| `ENTROPY_COEFF` | 0.001 | Entropy bonus coefficient |
-| `SHAPING_C` | 0.05 | Potential-shaping scale factor |
-| Pool `max_size` | 20 | Rolling snapshot window length |
+| `lr_actor` / `lr_critic` | 3e-4 | Adam LR, both actor and critic; linearly decayed to `lr_final_frac * init` (`lr_final_frac=0.0` ⇒ decays to 0) over the run |
+| `hidden_dim` (Policy) | 64 | Policy network width |
+| `critic_hidden_dim` (Critic) | 128 | Critic widened alone first — the densifier of the sparse terminal reward (`docs/decision.md`, 2026-07-03) |
+| `entropy_coeff` | 0.025 → `entropy_coeff_final` 0.003 | Entropy bonus coefficient, linearly annealed over the run |
+| `SHAPING_C` | 0.05 | Base-diff potential-shaping scale factor (constant, not annealed) |
+| `C_MAT` | 0.015 | Material (boxed-coin) potential-shaping scale factor |
+| `shaping_anneal` | 1.0 → 0.1 over first half of run | Multiplier applied to the holding reward and material shaping (`docs/rewards.md`) |
+| Pool `max_size` / `snapshot_every` | 20 / 15 | Rolling snapshot window length / batches between snapshots |
 | `eval_every` | 10 | Evaluate every N batches |
 | `eval_episodes` | 20 | Episodes per evaluation block |
 | `wr_random_finetune_threshold` | 0.90 | WR vs random that triggers finetune phase |
@@ -119,16 +117,22 @@ This raises the training bar automatically as the policy matures, without any on
 | `critic_loss` | Mean critic MSE loss averaged over minibatch updates |
 | `approx_kl` | Approximate KL divergence from old to new policy |
 | `entropy` | Mean policy entropy |
+| `max_entropy` | Batch's own entropy ceiling, `mean(log(n_legal))` — see `docs/METRICS.md` |
+| `entropy_frac` | `entropy / max_entropy` — the decisive-ness ratio (1.0 = random) |
+| `entropy_coeff` | Current (annealed) entropy bonus coefficient |
+| `lr` | Current (decayed) actor learning rate |
 | `grad_norm_actor` | Post-clip gradient norm, actor-side parameters |
 | `grad_norm_critic` | Post-clip gradient norm, critic parameters |
 | `clip_frac` | Fraction of timesteps where PPO ratio was clipped |
 | `critic_mae` | Mean absolute error of critic predictions vs actual returns |
-| `critic_mean` | Mean predicted state value across the batch |
-| `critic_std` | Std of predicted state values across the batch |
 | `advantage_std` | Std of raw (pre-normalised) advantages |
-| `return_mean` | Mean of raw GAE returns |
-| `return_std` | Std of raw GAE returns |
 | `avg_turns` | Mean episode length in the batch |
+| `score_attack` / `score_shaping` / `score_holding` / `score_material` / `score_terminal` / `score_other` | Per-episode-mean decomposition of `score_main` into its reward sources — see `docs/METRICS.md` |
+| `shaping_anneal` | Current anneal multiplier applied to the holding + material shaping terms |
+
+`critic_mean`/`critic_std` (predicted-value mean/std) and `return_mean`/`return_std` (raw GAE
+return mean/std) are computed each batch and printed to the text log, but are **not** sent to
+W&B.
 
 ### Per eval block (logged by `_maybe_eval`, every `eval_every` batches)
 
