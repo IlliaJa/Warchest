@@ -20,7 +20,9 @@ The plateau / high-entropy / reward-decoupling problems observed on that run are
 
 ### Reward shaping for the coin/unit economy
 
-All current shaping is base-centric; nothing rewards the coin economy even though `attack` permanently removes enemy coins (shrinking their bag → fewer actions/round). Two proposed **potential-based** (policy-invariant) shaping terms — a material differential over `GameState.boxed` and an optional board-presence term — are written up in `docs/rewards.md` §9–10, with coefficients, exploit analysis, and the tension against the `ppo_20260630` over-shaping diagnosis. Material advantage is strongly win-correlated, so §9 is the higher-value of the two; A/B against the plateau before stacking on the existing holding reward.
+Material PBRS (§9) is now **implemented** (2026-07-03, `C_MAT=0.015`, annealed with holding); the optional board-presence term (§10) is still open. See `docs/rewards.md`.
+
+> **⚠️ REMINDER — zero `ATTACK_REWARD` in the next A/B.** Now that material PBRS is live, the raw `ATTACK_REWARD = 0.02` (`warchest_env.py`) **double-pays** the same box-a-coin event that `phi_material` already rewards — and unlike the PBRS term it is non-telescoping (farmable in principle, adds return variance). Decision: **it can be zeroed.** Not done in the 2026-07-03 pass only to keep that change set to exactly what was requested. Set `ATTACK_REWARD = 0.0` and re-run the material-PBRS A/B so attacks are paid once, through the policy-invariant term. (Full rationale: `docs/rewards_improvements.md` §2/Step 2 and §4.1.)
 
 ### Draw-probability observation features (bag dilution / draw efficiency)
 

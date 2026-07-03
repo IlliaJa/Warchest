@@ -21,6 +21,18 @@ from src.services.bots import GreedyBot, RandomBot
 from src.utils.elo import EloTracker
 
 SHAPING_C = 0.05
+# Material PBRS coefficient (rewards.md §9): potential over the boxed-coin differential.
+# Kept well below SHAPING_C — bases win the game, material is only a means.
+C_MAT = 0.015
+# The holding reward and the material PBRS term are linearly annealed from
+# SHAPING_ANNEAL_INIT down to SHAPING_ANNEAL_FINAL over the first
+# SHAPING_ANNEAL_HALF_FRAC of the run, then held at the floor. This keeps the dense
+# guidance early (weak critic, high entropy) and hands the final policy back toward
+# the true terminal objective — the over-shaping antidote (see docs/decision.md,
+# 2026-07-03). Base-diff PBRS (SHAPING_C) is intentionally left constant.
+SHAPING_ANNEAL_INIT = 1.0
+SHAPING_ANNEAL_FINAL = 0.1
+SHAPING_ANNEAL_HALF_FRAC = 0.5
 use_wandb = False
 
 OPP_TYPE_IDX = {'random': 0, 'greedy': 1, 'pool': 2}
@@ -111,6 +123,8 @@ class PPOTrainer:
         self._lr_critic_init = hp['lr_critic']
         self._lr_final_frac = hp.get('lr_final_frac', 0.0)
         self._holding_reward_rate = hp['holding_reward_rate']
+        # anneal multiplier applied to holding + material shaping; set per batch.
+        self._shaping_anneal = SHAPING_ANNEAL_INIT
         self._minibatch_size = hp['minibatch_size']
         self._print_every = hp['print_every']
         self._eval_every = hp.get('eval_every', 10)
@@ -179,6 +193,15 @@ class PPOTrainer:
         for group in self._critic_optimizer.param_groups:
             group['lr'] = self._lr_critic_init * lr_scale
 
+        # Holding + material shaping anneal: 1.0 -> SHAPING_ANNEAL_FINAL over the first
+        # SHAPING_ANNEAL_HALF_FRAC of the run (half-point derived from n_batches so it
+        # tracks a changed schedule length), then held at the floor.
+        half = max(self._n_batches * SHAPING_ANNEAL_HALF_FRAC, 1.0)
+        anneal_frac = min((batch_num - 1) / half, 1.0)
+        self._shaping_anneal = (
+            SHAPING_ANNEAL_INIT + anneal_frac * (SHAPING_ANNEAL_FINAL - SHAPING_ANNEAL_INIT)
+        )
+
     def train(self):
         for batch_num in range(1, self._n_batches + 1):
             self._update_schedules(batch_num)
@@ -228,8 +251,9 @@ class PPOTrainer:
         claims = 0
         main_score = 0.0
         turns = 0
+        opp_pid = 3 - main_pid  # absolute id of the main actor's opponent
         # score decomposition (sums to main_score) + entropy-ceiling tracking
-        r_attack = r_shaping = r_holding = r_terminal = r_other = 0.0
+        r_attack = r_shaping = r_holding = r_material = r_terminal = r_other = 0.0
         sum_log_nlegal = 0.0
         n_decisions = 0
 
@@ -269,6 +293,11 @@ class PPOTrainer:
                 base_diff = (obs_before['global'][1] - obs_before['global'][2]) * _wbc
                 phi_before = SHAPING_C * base_diff
                 holding_reward = self._holding_reward_rate * base_diff
+                # Material PBRS potential (rewards.md §9): boxed differential, opp minus me.
+                # boxed_total is keyed by absolute pid, so no perspective flip is needed.
+                phi_mat_before = C_MAT * (
+                    self._env.boxed_total(opp_pid) - self._env.boxed_total(main_pid)
+                )
                 env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
 
                 t0 = _pt()
@@ -289,12 +318,21 @@ class PPOTrainer:
                     phi_after = SHAPING_C * (state['global'][1] - state['global'][2]) * _wbc
                 else:
                     phi_after = SHAPING_C * (state['global'][2] - state['global'][1]) * _wbc
-                shaped_reward = reward + self._gamma * phi_after - phi_before + holding_reward
+                phi_mat_after = C_MAT * (
+                    self._env.boxed_total(opp_pid) - self._env.boxed_total(main_pid)
+                )
+                # Base-diff PBRS is constant; holding + material shaping are annealed together.
+                base_shaping = self._gamma * phi_after - phi_before
+                material_shaping = self._gamma * phi_mat_after - phi_mat_before
+                annealed_holding = self._shaping_anneal * holding_reward
+                annealed_material = self._shaping_anneal * material_shaping
+                shaped_reward = reward + base_shaping + annealed_holding + annealed_material
                 main_score += shaped_reward
 
                 # decompose the reward so score/win decoupling is visible in the logs
-                r_shaping += self._gamma * phi_after - phi_before
-                r_holding += holding_reward
+                r_shaping += base_shaping
+                r_holding += annealed_holding
+                r_material += annealed_material
                 if terminated:
                     r_terminal += reward  # dominated by WIN_REWARD on a winning move
                 elif step_info['action'].type == ATTACK_ACTION:
@@ -337,12 +375,17 @@ class PPOTrainer:
                     diff = (state['global'][1] - state['global'][2]) * _wbc
                 else:
                     diff = (state['global'][2] - state['global'][1]) * _wbc
+                # Base-diff-proportional truncation reward (C17): a smoother critic
+                # target than the old 0 / -0.5 / -1.0 step function, so the critic sees
+                # lower target variance at the states the agent spends most time in.
+                # A draw from a winning position is still 0; ties and deficits scale
+                # linearly from -0.5 (tie) toward LOSS_REWARD (full-deficit rout),
+                # preserving the two anchor values of the old step function.
                 if diff > 0:
                     trunc_reward = 0.0
-                elif diff == 0:
-                    trunc_reward = LOSS_REWARD * 0.5
                 else:
-                    trunc_reward = LOSS_REWARD
+                    deficit_frac = min(-diff, _wbc) / _wbc  # 0 at a tie ... 1 at max deficit
+                    trunc_reward = LOSS_REWARD * (0.5 + 0.5 * deficit_frac)
                 self._buffer.append_terminal_reward(trunc_reward)
                 main_score += trunc_reward
                 r_terminal += trunc_reward
@@ -360,6 +403,7 @@ class PPOTrainer:
             'r_attack': r_attack,
             'r_shaping': r_shaping,
             'r_holding': r_holding,
+            'r_material': r_material,
             'r_terminal': r_terminal,
             'r_other': r_other,
             'sum_log_nlegal': sum_log_nlegal,
@@ -601,6 +645,7 @@ class PPOTrainer:
         r_attack = float(np.mean([ep['r_attack'] for ep in self._batch_eps]))
         r_shaping = float(np.mean([ep['r_shaping'] for ep in self._batch_eps]))
         r_holding = float(np.mean([ep['r_holding'] for ep in self._batch_eps]))
+        r_material = float(np.mean([ep['r_material'] for ep in self._batch_eps]))
         r_terminal = float(np.mean([ep['r_terminal'] for ep in self._batch_eps]))
         r_other = float(np.mean([ep['r_other'] for ep in self._batch_eps]))
         # entropy ceiling: mean over all main-player decisions of log(n_legal).
@@ -641,7 +686,8 @@ class PPOTrainer:
         logger.info(
             f'batch={batch_num} score_parts (per-ep mean): '
             f'attack={r_attack:.3f} shaping={r_shaping:.3f} holding={r_holding:.3f} '
-            f'terminal={r_terminal:.3f} other={r_other:.3f}'
+            f'material={r_material:.3f} terminal={r_terminal:.3f} other={r_other:.3f} '
+            f'anneal={self._shaping_anneal:.3f}'
         )
 
         if use_wandb:
@@ -666,8 +712,10 @@ class PPOTrainer:
                 'score_attack': r_attack,
                 'score_shaping': r_shaping,
                 'score_holding': r_holding,
+                'score_material': r_material,
                 'score_terminal': r_terminal,
                 'score_other': r_other,
+                'shaping_anneal': self._shaping_anneal,
             })
 
 
@@ -708,6 +756,11 @@ if __name__ == '__main__':
         'lr_critic': 3e-4,
         'lr_final_frac': 0.0,  # LR decays linearly to lr_*_init * this (0.0 => to zero)
         'hidden_dim': 64,
+        # Step 5 (docs/rewards_improvements.md): strengthen the *densifier*. The critic
+        # is what turns the terminal reward into a per-step signal, so widen it alone
+        # (policy left at hidden_dim) to keep the capacity A/B attributable. Safe because
+        # the critic's board encoder is independent of the policy's during PPO rollout.
+        'critic_hidden_dim': 128,
         'print_every': 10,
         # opponent sampling weights — initial phase (random opponent included)
         'p_random_initial': 0.40,
@@ -749,7 +802,7 @@ if __name__ == '__main__':
         return Policy(device=device, hidden_dim=hp['hidden_dim'])
 
     warchest_policy = policy_constructor().to(device)
-    warchest_critic = Critic(device=device, hidden_dim=hp['hidden_dim']).to(device)
+    warchest_critic = Critic(device=device, hidden_dim=hp['critic_hidden_dim']).to(device)
     actor_optimizer = optim.Adam(warchest_policy.parameters(), lr=hp['lr_actor'])
     critic_optimizer = optim.Adam(warchest_critic.parameters(), lr=hp['lr_critic'])
 

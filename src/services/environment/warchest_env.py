@@ -386,6 +386,15 @@ class WarChestEnv(gym.Env):
     def active_player(self):
         return self.state.active_player
 
+    def boxed_total(self, player_id: int) -> int:
+        """Total coins ``player_id`` has permanently lost to the box.
+
+        Coins only ever leave the cycle into ``boxed`` (monotonic per player), so
+        this is the live-material signal used by the material PBRS shaping term in
+        the training loop. Keyed by absolute player id, so it is perspective-free.
+        """
+        return sum(self.state.boxed[player_id].values())
+
     # ------------------------------------------------------------------
     # Round / turn controller
     # ------------------------------------------------------------------
