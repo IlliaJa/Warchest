@@ -1,11 +1,19 @@
 # Parallel rollout collection (multiprocessing)
 
-**Status:** Phases 1–3 implemented — `rollout_core.play_episode` (shared core),
-`rollout_collector.ParallelRolloutCollector` (spawn worker pool), `RolloutBuffer.ingest_chunks`,
-incremental pool sync, `n_workers=6` default. Correctness verified (serial + parallel run clean,
-pool sync + worker-failure path tested). **Speed benchmark on the real config still pending**
-(run `n_workers=1` vs `6` head-to-head on an otherwise-idle box). Phases 4–5 tracked in
-`docs/IDEAS.md` #11.
+**Status:** Phases 1–5 implemented.
+- 1–3: `rollout_core.play_episode` (shared core), `rollout_collector.ParallelRolloutCollector`
+  (spawn worker pool), `RolloutBuffer.ingest_chunks`, incremental pool sync, `n_workers=6`.
+- 4 (P11a): dynamic load balancing — workers claim episodes from a shared atomic counter
+  instead of a fixed per-worker share (submit/gather API in the collector).
+- 5 (P11b): `overlap_collection=True` — batch N+1's rollout runs on the CPU workers while the
+  GPU updates batch N (1-step-stale behavior weights).
+
+Timing log reports rollout (critical-path = slowest worker's wall), env and model_play
+(aggregate sums across workers), value_pass, actor_gradient, critic_gradient, IPC (gather wall
+not explained by the slowest worker), and total wall. Correctness verified for all three modes
+(serial, parallel barrier, parallel overlap); in overlap the rollout is fully hidden (IPC→0
+steady state). **Real-config speed + learning-quality A/B still pending** (overlap adds
+off-policy staleness — compare elo/wr, not just wall-clock).
 
 ## Motivation
 
@@ -37,7 +45,7 @@ and is never broadcast. Each batch the main process broadcasts only the small po
 Main process (GPU)
   ├── N persistent workers (spawn), CPU-only, torch.set_num_threads(1)
   ├── per batch: broadcast(policy.state_dict + new pool snapshot(s) + phase config)
-  ├── workers each play a share of collect_episodes → return (numpy transitions + ep metrics)
+  ├── workers claim episodes from a shared counter → return (numpy transitions + ep metrics)
   ├── buffer.ingest_chunks(...)  (concatenate, shift episode_ends)
   ├── stack() → _compute_values_batched() [GPU] → compute_gae() → PPO update [GPU]
   └── maybe_snapshot / eval / log   (unchanged)
@@ -50,22 +58,30 @@ Main process (GPU)
   construct `WarChestEnv`, a local empty `Policy`, a local `OpponentPool`; seed
   `np`/`torch`/env RNG from `(base_seed, worker_id)`.
 - **loop:** block on this worker's task queue →
-  1. `policy.load_state_dict(task.policy_sd)`;
-  2. if `task.new_snapshots`: append to local pool (same `maxlen` deque → worker pools stay
+  1. `policy.load_state_dict(task['policy_sd'])`;
+  2. if `task['new_snapshots']`: append to local pool (same `maxlen` deque → worker pools stay
      in sync without shipping the whole pool);
-  3. `pool.set_weights(task.weights)`; set `shaping_anneal`;
-  4. play `task.n_episodes` via `rollout_core.play_episode` (shared with single-process path);
-  5. put `(worker_id, stacked_arrays, episode_dicts)` on the shared result queue.
+  3. apply `task['weights']` (p_random/greedy/pool) + `shaping_anneal`/`holding_reward_rate`;
+  4. **claim episodes from the shared atomic counter** until it hits 0 (dynamic balancing —
+     not a fixed per-worker share), playing each via `rollout_core.play_episode` (shared with
+     the single-process path);
+  5. pre-stack its transitions into numpy and put `(worker_id, status, payload)` on the shared
+     result queue (`payload` = the numpy arrays + `episode_dicts` + `t_env`/`t_model_play`/
+     `t_worker_wall` timing).
 - **shutdown:** `None` sentinel → clean exit; main `terminate()`+`join()` in `finally`.
 
 ### IPC protocol
 
-- **Per-worker task queues** (list of N) + **one shared result queue**. Per-worker queues
-  guarantee every worker receives every batch → incremental pool sync is correct.
-  (`ProcessPoolExecutor` gives no such guarantee about *which* worker runs a task, which
-  breaks incremental pool replication — hence manual `Process`+`Queue`.)
-- **Task** (small, pickled per batch): `policy_sd` (CPU tensors), `new_snapshots` (0-1
-  usually), `weights` (p_random/greedy/pool), `n_episodes`, `anneal`, `batch_num`.
+- **Per-worker task queues** (list of N) + **one shared result queue** + **one shared atomic
+  counter** (`mp.Value('i')`, remaining episodes this batch). Per-worker queues guarantee every
+  worker receives every batch → incremental pool sync is correct. (`ProcessPoolExecutor` gives
+  no such guarantee about *which* worker runs a task, which breaks incremental pool
+  replication — hence manual `Process`+`Queue`.) The episode *count* is handed out via the
+  counter, not the task, so a fast worker naturally claims more (dynamic balancing).
+- **Task** (small, pickled per batch, identical to every worker): `policy_sd` (CPU tensors),
+  `new_snapshots` (0-1 usually), `weights` (p_random/greedy/pool), `gamma`, `shaping_anneal`,
+  `holding_reward_rate`, `max_t`. The number of episodes is *not* in the task — workers claim
+  from the shared counter until it drains.
 - **Result:** worker pre-stacks its transitions into numpy: `boards [n,C,7,7] f32`,
   `globals`, `masks`, `actions i64`, `log_probs f32`, `rewards f32`, `opp_onehots`,
   `privileged`, `episode_ends`. Whole-batch total ~55 MB → trivial at ~12 s/batch. If it
@@ -83,38 +99,53 @@ tensors (`.cpu()` at snapshot time) so broadcast is cheap and never drags CUDA i
 ### Load balancing
 
 Episodes vary 60-200 turns.
-- **v1 (simple):** static split `collect_episodes // N` (+ remainder to first workers).
-- **v2 (better, IDEAS #11):** dynamic task queue — workers pull episodes until the batch
-  quota is met, removing the slowest-episode tail. Start with v1; move to v2 if profiling
-  shows imbalance.
+- **Implemented (P11a, IDEAS #11):** dynamic balancing via a shared atomic counter
+  (`mp.Value('i')` = remaining episodes). Every worker loops "atomically decrement the counter
+  → play one episode" until it reads ≤0, so a worker that draws short episodes claims more and
+  the slowest-episode tail is removed — no fixed per-worker share.
+- The earlier static split (`collect_episodes // N` + remainder) was superseded by the counter
+  and is no longer used.
 
 ## File changes
 
 - **`src/services/environment/rollout_core.py`** (new): pure
-  `play_episode(env, policy, opp, opp_type, main_pid, *, gamma, shaping_anneal,
-  holding_reward_rate, ...) -> (transitions, episode_dict)`, extracted from the old
-  `PPOTrainer._collect_episode` with no `self`/critic dependency. **Single source of truth**
-  used by both the worker and the single-process path.
+  `play_episode(env, policy, opp, main_pid, opp_type, *, gamma, shaping_anneal,
+  holding_reward_rate, max_t) -> (steps, episode_dict)`, extracted from the old
+  `PPOTrainer._collect_episode` with no `self`/critic dependency. `steps` is a dict of
+  parallel per-decision lists (obs, actions, log_probs, rewards, opp_onehots, privileged);
+  the terminal/truncation reward is folded into `rewards[-1]`. `episode_dict` also carries
+  `t_env`/`t_model_play` so the caller accumulates timing. **Single source of truth** used by
+  both the worker and the single-process path.
 - **`src/utils/rollout_buffer.py`:** `ingest_chunks(worker_arrays)` — concatenate arrays +
   shift `episode_ends`. `add_step` retained for the single-process fallback.
 - **`src/services/rollout_collector.py`** (new): `ParallelRolloutCollector` — owns workers,
   broadcast, gather; encapsulates all multiprocessing.
-- **`src/app/ppo.py`:** `_collect_batch` branches on `n_workers` (`1` = current serial path
-  through `play_episode`; `>1` = collector). Everything downstream unchanged.
-- **`src/services/opponent_pool.py`:** version counter / `snapshots_since(idx)` for
-  incremental broadcast.
-- **hp:** `'n_workers': 6` (1 = current behavior), `'rollout_seed': <int>`.
+- **`src/app/ppo.py`:** the training loop picks one of three collection paths per batch:
+  `n_workers ≤ 1` → in-process serial through `play_episode`; `n_workers > 1` and
+  `overlap_collection=False` → `_collect_parallel_barrier` (submit+gather in one step);
+  `n_workers > 1` and `overlap_collection=True` → pipelined: `_submit_parallel(N+1)` is
+  launched right after the value/GAE pass so the workers run batch N+1 while the GPU updates
+  batch N, and `_gather_and_ingest` collects it at the top of the next iteration. Everything
+  downstream unchanged.
+- **`src/services/opponent_pool.py`:** `new_snapshots_since(seen_count) -> (new_snapshots,
+  total_count)` for incremental broadcast; `weights` property.
+- **hp:** `'n_workers': 6` (≤1 = in-process path), `'overlap_collection': True` (P11b),
+  `'rollout_seed': 0`. `n_workers` is capped at `collect_episodes` so every worker gets ≥1
+  episode.
 
 ## Correctness
 
 - **Critic values:** unchanged path — workers compute no values; main runs the same batched
   pass. Bit-identical to single-process for the same states.
-- **RNG:** parallel streams with distinct seeds → *different* concrete episodes, statistically
-  equivalent. Everything downstream (GAE/update) is identical in form. Not bit-reproducible
-  vs single-process; **is** reproducible for fixed `(rollout_seed, n_workers)`. Changing
-  `n_workers` changes the episode sample.
-- **Equivalence test:** `n_workers=1` through the collector should reproduce the serial path
-  exactly (same `play_episode`, same RNG order) — the safety net before scaling.
+- **RNG:** each worker seeds its `np`/`torch`/env RNG once from `(base_seed, worker_id)` →
+  parallel streams produce *different* concrete episodes, statistically equivalent. Everything
+  downstream (GAE/update) is identical in form. **Not bit-reproducible** — with dynamic
+  counter balancing, *which* worker plays *which* episode depends on timing, so even a fixed
+  `(rollout_seed, n_workers)` does not pin the episode sample (documented tradeoff of P11a).
+- **Equivalence:** the serial path (`n_workers ≤ 1`) and the workers call the same
+  `play_episode`, so they are behaviourally/statistically equivalent — but the serial path
+  runs in-process and does **not** go through the collector, so this is form-equivalence, not
+  a bit-identical reproduction.
 
 ## Pitfalls (accounted for)
 
@@ -126,19 +157,27 @@ Episodes vary 60-200 turns.
   raises and cleanly shuts all workers down (`try/finally` + `terminate()`/`join()`) — no
   zombie processes.
 - **Invalid-action path** (`make_random_step`, `log_prob=0`) moves into `play_episode` as-is.
-- **No oversubscription:** `N = min(n_workers, nproc-2)`; leave cores for the GPU update, IPC
-  and the OS. On 12 cores, default **6**, ceiling 8.
+- **No oversubscription:** `n_workers` is set manually (default **6** on this 12-core box) to
+  leave cores for the GPU update, IPC and the OS, and each worker pins `torch.set_num_threads(1)`
+  so N workers don't spawn N×intra-op threads. The only automatic cap is
+  `min(n_workers, collect_episodes)` (so every worker gets ≥1 episode) — there is no auto-cap
+  against core count, so raising `n_workers` past ~8 on 12 cores is the caller's responsibility.
 
 ## Phases
 
-1. **Refactor (this doc's implemented part):** extract `play_episode` into `rollout_core.py`;
-   route the current `_collect_batch` through it. Prove metrics unchanged vs the pre-refactor
-   run. *Zero-risk groundwork.*
-2. **Collector + workers, `n_workers=1`:** prove metric equivalence against Phase 1.
-3. **Scale to N=6:** measure `t=` / balance; wire error handling + shutdown.
-4. **(IDEAS #11) Dynamic work-queue** if a tail imbalance shows up.
-5. **(IDEAS #11) Overlap** collection of batch N+1 with the GPU update of batch N (policy is
-   frozen during collection anyway) — another ~15-20%, more complexity; not for v1.
+All five are implemented; listed here as the delivery order.
+
+1. **Refactor:** extract `play_episode` into `rollout_core.py`; route `_collect_batch` through
+   it. *Zero-risk groundwork.*
+2. **Collector + workers:** `ParallelRolloutCollector` owning the spawn pool, broadcast, gather.
+3. **Scale to N=6:** timing / balance; error handling + clean shutdown.
+4. **(P11a, IDEAS #11) Dynamic balancing:** shared atomic counter instead of a static split.
+5. **(P11b, IDEAS #11) Overlap:** collect batch N+1 with the GPU update of batch N (policy is
+   frozen during collection anyway). Adds 1-step off-policy staleness + a second in-flight
+   buffer; gated by `overlap_collection`.
+
+Remaining work is validation/tuning, not implementation — see IDEAS #11 (P11c real-config
+speed + learning-quality A/B; P11d shared-memory IPC only if profiling demands it).
 
 ## Expected gain (Amdahl)
 

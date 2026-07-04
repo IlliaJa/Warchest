@@ -17,7 +17,7 @@ import argparse
 import csv
 import glob
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import numpy as np
 import torch
@@ -51,6 +51,10 @@ def play_one_game(env, policy, bot, main_pid, max_t):
     state, _ = env.reset()
     used_tactic = False
     bolster_count = 0
+    bolsters = Counter()             # bolstered unit id -> times its stack was grown
+    bolsters_with_supply = Counter()  # ... restricted to bolsters made while >=1 coin
+                                      # of that unit still sat in the player's supply
+    supply_left_sum = Counter()       # sum of coins-left-in-supply over those bolsters
     chain_offered = 0
     chain_used = 0
     acting_pid = main_pid
@@ -75,6 +79,20 @@ def play_one_game(env, policy, bot, main_pid, max_t):
             used_tactic = True
         if acting_pid == main_pid and VERB_OF_ACTION[env_action] == V_BOLSTER:
             bolster_count += 1
+            # Bolster is a spatial action: the bolstered unit is the one on the target
+            # cell. Decode the (absolute-frame) env_action and read the unit there
+            # before stepping (bolster does not touch supply, so the count is the same
+            # before/after). We flag bolsters made while coins of that same unit still
+            # sit in the player's supply — e.g. a Knight (4 total) bolstered to stack 2
+            # with 2 still in supply, a Swordsman (5 total) with 3 still in supply.
+            _, br, bq = WarChestEnv.decode_action(env_action)
+            bunit = env.board.get_unit_at(br, bq)
+            if bunit is not None:
+                bolsters[bunit.id] += 1
+                supply_left = env.state.supply[main_pid].get(bunit.id, 0)
+                if supply_left > 0:
+                    bolsters_with_supply[bunit.id] += 1
+                    supply_left_sum[bunit.id] += supply_left
         state, _, terminated, truncated, step_info = env.step(env_action)
         if not step_info['action'].is_valid:
             state, _, terminated, truncated, step_info = env.make_random_step()
@@ -99,6 +117,9 @@ def play_one_game(env, policy, bot, main_pid, max_t):
         'opp_bases': opp_bases,
         'used_tactic': used_tactic,
         'bolster_count': bolster_count,
+        'bolsters': bolsters,                          # Counter: unit id -> bolsters
+        'bolsters_with_supply': bolsters_with_supply,  # ... while supply still had coins
+        'supply_left_sum': supply_left_sum,            # sum of supply-left over those
         'turns': env.action_count,
         'main_pid': main_pid,
     }
@@ -141,6 +162,51 @@ def _print_unit_breakdown(records, title, composition_key):
         wo_str = f'{wr_wo:.2f}±{se_wo:.2f}({n_wo})' if n_wo else 'n/a'
         swing_str = f'{swing:+.2f}' if swing == swing else 'n/a'
         print(f'{name:<16} {w_str:<16} {wo_str:<16} {swing_str:>7}')
+
+
+def _print_bolster_breakdown(records):
+    """How often the policy bolsters (plays a hand coin onto an on-board unit, growing
+    its stack) and — the metric of interest — how often it does so while coins of that
+    same unit still sit in its supply (e.g. a Knight bolstered with 2 still in supply,
+    a Swordsman with 3). Bolstering commits a coin to the board while the unit is not
+    yet fully drawn out of supply, so this flags stack investment made 'early'."""
+    n = len(records)
+    bolster_games = [r for r in records if r['bolster_count'] > 0]
+    total_bolsters = sum(r['bolster_count'] for r in records)
+    total_with_supply = sum(sum(r['bolsters_with_supply'].values()) for r in records)
+    print(f'\n=== Bolstering (and bolsters made while supply still holds that unit) ===')
+    print(f'Bolstered at least once: {len(bolster_games)}/{n} games '
+          f'({len(bolster_games) / n:.1%}), {total_bolsters} bolster actions total '
+          f'({total_bolsters / n:.2f} per game)')
+    if total_bolsters == 0:
+        print('  (policy never bolsters)')
+        return
+    share = total_with_supply / total_bolsters
+    print(f'Of those, {total_with_supply}/{total_bolsters} ({share:.1%}) were made while '
+          f'>=1 coin of the same unit was still in supply.')
+
+    wr_b, se_b = _wr_and_se(sum(r['outcome'] == 'win' for r in bolster_games), len(bolster_games))
+    no_bolster = [r for r in records if r['bolster_count'] == 0]
+    wr_no, se_no = _wr_and_se(sum(r['outcome'] == 'win' for r in no_bolster), len(no_bolster))
+    print(f'  WR when bolstered >=1:  {wr_b:.3f} ± {se_b:.3f} (n={len(bolster_games)})')
+    print(f'  WR when never bolstered:{wr_no:.3f} ± {se_no:.3f} (n={len(no_bolster)})')
+
+    # Per unit: total bolsters, how many while supply still had coins, and the average
+    # number of coins that were left in supply at those moments. Sorted by total desc.
+    per_unit_total = Counter()
+    per_unit_supply = Counter()
+    per_unit_supply_sum = Counter()
+    for r in records:
+        per_unit_total.update(r['bolsters'])
+        per_unit_supply.update(r['bolsters_with_supply'])
+        per_unit_supply_sum.update(r['supply_left_sum'])
+    print(f'\n  {"unit":<16} {"bolsters":>9} {"w/ supply left":>15} {"avg supply left":>16}')
+    for uid, tot in per_unit_total.most_common():
+        name = UNIT_BY_ID[uid].name
+        with_sup = per_unit_supply[uid]
+        avg = per_unit_supply_sum[uid] / with_sup if with_sup else float('nan')
+        avg_str = f'{avg:.2f}' if avg == avg else '—'
+        print(f'  {name:<16} {tot:>9} {with_sup:>15} {avg_str:>16}')
 
 
 def _print_exact_composition_breakdown(records, min_games=3):
@@ -216,11 +282,7 @@ def main():
     print(f'  WR when tactic used:     {wr_tactic:.3f} ± {se_tactic:.3f} (n={len(tactic_games)})')
     print(f'  WR when tactic NOT used: {wr_no_tactic:.3f} ± {se_no_tactic:.3f} (n={len(no_tactic_games)})')
 
-    bolster_games = [r for r in decisive if r['bolster_count'] > 0]
-    total_bolsters = sum(r['bolster_count'] for r in decisive)
-    print(f'\nBolster used at least once: {len(bolster_games)}/{len(decisive)} games '
-          f'({len(bolster_games) / len(decisive):.1%}), {total_bolsters} bolster actions total '
-          f'({total_bolsters / len(decisive):.2f} per game)')
+    _print_bolster_breakdown(decisive)
 
     # Stack-chain units (Berserker: extra_maneuvers_from_stack) never touch V_TACTIC —
     # their ability triggers via the 'extra_maneuver' pending state instead, so this
@@ -265,6 +327,9 @@ def main():
                 row = dict(r)
                 row['my_composition'] = ','.join(row['my_composition'])
                 row['opp_composition'] = ','.join(row['opp_composition'])
+                for col in ('bolsters', 'bolsters_with_supply', 'supply_left_sum'):
+                    row[col] = ','.join(
+                        f'{UNIT_BY_ID[uid].name}:{cnt}' for uid, cnt in row[col].items())
                 writer.writerow(row)
         print(f'\nWrote {len(records)} game records to {args.out_csv}')
 

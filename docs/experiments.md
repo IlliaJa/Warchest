@@ -134,3 +134,60 @@ A ~0.3 pooled-std gap, from a single run per architecture, is indistinguishable 
 **Implication.** This run provides no evidence the architecture change helped or hurt. The entropy/critic numbers hint the new network isn't obviously worse, but nothing here clears the noise bar. To actually test the hypothesis: 2–3 seeds per architecture, same `n_batches`, comparing distributions (as above) rather than single runs or endpoints.
 
 ![Threat/position-aware observation vs. correct baseline — W&B comparison panels, orange=ppo_20260702-082214 (new) vs magenta=ppo_20260701-191923 (baseline, same n_batches=400)](assets/2026-07-02-spacial-awareness.png)
+
+---
+
+## 2026-07-04 — New obs features + annealed material PBRS + PPO tuning, parallelized (~600 batches)
+
+**Changes.** This run bundles everything landed since the 2026-07-02 entry — it is *not* an
+isolated A/B:
+- **Observation** (`docs/history.md` 2026-07-03): material-at-risk, expected-opponent-hand
+  (`E_opp_hand`), and base-control reach planes added (commit `70c948b`, `OBS_VERSION` bump).
+- **Reward + critic** (`docs/history.md` 2026-07-03): annealed material PBRS reward; critic
+  widened to `critic_hidden_dim=192` (commit `33e33d2`).
+- **PPO dynamics** (commit `dcaabdd`): `lr_final_frac` 0.0 → **0.1** (LR now decays to
+  `3e-4 → 3e-5`, not to 0, targeting late-run WR oscillation); `KL_TARGET` raised to **0.03**
+  with per-minibatch KL-skip instead of an early-stop of the whole epoch.
+- **Speed:** episode-level multiprocessing (`n_workers=6`, `docs/parallel_rollouts.md`).
+  Speed-only in expectation — it changes the concrete episode sample (parallel RNG streams)
+  but not the learning dynamics.
+
+Config: `n_batches=600, collect_episodes=64, ppo_epochs=4, ppo_eps=0.2, gamma=0.99, lam=0.95,
+entropy_coeff=0.025→0.003, lr=3e-4→3e-5, hidden_dim=64, critic_hidden_dim=192, minibatch=64,
+pool_snapshot_every=15`, shaping anneal `1.0→0.1` over the first 50% then floored. Greedy eval
+is the true bot (`RANDOM_ACTION_PROB=0`), so WR-vs-greedy is honest.
+
+**Results — new best on every headline metric, and the score-vs-win decoupling is gone.**
+- **`elo_policy`** climbs ~1000 → **~1500** (peak ~1520), essentially monotone across the whole
+  run — a clear step above the prior highs (1457 on 07-02, 1433 on 06-30).
+- **`wr_vs_greedy_eval`** rises 0 → **~0.9**, oscillating 0.8–1.0 through the second half
+  (vs 0.80 / 0.70 in the two prior logged runs); `wr_vs_greedy_train` tracks it at ~0.9;
+  `wr_vs_random_eval` saturates at 1.0.
+- **Elo/WR keep climbing together with `score_main`** (~0 → ~0.6) instead of the score-up /
+  WR-flat split that defined the 2026-06-30 run. This is the headline: the agent is now
+  converting dense shaping into actual wins, and WR is still trending up at the end rather
+  than plateauing.
+- **Shaping annealed cleanly:** `shaping_anneal` 1.0 → 0.1 by ~batch 300; `score_material` and
+  `score_holding` both decay to ~0 as intended, so the late-run gains are terminal-driven.
+- **Exploration:** `entropy` falls 1.75 → ~0.7 while `max_entropy` *rises* to ~2.5 (mean legal
+  count grows as games open up); `entropy_frac` ends ~0.25 — the policy still spreads mass over
+  ~a quarter of legal moves, same regime as before, not a hard collapse.
+- **Training health is clean:** `clip_frac` 0.15 → ~0.05 (consistent with LR/entropy anneal),
+  `critic_loss` ~0.2 flat, `actor_loss` ~-0.02 → 0, `advantage_std` ~0.4 stable, grad norms low
+  with only occasional late spikes (actor ≤15, critic ≤5). `critic_mae` drifts *up* 0.05 → ~0.22
+  over the run (return scale grows as the policy improves) but ends below the 0.34 of the 07-02
+  baseline — worth watching, not alarming.
+
+**Caveats.**
+1. **Bundled changes, n=1.** Three substantive changes (obs features, reward+critic, PPO
+   tuning) shipped together, so the ~1500 Elo / ~0.9 WR gain can't be attributed to any one
+   piece without an ablation. WR oscillates with `eval_episodes=20` (~11pp std error), so the
+   peak-vs-plateau shape from a single run is not distinguishable from noise.
+2. **`wr_vs_pool_train` ≈ 0.7, not the ~0.5 self-play equilibrium** — it sits above 0.5,
+   oscillating ~0.6–0.8, i.e. the policy is outrunning its own snapshots. The pool is lagging
+   (improvement outpacing `pool_snapshot_every=15`), so the greedy/Elo gains are real but
+   self-play here is not a tight equilibrium. Denser snapshots may keep the pool honest.
+3. Parallel rollouts were correctness-verified but the head-to-head speed benchmark
+   (`n_workers=1` vs `6`) is still pending (`docs/parallel_rollouts.md`).
+
+![New obs + annealed material PBRS + PPO tuning — W&B training panels (~600 batches)](assets/2026-07-04.png)

@@ -134,6 +134,10 @@ class PPOTrainer:
         # Parallel rollout collection (docs/parallel_rollouts.md). n_workers<=1 => in-process
         # path. Capped at collect_episodes so every worker gets >=1 episode.
         self._n_workers = min(hp.get('n_workers', 1), hp['collect_episodes'])
+        # Overlap batch N+1's (CPU worker) collection with batch N's GPU update. Hides the
+        # rollout wall behind the update at the cost of 1-step-stale behavior weights + a
+        # second in-flight buffer in RAM. Only meaningful when n_workers > 1.
+        self._overlap = hp.get('overlap_collection', False)
         self._rollout_seed = hp.get('rollout_seed', 0)
         self._policy_hidden_dim = hp['hidden_dim']
         self._pool_max_size = hp.get('pool_max_size', 20)
@@ -183,8 +187,15 @@ class PPOTrainer:
         self._batch_start: float = 0.0
         self._t_env: float = 0.0
         self._t_model_play: float = 0.0
-        self._t_gradient: float = 0.0
-        self._t_collect_wall: float = 0.0
+        # per-batch timing (seconds) surfaced in the timing log line
+        self._t_rollout: float = 0.0
+        self._t_rollout_env: float = 0.0
+        self._t_rollout_model: float = 0.0
+        self._t_ipc: float = 0.0
+        self._t_value_pass: float = 0.0
+        self._t_actor_grad: float = 0.0
+        self._t_critic_grad: float = 0.0
+        self._t_eval: float = 0.0
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -207,40 +218,64 @@ class PPOTrainer:
             group['lr'] = self._lr_critic_init * lr_scale
 
         # Holding + material shaping anneal: 1.0 -> SHAPING_ANNEAL_FINAL over the first
-        # SHAPING_ANNEAL_HALF_FRAC of the run (half-point derived from n_batches so it
-        # tracks a changed schedule length), then held at the floor.
+        # SHAPING_ANNEAL_HALF_FRAC of the run, then held at the floor. Used at COLLECTION
+        # time; kept pure (see _compute_shaping_anneal) so the overlap path can compute the
+        # next batch's value without disturbing this batch's LR/entropy.
+        self._shaping_anneal = self._compute_shaping_anneal(batch_num)
+
+    def _compute_shaping_anneal(self, batch_num: int) -> float:
         half = max(self._n_batches * SHAPING_ANNEAL_HALF_FRAC, 1.0)
         anneal_frac = min((batch_num - 1) / half, 1.0)
-        self._shaping_anneal = (
-            SHAPING_ANNEAL_INIT + anneal_frac * (SHAPING_ANNEAL_FINAL - SHAPING_ANNEAL_INIT)
-        )
+        return SHAPING_ANNEAL_INIT + anneal_frac * (SHAPING_ANNEAL_FINAL - SHAPING_ANNEAL_INIT)
 
     def train(self):
+        overlap = self._n_workers > 1 and self._overlap
+        if overlap:
+            logger.warning(
+                'overlap_collection=True: batch N+1 is collected with pre-update (1-step-stale) '
+                'weights while the GPU updates batch N. Hides rollout wall behind the update, '
+                'but adds off-policy staleness (interacts with KL-skip) and a second in-flight '
+                'buffer in RAM. A/B learning quality, not just speed; disable if RAM-bound.'
+            )
         try:
+            if overlap:
+                # Prime the pipeline: batch 1's rollout is launched before the loop so it is
+                # ready to gather on the first iteration.
+                self._submit_parallel(1)
             for batch_num in range(1, self._n_batches + 1):
-                self._update_schedules(batch_num)
+                self._update_schedules(batch_num)  # LR/entropy for THIS batch's update
                 self._batch_start = time.time()
-                # Only the policy runs during rollout (single-obs act() calls); it goes to
-                # CPU to dodge batch=1 CUDA launch overhead. The critic is NOT used per step
-                # anymore — its values are computed in one batched GPU pass below — so it
-                # stays on self._device throughout. (In the parallel path the workers hold
-                # their own CPU policy copies; this keeps the main copy consistent.)
-                self._policy.to('cpu')
-                tc = time.perf_counter()
-                self._collect_batch()  # leaves the buffer stacked (serial: stack(); parallel: ingest)
+
+                # --- collection: get this batch's transitions into the buffer ---
+                if overlap:
+                    # Rollout was submitted in the previous iteration and ran concurrently
+                    # with the previous update; just gather it.
+                    roll_timing = self._gather_and_ingest()
+                elif self._n_workers > 1:
+                    roll_timing = self._collect_parallel_barrier(batch_num)
+                else:
+                    roll_timing = self._collect_serial()
+
+                # --- values + GAE (main process / GPU) ---
+                tv = time.perf_counter()
                 self._compute_values_batched()
                 self._buffer.compute_gae(self._gamma, self._lam, self._device)
                 self._ret_normalizer.update(self._buffer.returns)
-                # Wall-clock of the whole collection phase. Distinct from self._t_env /
-                # self._t_model_play, which in the parallel path are SUMMED across workers
-                # (aggregate CPU-seconds > wall); this is the honest wall number.
-                self._t_collect_wall = time.perf_counter() - tc
-                self._policy.to(self._device)
-                t0 = time.perf_counter()
+                self._t_value_pass = time.perf_counter() - tv
+
+                # --- overlap: launch next batch's rollout NOW (pre-update weights) so the
+                #     CPU workers run it while the GPU does this batch's update below ---
+                if overlap and batch_num < self._n_batches:
+                    self._submit_parallel(batch_num + 1)
+
+                # --- update (GPU); sets self._t_actor_grad / self._t_critic_grad ---
                 update_stats = self._run_ppo_update(batch_num)
-                self._t_gradient = time.perf_counter() - t0
+
                 self._pool.maybe_snapshot(self._policy)
+                te = time.perf_counter()
                 self._maybe_eval(batch_num)
+                self._t_eval = time.perf_counter() - te
+                self._store_roll_timing(roll_timing)
                 self._log_batch(batch_num, update_stats)
         finally:
             if self._collector is not None:
@@ -273,42 +308,7 @@ class PPOTrainer:
         self._critic.train()
         self._buffer.set_values(torch.cat(raw_values).numpy() if raw_values else [])
 
-    def _collect_batch(self):
-        """Fill + stack the buffer with collect_episodes episodes (values + GAE run after).
-
-        Dispatches to the parallel worker pool when n_workers > 1, else the in-process path.
-        Both leave the buffer in the same stacked state.
-        """
-        self._batch_eps = []
-        self._t_env = 0.0
-        self._t_model_play = 0.0
-        if self._n_workers > 1:
-            self._collect_batch_parallel()
-        else:
-            self._collect_batch_serial()
-
-    def _collect_batch_serial(self):
-        self._buffer.clear()
-        self._policy.train()
-        self._critic.train()
-        for _ in range(self._collect_episodes):
-            main_pid = np.random.choice([1, 2])
-            # Sample the opponent onto the rollout device (CPU during collection — see
-            # train()), not self._device. A pool snapshot left on the GPU would run its
-            # per-move forward at batch=1 on CUDA, exactly the launch/transfer overhead
-            # the CPU-rollout design exists to avoid — and it dominates late-run batches
-            # where p_pool -> 0.9.
-            opp, opp_type = self._pool.sample(self._policy_constructor, self._policy.device)
-            ep = self._collect_episode(opp, main_pid, opp_type)
-            self._batch_eps.append(ep)
-        self._buffer.stack()
-
-    def _collect_batch_parallel(self):
-        """Collect the batch across worker processes, then ingest their numpy transitions.
-
-        Timing note: t_env/t_model_play here are summed across workers (aggregate CPU work),
-        so they exceed the collection wall-clock — the batch `t=` (wall) is the honest number.
-        """
+    def _lazy_init_collector(self):
         if self._collector is None:
             self._collector = ParallelRolloutCollector(
                 self._n_workers,
@@ -316,18 +316,57 @@ class PPOTrainer:
                 pool_max_size=self._pool_max_size,
                 seed_base=self._rollout_seed,
             )
-        chunks = self._collector.collect(
+
+    def _submit_parallel(self, batch_num: int):
+        """Broadcast weights + hand out episodes for `batch_num` to the worker pool (async)."""
+        self._lazy_init_collector()
+        self._collector.submit(
             self._policy, self._pool, self._collect_episodes,
             gamma=self._gamma,
-            shaping_anneal=self._shaping_anneal,
+            shaping_anneal=self._compute_shaping_anneal(batch_num),
             holding_reward_rate=self._holding_reward_rate,
             max_t=self._max_t,
         )
+
+    def _gather_and_ingest(self) -> dict:
+        """Wait for the submitted batch, ingest worker transitions, return rollout timing."""
+        chunks, timing = self._collector.gather()
+        self._batch_eps = []
         self._buffer.ingest_chunks(chunks)
         for c in chunks:
             self._batch_eps.extend(c['episode_dicts'])
-            self._t_env += c['t_env']
-            self._t_model_play += c['t_model_play']
+        return timing
+
+    def _collect_parallel_barrier(self, batch_num: int) -> dict:
+        """Non-overlap parallel path: submit then immediately gather (main blocks)."""
+        self._submit_parallel(batch_num)
+        return self._gather_and_ingest()
+
+    def _collect_serial(self) -> dict:
+        """In-process collection. Policy goes to CPU (dodges batch=1 CUDA overhead), back after."""
+        self._policy.to('cpu')
+        self._batch_eps = []
+        self._t_env = 0.0
+        self._t_model_play = 0.0
+        self._policy.train()
+        self._critic.train()
+        t0 = time.perf_counter()
+        self._buffer.clear()
+        for _ in range(self._collect_episodes):
+            main_pid = np.random.choice([1, 2])
+            opp, opp_type = self._pool.sample(self._policy_constructor, self._policy.device)
+            ep = self._collect_episode(opp, main_pid, opp_type)
+            self._batch_eps.append(ep)
+        self._buffer.stack()
+        wall = time.perf_counter() - t0
+        self._policy.to(self._device)
+        return {'rollout': wall, 'env': self._t_env, 'model_play': self._t_model_play, 'ipc': 0.0}
+
+    def _store_roll_timing(self, t: dict):
+        self._t_rollout = t['rollout']
+        self._t_rollout_env = t['env']
+        self._t_rollout_model = t['model_play']
+        self._t_ipc = t['ipc']
 
     def _collect_episode(self, opp, main_pid, opp_type) -> dict:
         """Run one episode via the shared rollout core, then append its steps to the buffer.
@@ -359,9 +398,13 @@ class PPOTrainer:
     # ------------------------------------------------------------------
 
     def _run_ppo_update(self, batch_num: int) -> dict:
-        """Run actor and critic updates independently over the current buffer."""
+        """Run actor and critic updates independently over the current buffer (timed separately)."""
+        t0 = time.perf_counter()
         actor_stats = self._update_actor(batch_num)
+        self._t_actor_grad = time.perf_counter() - t0
+        t0 = time.perf_counter()
         critic_stats = self._update_critic(batch_num)
+        self._t_critic_grad = time.perf_counter() - t0
         return {**actor_stats, **critic_stats}
 
     def _update_actor(self, batch_num: int) -> dict:
@@ -612,17 +655,21 @@ class PPOTrainer:
             f'critic mean={s["avg_critic_mean"]:.4f} std={s["avg_critic_std"]:.4f} '
             f'clip_frac={s["avg_clip_frac"]:.3f} critic_mae={s["avg_critic_mae"]:.4f}'
         )
-        # total_accounted is real wall (collection wall + gradient wall), NOT the summed
-        # per-worker rollout time. The env/model_play breakdown is aggregate CPU-seconds
-        # across workers in the parallel path (so it can exceed the collection wall).
-        total_t = self._t_collect_wall + self._t_gradient
-        agg = f' (aggregate x{self._n_workers} workers)' if self._n_workers > 1 else ''
+        # rollout = worker critical-path wall (max over workers in parallel; the serial wall
+        # otherwise). env/model_play are aggregate CPU-seconds across workers in parallel (so
+        # they can exceed `rollout`). In overlap mode `rollout` ran concurrently with the
+        # previous update, so total < rollout + gradients — that gap is the overlap win.
+        total_wall = time.time() - self._batch_start
+        overlap_note = ' (overlapped)' if (self._n_workers > 1 and self._overlap) else ''
+        agg = f' aggregate/{self._n_workers}w' if self._n_workers > 1 else ''
         logger.info(
             f'batch={batch_num} timing: '
-            f'collect={self._t_collect_wall:.2f}s ({100*self._t_collect_wall/total_t:.0f}%) '
-            f'gradient={self._t_gradient:.2f}s ({100*self._t_gradient/total_t:.0f}%) '
-            f'total_accounted={total_t:.2f}s | '
-            f'rollout breakdown{agg}: env={self._t_env:.2f}s model_play={self._t_model_play:.2f}s'
+            f'rollout={self._t_rollout:.2f}s{overlap_note} '
+            f'(env={self._t_rollout_env:.2f}s model_play={self._t_rollout_model:.2f}s{agg}) | '
+            f'value_pass={self._t_value_pass:.2f}s '
+            f'actor_gradient={self._t_actor_grad:.2f}s critic_gradient={self._t_critic_grad:.2f}s '
+            f'eval={self._t_eval:.2f}s | '
+            f'IPC={self._t_ipc:.2f}s | total={total_wall:.2f}s'
         )
         logger.info(
             f'batch={batch_num}/{self._n_batches} '
@@ -708,6 +755,10 @@ if __name__ == '__main__':
         # Parallel rollout collection (docs/parallel_rollouts.md). 1 = in-process; 6 leaves
         # cores for the GPU update + IPC + OS on this 12-core box. Capped at collect_episodes.
         'n_workers': 6,
+        # Overlap next-batch collection with the GPU update (docs/parallel_rollouts.md P11b).
+        # Hides rollout wall behind the update; adds 1-step off-policy staleness + a second
+        # in-flight buffer in RAM. A/B learning quality, and disable if RAM-bound.
+        'overlap_collection': True,
         'rollout_seed': 0,
         'lr_actor': 3e-4,
         'lr_critic': 3e-4,

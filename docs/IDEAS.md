@@ -64,21 +64,13 @@ The full base game (all 16 units + per-game disjoint drafting) is implemented; d
 
 **Priority: backlog, bundle with the next observation-schema change rather than standalone.** Deprioritized because: (a) self-assessed as a weak effect, and weak effects are exactly what the current ~0.10 eval-noise band cannot detect; (b) `GreedyBot` never recruits, so it doesn't punish bag dilution — this barely touches the "beat greedy" axis; (c) it's the same class of change as the threat planes ("hand the network a value it could in principle already compute from raw state"), and that class already produced a measured **no-effect** result (`docs/history.md` → "Threat/position-aware observation"). Add it opportunistically when another `OBS_VERSION` bump is already planned, so the retrain cost is shared rather than spent on this alone.
 
-### Material-at-risk + expected-opponent-hand observation features
-
-**Planned in full: `docs/observation_improvement.md`.** Two actor-legibility features bundled into one `OBS_VERSION 9 → 10` bump, A/B'd separately:
-- **`own/opp_material_at_risk`** — two scalars: how much of my committed on-board material can die next turn (`Σ min(enemy_hits[cell], stack)`), and how much of theirs I can kill. Reduces the existing threat grids × unit-stack occupancy — a cross-plane spatial reduction the location-blind heads compute poorly. Drives the bolster/trade/extend decision.
-- **`E_opp_hand[t]`** — expected copies of type `t` in the opponent's hand *right now* (`hidden_v[t] · opp_hand_size / hidden_total`), the calibrated version of "can they counter this." An **actor-side** feature: the critic already sees the true opp-hand split (`PRIV_DIM`), the policy only sees the public pool and never combines it with hand size.
-
-See the plan doc for formulas, modeling choices, normalization, and the discarded alternatives (stack-fragility, base-count, own-tempo). Difficulty: low. Shares the same "bundle with the next schema bump" logic as the draw-probability features above.
-
 ### Likelihood-weighted threat-plane magnitude
 
-*(Split off from the expected-opponent-hand feature above — a variant, not a duplicate.)*
+*(A variant of the shipped `E_opp_hand` feature — `docs/history.md` 2026-07-03 — not a duplicate.)*
 
 The enemy threat planes gate opponent availability worst-case: a unit type contributes its full hit-count to a cell if the opponent holds **≥1** hidden coin of that type (`_threat_grids` `coin_gate`, `warchest_env.py:1593-1594`). This is correct for spatial *safety* — one Berserker coin they happen to hold is lethal even at low expected count, and you don't want the plane to average that tail away.
 
-**The idea:** scale each unit's threat contribution by its **likelihood of being playable this round** — `E_opp_hand[t]` (see above / `docs/observation_improvement.md`) instead of the binary `≥1` gate. The plane would then read *"how likely am I to actually be hit here,"* not *"could I possibly be hit here."*
+**The idea:** scale each unit's threat contribution by its **likelihood of being playable this round** — the shipped `E_opp_hand[t]` feature (`docs/observation_improvement.md`) instead of the binary `≥1` gate. The plane would then read *"how likely am I to actually be hit here,"* not *"could I possibly be hit here."*
 
 **Why it's parked, not planned:** it understates exactly the tails that lose material. Worst-case planes + an expected-hand **global** scalar (the split shipped in `observation_improvement.md`) already give both signals — max for "where can I die," mean for "how loaded are they" — without diluting the spatial safety read. Only revisit likelihood-weighting the *planes* if the worst-case version makes the agent measurably too timid (over-bolstering, refusing good trades). If pursued, A/B against the worst-case planes directly; keep the two mutually exclusive within the threat-plane block.
 
@@ -128,12 +120,12 @@ The verb head already groups all 6 move directions under one `V_MOVE` and all 6 
 
 ### 11. Parallel rollout collection — remaining phases 4 & 5
 
-Full design + phases 1-3 in `docs/parallel_rollouts.md` (Phase 1, the `rollout_core.play_episode` refactor, is implemented; Phases 2-3 build the `spawn` worker pool + scale to `n_workers=6`). These are the two **deferred** phases, worth doing only after 2-3 land and profiling justifies them:
+Full design in `docs/parallel_rollouts.md`. **All phases 1-5 are now implemented** (P11a dynamic balancing via a shared atomic episode counter; P11b `overlap_collection` hides the rollout wall behind the GPU update). Remaining open work is validation + tuning, not implementation:
 
-- **P11a. Dynamic work-queue load balancing.** v1 splits `collect_episodes` statically across workers; episodes vary 60-200 turns, so the batch waits on the slowest worker's longest episode. Replace with a shared task queue workers pull from until the batch quota is met, trimming the tail. Do this only if profiling shows a real imbalance (per-worker collection-time spread). Difficulty: low-moderate.
-- **P11b. Overlap collection with the update.** The policy is frozen during collection, so batch N+1's rollout can run on the workers while the main process does batch N's GPU update. Est. another ~15-20% wall-clock, but adds a pipelining stage (weight-broadcast timing, one-batch-stale snapshots) and complicates the equivalence story. Difficulty: moderate. Only after N=6 is stable and measured.
+- **P11c. Real-config speed + learning-quality A/B.** Overlap adds 1-step off-policy staleness (behavior weights are one update behind), which interacts with the KL-skip (larger old→new gap → more skipped minibatches). Compare `overlap=True` vs `False` on **elo/wr trajectory**, not just wall-clock, before trusting it. Also confirm RAM headroom — overlap holds a second in-flight buffer (the box was at 87% RAM when this landed).
+- **P11d. IPC via shared memory (if it ever bottlenecks).** Currently worker→main transfer is pickle-through-Queue (~55 MB/batch). Steady-state IPC is small (→0 when hidden by overlap); move board arrays to `multiprocessing.shared_memory` only if profiling shows it on the critical path.
 
-Standing-rule reminder: measure `t=` distributions over ≥10 batches per config, not a single batch — spawn/import startup and pool-phase (`p_pool→0.9`) opponent cost both skew early/late batches.
+Standing-rule reminder: measure over ≥10 batches per config, not a single batch — spawn/import startup (batch 1) and pool-phase (`p_pool→0.9`) opponent cost both skew early/late batches.
 
 ---
 

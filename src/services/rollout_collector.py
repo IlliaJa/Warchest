@@ -3,8 +3,12 @@
 See docs/parallel_rollouts.md. Workers are CPU-only and run ONLY the policy (act) + the
 opponent move + env.step — the critic never leaves the main process (its values are computed
 in one batched GPU pass after collection). Each batch the main process broadcasts the small
-policy state_dict plus, incrementally, any new pool snapshot; workers return pre-stacked numpy
-transitions which the main process concatenates into the RolloutBuffer.
+policy state_dict plus, incrementally, any new pool snapshot; workers pull episodes from a
+shared counter (dynamic load balancing — P11a) and return pre-stacked numpy transitions which
+the main process concatenates into the RolloutBuffer.
+
+The API is split into submit() / gather() so the caller can overlap the next batch's collection
+with the current batch's GPU update (P11b).
 
 Kept import-light at module top so `spawn` children re-import it cheaply; torch/env/policy are
 imported inside the worker function.
@@ -12,15 +16,15 @@ imported inside the worker function.
 
 import logging
 import multiprocessing as mp
+import time
 
 logger = logging.getLogger('warchest')
 
 
-def _worker_loop(worker_id, task_q, result_q, cfg):
-    """Persistent worker: load weights, play its share of episodes, return numpy transitions."""
+def _worker_loop(worker_id, task_q, result_q, counter, cfg):
+    """Persistent worker: load weights, claim episodes from the shared counter, return numpy."""
     import os
     import sys
-    # Under spawn the child starts fresh; make the project root importable.
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
     if root not in sys.path:
         sys.path.insert(0, root)
@@ -53,16 +57,25 @@ def _worker_loop(worker_id, task_q, result_q, cfg):
     env = WarChestEnv(save_game_history=False, debug_mode=False)
     policy = policy_constructor()
     policy.eval()
-    # snapshot_every is irrelevant here — the main process owns snapshotting; the worker only
-    # mirrors the pool contents via append_snapshot. Weights are set per task.
     pool = OpponentPool(max_size=cfg['pool_max_size'], snapshot_every=10 ** 9,
                         p_random=1.0, p_greedy=0.0, p_pool=0.0)
+
+    def claim_episode():
+        # Atomic decrement of the shared remaining-episode counter (dynamic load balancing:
+        # fast workers naturally take more episodes, so the batch waits on total work / N
+        # rather than on the slowest fixed share).
+        with counter.get_lock():
+            if counter.value <= 0:
+                return False
+            counter.value -= 1
+            return True
 
     while True:
         task = task_q.get()
         if task is None:
             break
         try:
+            t_start = time.perf_counter()
             policy.load_state_dict(task['policy_sd'])
             for sd in task['new_snapshots']:
                 pool.append_snapshot(sd)
@@ -72,7 +85,7 @@ def _worker_loop(worker_id, task_q, result_q, cfg):
             ends, episode_dicts = [], []
             t_env = t_model = 0.0
 
-            for _ in range(task['n_episodes']):
+            while claim_episode():
                 main_pid = int(np.random.choice([1, 2]))
                 opp, opp_type = pool.sample(policy_constructor, device)
                 steps, ep = play_episode(
@@ -93,20 +106,26 @@ def _worker_loop(worker_id, task_q, result_q, cfg):
                 t_model += ep.pop('t_model_play')
                 episode_dicts.append(ep)
 
-            payload = {
-                'boards': np.stack([o['board'] for o in obs_l]),
-                'globals': np.stack([o['global'] for o in obs_l]),
-                'masks': np.stack([o['valid_action_mask'] for o in obs_l]),
-                'actions': np.array(act_l, dtype=np.int64),
-                'log_probs': np.array(lp_l, dtype=np.float32),
-                'rewards': np.array(rew_l, dtype=np.float32),
-                'opp_onehots': np.stack(opp_l),
-                'privileged': np.stack(priv_l),
-                'episode_ends': ends,
-                'episode_dicts': episode_dicts,
-                't_env': t_env,
-                't_model_play': t_model,
-            }
+            # A worker may claim zero episodes (all taken by faster peers) — return an empty,
+            # concat-safe payload the buffer ingest skips.
+            if obs_l:
+                payload = {
+                    'boards': np.stack([o['board'] for o in obs_l]),
+                    'globals': np.stack([o['global'] for o in obs_l]),
+                    'masks': np.stack([o['valid_action_mask'] for o in obs_l]),
+                    'actions': np.array(act_l, dtype=np.int64),
+                    'log_probs': np.array(lp_l, dtype=np.float32),
+                    'rewards': np.array(rew_l, dtype=np.float32),
+                    'opp_onehots': np.stack(opp_l),
+                    'privileged': np.stack(priv_l),
+                    'episode_ends': ends,
+                    'episode_dicts': episode_dicts,
+                }
+            else:
+                payload = {'episode_ends': [], 'episode_dicts': []}
+            payload['t_env'] = t_env
+            payload['t_model_play'] = t_model
+            payload['t_worker_wall'] = time.perf_counter() - t_start
             result_q.put((worker_id, 'OK', payload))
         except Exception:
             import traceback
@@ -114,13 +133,21 @@ def _worker_loop(worker_id, task_q, result_q, cfg):
 
 
 class ParallelRolloutCollector:
-    """Owns the persistent worker pool; broadcasts weights and gathers transitions per batch."""
+    """Owns the persistent worker pool; broadcasts weights and gathers transitions per batch.
+
+    submit()/gather() are separate so the caller can overlap the next batch's collection with
+    the current batch's GPU update (P11b). collect() = submit()+gather() for the non-overlap
+    path. Episodes are handed out via a shared atomic counter (P11a dynamic balancing), so
+    which worker plays how many episodes varies with timing — runs are NOT bit-reproducible
+    even for a fixed seed (documented tradeoff).
+    """
 
     def __init__(self, n_workers, *, policy_hidden_dim, pool_max_size, seed_base):
         self._ctx = mp.get_context('spawn')
         self._n = n_workers
         self._task_qs = [self._ctx.Queue() for _ in range(n_workers)]
         self._result_q = self._ctx.Queue()
+        self._counter = self._ctx.Value('i', 0)  # remaining episodes this batch
         self._procs = []
         cfg = {
             'policy_hidden_dim': policy_hidden_dim,
@@ -130,7 +157,7 @@ class ParallelRolloutCollector:
         for wid in range(n_workers):
             p = self._ctx.Process(
                 target=_worker_loop,
-                args=(wid, self._task_qs[wid], self._result_q, cfg),
+                args=(wid, self._task_qs[wid], self._result_q, self._counter, cfg),
                 daemon=True,
             )
             p.start()
@@ -138,32 +165,40 @@ class ParallelRolloutCollector:
         self._seen_snapshots = 0
         logger.info(f'ParallelRolloutCollector: spawned {n_workers} rollout workers')
 
-    def collect(self, policy, pool, n_episodes, *, gamma, shaping_anneal,
-                holding_reward_rate, max_t):
-        """Broadcast the current policy + pool delta, run n_episodes across workers.
-
-        Returns the per-worker payloads in worker-id order (deterministic concat order).
-        """
+    def submit(self, policy, pool, n_episodes, *, gamma, shaping_anneal,
+               holding_reward_rate, max_t):
+        """Broadcast the policy + pool delta and hand out n_episodes for the workers to claim."""
         policy_sd = {k: v.detach().cpu() for k, v in policy.state_dict().items()}
         new_snaps, cnt = pool.new_snapshots_since(self._seen_snapshots)
         self._seen_snapshots = cnt
         weights = pool.weights
 
-        base, rem = divmod(n_episodes, self._n)
-        counts = [base + (1 if i < rem else 0) for i in range(self._n)]
+        with self._counter.get_lock():
+            self._counter.value = n_episodes
 
+        task = {
+            'policy_sd': policy_sd,
+            'new_snapshots': new_snaps,
+            'weights': weights,
+            'gamma': gamma,
+            'shaping_anneal': shaping_anneal,
+            'holding_reward_rate': holding_reward_rate,
+            'max_t': max_t,
+        }
         for wid in range(self._n):
-            self._task_qs[wid].put({
-                'policy_sd': policy_sd,
-                'new_snapshots': new_snaps,
-                'weights': weights,
-                'n_episodes': counts[wid],
-                'gamma': gamma,
-                'shaping_anneal': shaping_anneal,
-                'holding_reward_rate': holding_reward_rate,
-                'max_t': max_t,
-            })
+            self._task_qs[wid].put(task)
 
+    def gather(self):
+        """Block for all worker payloads; return (chunks, timing).
+
+        timing keys (seconds): rollout (critical-path worker wall = max over workers), env and
+        model_play (aggregate across workers), ipc (gather wall not explained by the slowest
+        worker ≈ result serialization + transfer + dispatch).
+        """
+        # Time the main thread is BLOCKED in the get-loop (not since submit): in the overlap
+        # path the rollout ran during the previous update, so this measures only the
+        # unhidden tail + transfer, not the whole intervening update.
+        t0 = time.perf_counter()
         results = {}
         for _ in range(self._n):
             wid, status, payload = self._result_q.get()
@@ -171,7 +206,22 @@ class ParallelRolloutCollector:
                 self.shutdown()
                 raise RuntimeError(f'rollout worker {wid} failed:\n{payload}')
             results[wid] = payload
-        return [results[w] for w in range(self._n)]
+        gather_wall = time.perf_counter() - t0
+
+        chunks = [results[w] for w in range(self._n) if results[w]['episode_ends']]
+        worker_walls = [results[w]['t_worker_wall'] for w in range(self._n)]
+        max_worker_wall = max(worker_walls) if worker_walls else 0.0
+        timing = {
+            'rollout': max_worker_wall,
+            'env': sum(results[w]['t_env'] for w in range(self._n)),
+            'model_play': sum(results[w]['t_model_play'] for w in range(self._n)),
+            'ipc': max(0.0, gather_wall - max_worker_wall),
+        }
+        return chunks, timing
+
+    def collect(self, policy, pool, n_episodes, **kw):
+        self.submit(policy, pool, n_episodes, **kw)
+        return self.gather()
 
     def shutdown(self):
         for q in self._task_qs:
