@@ -64,6 +64,24 @@ The full base game (all 16 units + per-game disjoint drafting) is implemented; d
 
 **Priority: backlog, bundle with the next observation-schema change rather than standalone.** Deprioritized because: (a) self-assessed as a weak effect, and weak effects are exactly what the current ~0.10 eval-noise band cannot detect; (b) `GreedyBot` never recruits, so it doesn't punish bag dilution — this barely touches the "beat greedy" axis; (c) it's the same class of change as the threat planes ("hand the network a value it could in principle already compute from raw state"), and that class already produced a measured **no-effect** result (`docs/history.md` → "Threat/position-aware observation"). Add it opportunistically when another `OBS_VERSION` bump is already planned, so the retrain cost is shared rather than spent on this alone.
 
+### Material-at-risk + expected-opponent-hand observation features
+
+**Planned in full: `docs/observation_improvement.md`.** Two actor-legibility features bundled into one `OBS_VERSION 9 → 10` bump, A/B'd separately:
+- **`own/opp_material_at_risk`** — two scalars: how much of my committed on-board material can die next turn (`Σ min(enemy_hits[cell], stack)`), and how much of theirs I can kill. Reduces the existing threat grids × unit-stack occupancy — a cross-plane spatial reduction the location-blind heads compute poorly. Drives the bolster/trade/extend decision.
+- **`E_opp_hand[t]`** — expected copies of type `t` in the opponent's hand *right now* (`hidden_v[t] · opp_hand_size / hidden_total`), the calibrated version of "can they counter this." An **actor-side** feature: the critic already sees the true opp-hand split (`PRIV_DIM`), the policy only sees the public pool and never combines it with hand size.
+
+See the plan doc for formulas, modeling choices, normalization, and the discarded alternatives (stack-fragility, base-count, own-tempo). Difficulty: low. Shares the same "bundle with the next schema bump" logic as the draw-probability features above.
+
+### Likelihood-weighted threat-plane magnitude
+
+*(Split off from the expected-opponent-hand feature above — a variant, not a duplicate.)*
+
+The enemy threat planes gate opponent availability worst-case: a unit type contributes its full hit-count to a cell if the opponent holds **≥1** hidden coin of that type (`_threat_grids` `coin_gate`, `warchest_env.py:1593-1594`). This is correct for spatial *safety* — one Berserker coin they happen to hold is lethal even at low expected count, and you don't want the plane to average that tail away.
+
+**The idea:** scale each unit's threat contribution by its **likelihood of being playable this round** — `E_opp_hand[t]` (see above / `docs/observation_improvement.md`) instead of the binary `≥1` gate. The plane would then read *"how likely am I to actually be hit here,"* not *"could I possibly be hit here."*
+
+**Why it's parked, not planned:** it understates exactly the tails that lose material. Worst-case planes + an expected-hand **global** scalar (the split shipped in `observation_improvement.md`) already give both signals — max for "where can I die," mean for "how loaded are they" — without diluting the spatial safety read. Only revisit likelihood-weighting the *planes* if the worst-case version makes the agent measurably too timid (over-bolstering, refusing good trades). If pursued, A/B against the worst-case planes directly; keep the two mutually exclusive within the threat-plane block.
+
 ### 3. A/B the 2026-07-03 reward + capacity bundle
 
 Material PBRS, annealed holding + material shaping, the base-diff-proportional truncation reward, and the critic-only widening all shipped together on 2026-07-03 (`docs/history.md`). The controlled A/B against the pre-change baseline is still owed — a run was started same-day (`ppo_20260703-142941`) but its outcome wasn't known at time of writing. Since all four changes landed in one pass, a clean A/B can only attribute the *bundle*, not the individual pieces; if the result is ambiguous, consider ablating one term at a time (start with material PBRS alone, since it's the one targeting the specific measured gap below).
@@ -99,6 +117,14 @@ Do idea 9 first — if tactic usage turns out to be reverse-causation, this isn'
 ### 9. Disambiguate tactic reverse-causation before acting on idea 8
 
 "Tactics correlate with losing" (11.5% usage, WR 0.696 with vs 0.915 without, from the same 200-game eval that motivated material PBRS) has two readings that imply *opposite* responses: reached-for-only-when-already-behind (reverse causation — no fix needed) vs. executed poorly when reached for (an execution/exploration gap — ideas 6/8 are on target). Cheap disambiguator: log tactic usage **conditioned on base-lead at the time of use**. If usage clusters in already-behind states, it's reverse causation; if it's spread across lead states, it's execution. Difficulty: low (logging only, no training change).
+
+### 10. Factor direction out of the move/attack spatial head
+
+The verb head already groups all 6 move directions under one `V_MOVE` and all 6 attack directions under one `V_ATTACK` (`warchest_env.py:113-115`, `N_FACTORED_VERBS=11`) — `P(verb)` doesn't distinguish move-north from move-south. But the *within-verb* spatial logits still come from `policy_head`'s single `Conv2d(hidden_dim + GLOBAL_DIM → N_VERBS=32, kernel=1)` (`policy.py:106`), which gives each of the 12 move/attack directions its own independently-learned output channel — direction isn't a shared factor, so the network can't transfer "which way is good here" between moving and attacking.
+
+**The idea:** add one more factorization level (verb → cell → direction) — collapse move/attack down to 2 spatial channels (or fold them into per-cell logits without a direction dimension) plus a small shared 6-way direction head reused by both verbs, analogous to how `verb_head` already shares parameters across directions at the top level.
+
+**Why parked, not planned:** the channel-count saving is modest (32 → ~22), and the real cost is reworking `policy_head` from a monolithic conv into cell-logits + a conditional direction head, then re-deriving `_joint_log_probs`/masking for a third factorization level (legal directions differ between move and attack per cell — masking must stay consistent with the new hierarchy). Worth it only if move/attack direction choices turn out to share enough structure that sample efficiency is actually gated on it; no evidence either way yet. Difficulty: moderate.
 
 ---
 

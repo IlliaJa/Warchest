@@ -6,7 +6,7 @@
 
 ### Board encoder (CNN)
 
-The board is encoded into `BOARD_CHANNELS` (46) planes by `generate_observation()` in `warchest_env.py` (not by the policy — the policy consumes the pre-encoded tensor directly):
+The board is encoded into `BOARD_CHANNELS` (48) planes by `generate_observation()` in `warchest_env.py` (not by the policy — the policy consumes the pre-encoded tensor directly):
 
 | Planes | Content |
 |---|---|
@@ -22,8 +22,10 @@ The board is encoded into `BOARD_CHANNELS` (46) planes by `generate_observation(
 | 41–43 | Enemy threat: melee, ranged, charge |
 | 44 | `row_coord` — static ego-centric row index / 6 |
 | 45 | `col_coord` — static ego-centric column index / 6 (the flank axis — see `docs/history.md` → "Threat/position-aware observation + deeper trunk") |
+| 46 | `own_base_reach` — 0/1: claimable base cells (uncontrolled or opponent-held) I can move a unit onto and claim *this turn* |
+| 47 | `enemy_base_reach` — 0/1: my bases (and neutrals) the opponent can reach and take this turn (objective-analogue of the threat planes; see `docs/observation_improvement.md`) |
 
-Planes 3/4, 6–37, 38–43 are all ego-centric (own vs opponent) regardless of which player is active; the P2 view rotates the whole board 180° so "own"/"forward" always mean the same thing. Three `HexConv2d` layers (3×3 hex-masked kernel, so the two non-hex-adjacent corners are always zero) process the `[BOARD_CHANNELS,7,7]` input — receptive-field radius 3, exactly covering the Lancer's distance-3 charge:
+Planes 3/4, 6–37, 38–47 are all ego-centric (own vs opponent) regardless of which player is active; the P2 view rotates the whole board 180° so "own"/"forward" always mean the same thing. Three `HexConv2d` layers (3×3 hex-masked kernel, so the two non-hex-adjacent corners are always zero) process the `[BOARD_CHANNELS,7,7]` input — receptive-field radius 3, exactly covering the Lancer's distance-3 charge:
 
 ```
 HexConv2d(BOARD_CHANNELS→32) + ReLU
@@ -33,7 +35,7 @@ HexConv2d(hidden_dim→hidden_dim) + ReLU
 
 ### Global features
 
-`global[GLOBAL_DIM]` (189) carries round/base/initiative counters and ego-centric coin-counting per type (own hand/bag/discard/supply/owned exactly; opponent's on-board/faceup/supply/owned exactly, with a bounded `hidden` pool standing in for what can't be observed) plus the pending-tactic-continuation one-hot — see the constant block above `GLOBAL_DIM` in `warchest_env.py` for the exact layout.
+`global[GLOBAL_DIM]` (211) carries round/base/initiative counters and ego-centric coin-counting per type (own hand/bag/discard/supply/owned exactly; opponent's on-board/faceup/supply/owned exactly, with a bounded `hidden` pool standing in for what can't be observed), plus (OBS_VERSION 10) **2 material-at-risk scalars** (own/opp coins that can die this turn = `Σ min(hits, stack)`), a **17-wide expected-opponent-hand vector** (`hidden · opp_hand_size / hidden_total` — actor-side estimate of live counter-capacity; the critic sees the true split via `PRIV_DIM`), and **3 base-control reach scalars** (bases I can claim this turn, my bases under flip threat, and a win-proximity alarm), then the pending-tactic-continuation one-hot — see the constant block above `GLOBAL_DIM` in `warchest_env.py` and `docs/observation_improvement.md` for the exact layout and rationale.
 
 ## Feature fusion and heads
 

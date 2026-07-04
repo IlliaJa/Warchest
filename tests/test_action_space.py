@@ -33,12 +33,14 @@ def test_action_space_sizes():
     assert ACTION_SPACE_SIZE == SPATIAL_SIZE + FACEDOWN_SIZE  # 1875
     assert DECLINE_ACTION_ID == ACTION_SPACE_SIZE - 1  # the very last id
     assert tuple(DEPLOY_VERBS.values()) == UNIT_COINS
-    assert OBS_VERSION == 9
+    assert OBS_VERSION == 10
 
 
 def test_global_dim_includes_pending_context():
     assert PENDING_CTX_DIM == 15  # 'no pending' + 14 tactic/attribute continuation kinds
-    assert GLOBAL_DIM == 7 * N_COIN_TYPES + 3 * roster.NUM_UNIT_TYPES + 7 + PENDING_CTX_DIM
+    # OBS_VERSION 10: +E_opp_hand (8th coin-vector) + 5 scalars (2 material-at-risk,
+    # 3 base-control reach) on top of the OBS_VERSION 9 layout.
+    assert GLOBAL_DIM == 8 * N_COIN_TYPES + 3 * roster.NUM_UNIT_TYPES + 12 + PENDING_CTX_DIM
 
 
 # --------------------------------------------------------------------------- #

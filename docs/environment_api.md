@@ -1,7 +1,7 @@
 # WarChestEnv API
 
 `WarChestEnv` follows the [Gymnasium](https://gymnasium.farama.org/) interface. This
-describes the current full-base-game schema (`OBS_VERSION = 9`, `ACTION_SPACE_SIZE = 1875`).
+describes the current full-base-game schema (`OBS_VERSION = 10`, `ACTION_SPACE_SIZE = 1875`).
 All named constants below are defined in `src/services/environment/warchest_env.py` unless
 noted otherwise.
 
@@ -57,12 +57,15 @@ Opens an interactive matplotlib window with Previous / Next buttons and keyboard
 }
 ```
 
-`BOARD_CHANNELS = 46`, `GLOBAL_DIM = 189`, `ACTION_SPACE_SIZE = 1875` for the current schema
-(bump `OBS_VERSION` — currently `9` — whenever any of these change). Board planes and global
+`BOARD_CHANNELS = 48`, `GLOBAL_DIM = 211`, `ACTION_SPACE_SIZE = 1875` for the current schema
+(bump `OBS_VERSION` — currently `10` — whenever any of these change). Board planes and global
 layout are documented in full in `docs/policy_network.md` (board encoder / global features
 sections); in short: 6 base/terrain planes, 16 own + 16 opponent per-unit-type stack planes,
-6 threat planes (own/enemy × melee/ranged/charge), 2 static coordinate planes, and a
-`PRIV_DIM = 51`-wide privileged (critic-only) opponent hidden-coin vector obtained separately
+6 threat planes (own/enemy × melee/ranged/charge), 2 static coordinate planes, and **2
+base-control reach planes** (own/enemy: base cells a side could move onto and claim this turn).
+The global vector adds (OBS_VERSION 10) 2 material-at-risk scalars, a 17-wide expected-opponent-hand
+vector, and 3 base-control reach scalars — see `docs/observation_improvement.md`. A
+`PRIV_DIM = 51`-wide privileged (critic-only) opponent hidden-coin vector is obtained separately
 (not part of the public `generate_observation()` dict — see `Critic.value_single`).
 
 For `active_player == 2` the whole observation is rotated 180° (board planes, `row_coord`/

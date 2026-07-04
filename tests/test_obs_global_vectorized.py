@@ -8,7 +8,7 @@ from collections import Counter
 from src.services.environment.warchest_env import (
     WarChestEnv,
     DECK, UNIT_COINS, RECRUIT_TYPES, N_COIN_TYPES, NUM_UNIT_TYPES,
-    TOTAL_COINS, SUPPLY_CAP, OWNED_TOTAL, HAND_SIZE, GLOBAL_DIM,
+    TOTAL_COINS, SUPPLY_CAP, OWNED_TOTAL, HAND_SIZE, GLOBAL_DIM, THREAT_KINDS,
     PENDING_CTX_DIM, PENDING_KIND_IDX,
     _DECK_LIST, _DECK_COIN_TO_IDX, _TOTAL_COINS_VEC,
     _UNIT_COIN_TO_IDX, _TOTAL_COINS_UNIT_VEC, _SUPPLY_CAP_VEC, _UNIT_IN_DECK,
@@ -49,6 +49,33 @@ def _ref_global_feats(env) -> np.ndarray:
         c: opp_owned[c] - opp_on_board[c] - opp_faceup[c] - opp_supply[c] for c in DECK
     }
 
+    # OBS_VERSION 10 blocks — recompute via the same public helpers (unit-tested
+    # separately) plus the documented formulas, independent of the concat code.
+    threat = env._threat_grids(active, own_hand, opp_hidden)
+    enemy_hits = sum(threat[(opponent, k)] for k in THREAT_KINDS)
+    own_hits = sum(threat[(active, k)] for k in THREAT_KINDS)
+    own_at_risk = sum(min(enemy_hits[u.loc], u.stack)
+                      for u in env.board.units if u.player_id == active)
+    opp_at_risk = sum(min(own_hits[u.loc], u.stack)
+                      for u in env.board.units if u.player_id == opponent)
+
+    opp_hand_size = sum(env.state.hands[opponent].values())
+    hidden_nonneg = [max(opp_hidden[c], 0.0) for c in DECK]
+    hidden_total = sum(hidden_nonneg)
+    if hidden_total > 0:
+        e_opp = [h * opp_hand_size / hidden_total for h in hidden_nonneg]
+    else:
+        e_opp = [0.0] * len(DECK)
+
+    base = env._base_reach_grids(active, own_hand, opp_hidden)
+    own_reach, enemy_reach = base[active], base[opponent]
+    bases_i_can_claim = float(own_reach.sum())
+    my_bases_under_flip = sum(enemy_reach[loc]
+                              for loc in env.board.get_controlled_bases(active))
+    win_alarm = float(
+        len(env.board.get_controlled_bases(opponent)) == env.winning_base_count - 1
+        and enemy_reach.sum() > 0)
+
     def norm(counter):
         return [counter[c] / TOTAL_COINS[c] for c in DECK]
 
@@ -76,8 +103,13 @@ def _ref_global_feats(env) -> np.ndarray:
         + norm_supply(opp_supply)
         + [opp_hidden[c] / TOTAL_COINS[c] for c in DECK]
         + norm(opp_owned)
-        + [sum(env.state.hands[opponent].values()) / HAND_SIZE]
-        + [float(env.state.initiative_transferred_this_round)],
+        + [opp_hand_size / HAND_SIZE]
+        + [float(env.state.initiative_transferred_this_round)]
+        + [min(own_at_risk / OWNED_TOTAL, 1.0), min(opp_at_risk / OWNED_TOTAL, 1.0)]
+        + [e_opp[i] / TOTAL_COINS[DECK[i]] for i in range(len(DECK))]
+        + [min(bases_i_can_claim / env.winning_base_count, 1.0),
+           min(my_bases_under_flip / env.winning_base_count, 1.0),
+           win_alarm],
         dtype=np.float32,
     )
 
@@ -198,7 +230,10 @@ def test_obs_global_p1_and_p2():
         active = env.active_player
         ref = _ref_global_feats(env)
         got = obs['global']
-        np.testing.assert_array_equal(got, ref, err_msg=f'P{active} mismatch')
+        # atol matches the random-game equivalence test: E_opp_hand's divide-by-pool-sum
+        # is order-sensitive in float32 (the reference computes it in float64 then casts),
+        # so tolerate ~1e-6; this test's job is verifying P1/P2 rotation, not bit-exactness.
+        np.testing.assert_allclose(got, ref, atol=1e-6, err_msg=f'P{active} mismatch')
         if active == 1:
             p1_checked = True
         else:

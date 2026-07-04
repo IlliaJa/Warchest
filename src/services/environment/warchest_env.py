@@ -176,7 +176,18 @@ COORD_PLANE_BASE = ENEMY_THREAT_PLANE_BASE + N_THREAT_KINDS  # 44
 ROW_COORD_PLANE = COORD_PLANE_BASE       # 44
 COL_COORD_PLANE = COORD_PLANE_BASE + 1   # 45
 
-BOARD_CHANNELS = COORD_PLANE_BASE + N_COORD_PLANES  # 6 + 32 + 6 + 2 = 46
+# Base-control reach planes (docs/IDEAS.md "base-control reach planes"): the
+# objective-analogue of the threat planes. A 0/1 grid marking each base cell a
+# side could move a unit onto (then claim) this turn — uncontrolled or
+# opponent-held bases, gated by coin availability (own hand / opponent hidden
+# pool, worst-case, exactly as the threat planes gate). own_base_reach = bases I
+# can take; enemy_base_reach = my bases (and neutrals) the opponent can take.
+N_BASE_REACH_PLANES = 2
+BASE_REACH_PLANE_BASE = COORD_PLANE_BASE + N_COORD_PLANES  # 46
+OWN_BASE_REACH_PLANE = BASE_REACH_PLANE_BASE       # 46
+ENEMY_BASE_REACH_PLANE = BASE_REACH_PLANE_BASE + 1  # 47
+
+BOARD_CHANNELS = BASE_REACH_PLANE_BASE + N_BASE_REACH_PLANES  # 6 + 32 + 6 + 2 + 2 = 48
 
 # Unit coin types (deployable); the royal coin has no board unit.
 UNIT_COINS = UNIT_IDS
@@ -191,7 +202,15 @@ OWNED_TOTAL = UNITS_PER_PLAYER * MAX_TOTAL + 1  # 21
 #   own (known): hand[C] bag[C] discard[C] supply[U] bag_size[1] owned[C]
 #   opponent (public): on_board[U] faceup[C] supply[U] hidden_pool[C] owned[C]
 #                      opp_hand_size[1]
-#   [last] initiative already transferred this round
+#   [.] initiative already transferred this round
+#   material-at-risk (OBS_VERSION 10): own_at_risk[1] opp_at_risk[1] — coins of my
+#     (their) on-board material that can die this turn (min(enemy_hits, stack) summed
+#     over my (their) units), from the raw threat grids; see docs/observation_improvement.md
+#   E_opp_hand[C] (OBS_VERSION 10): expected copies of each type in the opponent's
+#     hand right now = hidden_pool * opp_hand_size / hidden_total (actor-side estimate
+#     of live counter-capacity; the critic already sees the true split via PRIV_DIM)
+#   base-control reach scalars (OBS_VERSION 10): bases_i_can_claim[1]
+#     my_bases_under_flip_threat[1] win_proximity_alarm[1]
 #   + pending-context one-hot (PENDING_CTX_DIM): which mid-tactic continuation, if any
 #
 # Pending-context one-hot (Phase 4): slot 0 = no pending (normal play); the rest are
@@ -216,8 +235,13 @@ PENDING_KINDS = (
 )
 PENDING_CTX_DIM = 1 + len(PENDING_KINDS)  # 15
 PENDING_KIND_IDX = {k: i for i, k in enumerate(PENDING_KINDS)}
-GLOBAL_DIM = 7 * N_COIN_TYPES + 3 * NUM_UNIT_TYPES + 7 + PENDING_CTX_DIM  # 189
-OBS_VERSION = 9  # bumped for threat + coordinate board planes (BOARD_CHANNELS 38 -> 46)
+# 8 coin-vectors (hand,bag,discard,owned,opp_faceup,opp_hidden,opp_owned,E_opp_hand)
+# + 3 unit-vectors (supply,opp_on_board,opp_supply) + 12 standalone scalars
+# (4 header + bag_size + opp_hand_size + init_transferred + 2 material-at-risk
+#  + 3 base-reach) + pending one-hot.
+GLOBAL_DIM = 8 * N_COIN_TYPES + 3 * NUM_UNIT_TYPES + 12 + PENDING_CTX_DIM  # 211
+OBS_VERSION = 10  # material-at-risk + E_opp_hand globals; base-control reach planes
+                  # (BOARD_CHANNELS 46 -> 48, GLOBAL_DIM 189 -> 211)
 
 # Privileged critic-only features: the opponent's true hidden split, per coin (C).
 #   [0:C] opp hand   [C:2C] opp bag   [2C:3C] opp face-down discard
@@ -723,6 +747,33 @@ class WarChestEnv(gym.Env):
             board_enc[OWN_THREAT_PLANE_BASE + i] = np.clip(own_grid / THREAT_NORM, 0.0, 1.0)
             board_enc[ENEMY_THREAT_PLANE_BASE + i] = np.clip(enemy_grid / THREAT_NORM, 0.0, 1.0)
 
+        # Material-at-risk (globals): coins of on-board material that can die this turn,
+        # min(hits, stack) summed per side. Uses the RAW threat grids (pre-clip) so the
+        # count is comparable to stack height; grids and u.loc are both absolute coords.
+        enemy_hits = sum(threat_grids[(opponent, k)] for k in THREAT_KINDS)
+        own_hits = sum(threat_grids[(active, k)] for k in THREAT_KINDS)
+        own_at_risk = opp_at_risk = 0.0
+        for u in self.board.units:
+            if u.player_id == active:
+                own_at_risk += min(enemy_hits[u.loc], u.stack)
+            else:
+                opp_at_risk += min(own_hits[u.loc], u.stack)
+
+        # Base-control reach planes + scalars (objective-analogue of the threat planes).
+        base_reach = self._base_reach_grids(active, own_hand, opp_hidden)
+        own_reach, enemy_reach = base_reach[active], base_reach[opponent]
+        bases_i_can_claim = float(own_reach.sum())
+        my_bases_under_flip = sum(
+            enemy_reach[loc] for loc in self.board.get_controlled_bases(active))
+        # The most decisive state in the game: opponent one base from winning AND able
+        # to take a base this turn unless answered.
+        win_alarm = float(opp_bases == self.winning_base_count - 1 and enemy_reach.sum() > 0)
+        if active == 2:
+            own_reach = np.rot90(own_reach, 2)
+            enemy_reach = np.rot90(enemy_reach, 2)
+        board_enc[OWN_BASE_REACH_PLANE] = own_reach
+        board_enc[ENEMY_BASE_REACH_PLANE] = enemy_reach
+
         # Convert all counters to dense numpy vectors; remaining ops are vectorised.
         hand_v    = _counter_to_deck_vec(own_hand)
         bag_v     = _counter_to_deck_vec(own_bag)
@@ -740,6 +791,16 @@ class WarChestEnv(gym.Env):
         opp_sup_deck = np.zeros(N_COIN_TYPES, dtype=np.float32)
         opp_sup_deck[_UNIT_IN_DECK] = opp_sup_v
         hidden_v = opp_own_v - onboard_deck - faceup_v - opp_sup_deck
+
+        # E_opp_hand: expected copies of each type in the opponent's hand right now,
+        # = hidden_pool * opp_hand_size / hidden_total (hypergeometric mean). Actor-side
+        # estimate of what they can play against me this round; decays to 0 as they empty
+        # their hand. hidden_v may carry tiny negatives from the unknown split — clip.
+        opp_hand_size = sum(self.state.hands[opponent].values())
+        hidden_nonneg = np.clip(hidden_v, 0.0, None)
+        hidden_total = hidden_nonneg.sum()
+        e_opp_hand = hidden_nonneg * (opp_hand_size / hidden_total) if hidden_total > 0 \
+            else np.zeros(N_COIN_TYPES, dtype=np.float32)
 
         global_feats = np.concatenate([
             np.array([
@@ -760,8 +821,21 @@ class WarChestEnv(gym.Env):
             hidden_v / _TOTAL_COINS_VEC,
             opp_own_v / _TOTAL_COINS_VEC,
             np.array([
-                sum(self.state.hands[opponent].values()) / HAND_SIZE,
+                opp_hand_size / HAND_SIZE,
                 float(self.state.initiative_transferred_this_round),
+            ], dtype=np.float32),
+            # material-at-risk (OBS_VERSION 10)
+            np.array([
+                min(own_at_risk / OWNED_TOTAL, 1.0),
+                min(opp_at_risk / OWNED_TOTAL, 1.0),
+            ], dtype=np.float32),
+            # expected opponent hand, per type (OBS_VERSION 10)
+            e_opp_hand / _TOTAL_COINS_VEC,
+            # base-control reach scalars (OBS_VERSION 10)
+            np.array([
+                min(bases_i_can_claim / self.winning_base_count, 1.0),
+                min(my_bases_under_flip / self.winning_base_count, 1.0),
+                win_alarm,
             ], dtype=np.float32),
         ])
 
@@ -1612,6 +1686,60 @@ class WarChestEnv(gym.Env):
                     continue
                 for cell, kind, hits in self._threat_contributions(u):
                     grids[(side, kind)][cell] += hits
+        return grids
+
+    # ------------------------------------------------------------------
+    # Base-control reach map (observation-only). The objective-analogue of
+    # the threat map: 0/1 grids marking base cells a side could move a unit
+    # onto and claim this turn. Like the threat helpers these are
+    # side-effect-free, evaluated for both physical players, and must NOT
+    # read self.active_player — `_reachable` is player-agnostic and safe to
+    # mirror. See docs/IDEAS.md "base-control reach planes".
+    # ------------------------------------------------------------------
+
+    def _maneuver_range(self, unit) -> int:
+        """How many empty cells `unit` can move through this turn to end on a base.
+
+        1 for a normal maneuver; a `move_to`/`royal_move` unit gets its tactic's
+        max_dist; a Berserker chains maneuvers by spending stack coins (stack steps).
+        Royal Guard's royal_move is restricted to controlled cells in play, but the
+        unit can still normal-maneuver 1 step anywhere, so treating it as an
+        unrestricted range-2 mover is a mild worst-case (accepted, cf. the Ensign
+        simplification in _threat_grids).
+        """
+        info = UNIT_BY_ID[unit.id]
+        if info.extra_maneuvers_from_stack:      # Berserker
+            return max(1, unit.stack)
+        if info.tactic in ('move_to', 'royal_move'):
+            return max(1, (info.tactic_params or {}).get('max_dist', 1))
+        return 1
+
+    def _is_claimable_base(self, side: int, cell) -> bool:
+        """True if `cell` is a base `side` may claim by standing on it — uncontrolled
+        or held by the other side (mirrors Board.is_valid_claim's cell test)."""
+        marker = self.board.board[cell]
+        other_base = (CONTROLLED_BASE_PLAYER_2_CELL_ID if side == 1
+                      else CONTROLLED_BASE_PLAYER_1_CELL_ID)
+        return marker in (other_base, UNCONTROLLED_BASE_CELL_ID)
+
+    def _base_reach_grids(self, active, own_hand, opp_hidden):
+        """{side: np.ndarray[BOARD_DIM,BOARD_DIM]} 0/1 grids of claimable base cells a
+        side could move a unit onto (then claim) this turn. ABSOLUTE coords (not yet
+        ego-rotated). Coin-availability gated exactly as _threat_grids (own hand /
+        opponent hidden pool, worst-case)."""
+        def coin_gate(side, coin_id):
+            return (own_hand[coin_id] >= 1) if side == active else (opp_hidden[coin_id] >= 1)
+
+        grids = {side: np.zeros((BOARD_DIM, BOARD_DIM), dtype=np.float32) for side in (1, 2)}
+        for side in (1, 2):
+            for u in self.board.units:
+                if u.player_id != side or not coin_gate(side, u.id):
+                    continue
+                cells = set(self._reachable(u.loc, self._maneuver_range(u)))
+                cells.add(u.loc)  # a unit already on a claimable base can claim in place
+                for cell in cells:
+                    if self._is_claimable_base(side, cell):
+                        grids[side][cell] = 1.0
         return grids
 
     def _continuation_actions(self):

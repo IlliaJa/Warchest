@@ -1,7 +1,9 @@
 /.idea/
+/.vscode/
 /data/
 /wandb/
 /runs/
 __pycache__/
 *.pyc
 /logs/
+/config/web_agent.toml

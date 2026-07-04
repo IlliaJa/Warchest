@@ -1,6 +1,6 @@
 # Warchest
 
-Turn-based hex-grid strategy game with a reinforcement learning agent (REINFORCE + GAE, actor-critic).
+Turn-based hex-grid strategy game with a reinforcement learning agent (PPO + GAE, actor-critic).
 
 ## Documentation
 
@@ -10,11 +10,11 @@ Turn-based hex-grid strategy game with a reinforcement learning agent (REINFORCE
 - [Policy network](docs/policy_network.md) — CNN + MLP architecture, encoding, hyperparameters
 - [Training guide](docs/training.md) — algorithm, hyperparameters, W&B metrics, cloud training
 - [Environment API](docs/environment_api.md) — Gymnasium interface, observation/action spaces, Board API
-- [Ideas](docs/IDEAS.md) — open issues (top) + REINFORCE-era archive (bottom)
+- [Ideas](docs/IDEAS.md) — numbered open items + REINFORCE-era archive (bottom)
 - [Training history](docs/history.md) — implemented fixes and their observed effects
 - [RL algorithms](docs/rl_algorithms.md) — GAE, PPO, DQN, and alternatives with Warchest-specific trade-offs
 - [Metrics reference](docs/METRICS.md) — W&B metrics explained: ideal ranges, trends, warning signs
-- [Run analysis: ppo_20260630](docs/analysis_ppo_20260630.md) — plateau + high-entropy diagnosis, prioritized action points
+- [Web agent](docs/web_agent.md) — design for driving warchestonline.com with a trained checkpoint via Playwright (not yet implemented; `config/web_agent.sample.toml` is the sketch)
 
 ## Quick orientation
 
@@ -27,15 +27,16 @@ src/
     opponent_pool.py  weighted opponent sampler (random / greedy / pool snapshots)
   app/
     ppo.py          PPO training entry point (PPOTrainer class)
-    reinforce.py    legacy REINFORCE+GAE trainer
+    reinforce.py    legacy REINFORCE+GAE trainer (retained for reference, not the primary path)
     demo.py         evaluation vs random + interactive replay
     main.py         minimal random-action smoke test
+    eval_bucketed.py  per-composition eval bucketing (see docs/IDEAS.md #1)
     policy_viz.py   export policy graph to TensorBoard
     test.py         entropy distribution visualiser
   utils/
     elo.py          Elo rating tracker
     rollout_buffer.py  GAE rollout buffer for PPO
-  config/           reserved for future config files
+config/              web_agent.sample.toml — sample config for the (not yet implemented) web agent, docs/web_agent.md
 Dockerfile          cloud training container
 launch-agent.yaml   W&B Agents queue config
 ```

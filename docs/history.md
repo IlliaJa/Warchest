@@ -126,6 +126,25 @@ Per-unit mechanics (card text in `docs/UNITS.md`):
 
 ---
 
+## Material-at-risk + expected-opponent-hand + base-control reach observation (2026-07-03)
+
+*Source: `docs/observation_improvement.md` (full plan/rationale) + `docs/IDEAS.md`
+"base-control reach planes". Schema-breaking (`OBS_VERSION` 9→10, `BOARD_CHANNELS`
+46→48, `GLOBAL_DIM` 189→211); prior saved models/pool snapshots retired. Three
+actor-legibility features, each a reduction the location-blind heads compute poorly
+from raw state, bundled into one bump but intended as separate A/B arms.*
+
+| What changed | Detail |
+|---|---|
+| **Material-at-risk scalars** | Two globals: `own/opp_material_at_risk = Σ min(hits, stack)` over each side's on-board units, from the **raw** threat grids (pre-clip). Directly encodes the bolster/trade/extend question — how much committed material can die this turn — instead of asking the location-blind heads to reduce the enemy-threat plane × unit-occupancy spatially. |
+| **`E_opp_hand`** | 17-wide expected opponent hand = `hidden_pool · opp_hand_size / hidden_total` (hypergeometric mean). Actor-side estimate of what the opponent can play *this round without redrawing*; decays to 0 as they empty their hand, unlike the static `hidden` pool. The critic already sees the true split via `PRIV_DIM`, so this closes an actor/critic asymmetry without leaking private state. The `hidden` pool's binary `≥1` gate in the threat planes was left worst-case (deliberate — max for "where can I die," mean for "how loaded are they"; see the parked "likelihood-weighted threat-plane magnitude" idea). |
+| **Base-control reach planes** | 2 new board planes (`own_base_reach`, `enemy_base_reach`): 0/1 over base cells a side could move a unit onto and claim this turn — the objective-analogue of the threat planes for the win condition (control 6 bases), which the schema previously encoded only as static positions/counts. Reuses `_reachable`; new side-effect-free helpers `_maneuver_range` (1 / move_to·royal_move max_dist / Berserker stack) and `_is_claimable_base` (mirrors `Board.is_valid_claim`'s cell test), gated by coin availability exactly as the threat planes. |
+| **Base-control reach scalars** | 3 globals: `bases_i_can_claim` this turn, `my_bases_under_flip_threat`, and a `win_proximity_alarm` (opponent one base from winning **and** able to take a base this turn — the most decisive state in the game, previously requiring the net to assemble it from three separate features). |
+| **Tests** | New `tests/test_obs_features.py` (helper semantics: `_is_claimable_base`, `_maneuver_range`, `_base_reach_grids` incl. gating/in-place/own-base/blocked cases, material-at-risk cap, `E_opp_hand` formula). Schema pins updated in `test_action_space.py`/`test_threat_planes.py`; the `test_obs_global_vectorized.py` reference reimplements all three blocks (its exact-equality P1/P2 check relaxed to `atol=1e-6` for float32 op-order on the divide). Full suite: 95 passed. Policy+Critic forward passes verified on the new schema. |
+| **Training run** | Not yet run — A/B protocol (baseline / +material / +E_opp_hand / +base-reach) is the remaining work per `docs/observation_improvement.md`. |
+
+---
+
 ## Threat/position-aware observation + deeper trunk (2026-07-02)
 
 *Source: `docs/IDEAS.md` "Architectural note — the agent can't see the board as

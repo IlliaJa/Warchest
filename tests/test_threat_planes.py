@@ -10,6 +10,7 @@ from collections import Counter
 from src.services.environment.warchest_env import (
     BOARD_CHANNELS, THREAT_KINDS, OWN_THREAT_PLANE_BASE, ENEMY_THREAT_PLANE_BASE,
     ROW_COORD_PLANE, COL_COORD_PLANE, THREAT_NORM,
+    OWN_BASE_REACH_PLANE, ENEMY_BASE_REACH_PLANE,
 )
 from _helpers import (
     blank_env, place, cavalry_scenario, archer_scenario,
@@ -18,12 +19,14 @@ from _helpers import (
 
 
 def test_threat_channel_layout():
-    assert BOARD_CHANNELS == 46
+    assert BOARD_CHANNELS == 48
     assert THREAT_KINDS == ('melee', 'ranged', 'charge')
     assert OWN_THREAT_PLANE_BASE == 38
     assert ENEMY_THREAT_PLANE_BASE == 41
     assert ROW_COORD_PLANE == 44
     assert COL_COORD_PLANE == 45
+    assert OWN_BASE_REACH_PLANE == 46
+    assert ENEMY_BASE_REACH_PLANE == 47
 
 
 # --------------------------------------------------------------------------- #
