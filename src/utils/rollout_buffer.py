@@ -31,14 +31,81 @@ class RolloutBuffer:
         self._lp_old = None
         self._vals_old = None
 
-    def add_step(self, obs, action, log_prob, reward, value, opp_onehot, privileged):
+    def add_step(self, obs, action, log_prob, reward, opp_onehot, privileged):
         self._obs.append(obs)
         self._actions.append(action)
         self._log_probs_old.append(log_prob.detach().cpu())
         self._rewards.append(float(reward))
-        self._values.append(value.detach().cpu().item())   # float, not tensor
         self._opp_onehots.append(opp_onehot)
         self._privileged.append(privileged)
+
+    def stack(self):
+        """Stack per-step lists into contiguous arrays for batched forward passes.
+
+        Called after collection, before value computation and GAE. Splitting this out
+        of compute_gae lets the critic run one batched pass over _boards/_globals/etc.
+        (see value_input_chunks) to fill self._values, instead of a per-step forward
+        during rollout.
+        """
+        self._boards = np.stack([o['board'] for o in self._obs])
+        self._globals = np.stack([o['global'] for o in self._obs])
+        self._masks = np.stack([o['valid_action_mask'] for o in self._obs])
+        self._opp_onehots_arr = np.stack(self._opp_onehots)
+        self._privileged_arr = np.stack(self._privileged)
+        self._actions_arr = np.array(self._actions, dtype=np.int64)
+        self._lp_old = torch.stack(self._log_probs_old)    # cached once; sliced per minibatch
+
+    def value_input_chunks(self, device, chunk_size):
+        """Yield critic-input batch dicts over all stored states, in fixed order.
+
+        Consumed once by the trainer to compute V(s) in a single batched pass. Requires
+        stack() (single-process) or ingest_chunks() (parallel) to have populated the arrays.
+        Order matches the stored transitions, so the values line up with rewards for GAE.
+        """
+        n = len(self._boards)
+        for start in range(0, n, chunk_size):
+            sl = slice(start, start + chunk_size)
+            yield {
+                'board':      torch.from_numpy(self._boards[sl]).to(device),
+                'global':     torch.from_numpy(self._globals[sl]).to(device),
+                'opp_onehot': torch.from_numpy(self._opp_onehots_arr[sl]).to(device),
+                'privileged': torch.from_numpy(self._privileged_arr[sl]).to(device),
+            }
+
+    def set_values(self, values):
+        """Store per-step V(s) (raw return scale) computed by the batched critic pass."""
+        self._values = [float(v) for v in values]
+        self._vals_old = torch.tensor(self._values, dtype=torch.float32)
+
+    def ingest_chunks(self, chunks):
+        """Populate the buffer from pre-stacked per-worker arrays (parallel rollout path).
+
+        Replaces the add_step + stack() route: parallel workers already return numpy arrays,
+        so we concatenate across workers here and shift each worker's episode_ends into the
+        combined index space. After this, the buffer is in the same state stack() would leave
+        it in (arrays + _rewards + _episode_ends), ready for value computation and GAE.
+
+        Each chunk is a dict with keys: boards, globals, masks, actions, log_probs, rewards,
+        opp_onehots, privileged, episode_ends. Chunks must be passed in a deterministic order
+        (e.g. sorted by worker id) so runs are reproducible for a fixed seed.
+        """
+        self.clear()
+        self._boards = np.concatenate([c['boards'] for c in chunks])
+        self._globals = np.concatenate([c['globals'] for c in chunks])
+        self._masks = np.concatenate([c['masks'] for c in chunks])
+        self._opp_onehots_arr = np.concatenate([c['opp_onehots'] for c in chunks])
+        self._privileged_arr = np.concatenate([c['privileged'] for c in chunks])
+        self._actions_arr = np.concatenate([c['actions'] for c in chunks]).astype(np.int64)
+        self._lp_old = torch.from_numpy(
+            np.concatenate([c['log_probs'] for c in chunks]).astype(np.float32)
+        )
+        self._rewards = list(np.concatenate([c['rewards'] for c in chunks]).astype(np.float32))
+        offset = 0
+        ends = []
+        for c in chunks:
+            ends.extend(int(e + offset) for e in c['episode_ends'])
+            offset += len(c['rewards'])
+        self._episode_ends = ends
 
     def end_episode(self):
         self._episode_ends.append(len(self._rewards))
@@ -83,23 +150,13 @@ class RolloutBuffer:
         self.advantages = adv_t.to(device)
         self.returns = ret_t.to(device)
 
-        # Stack all buffer arrays once; iter_minibatches fancy-indexes into these.
-        self._boards = np.stack([o['board'] for o in self._obs])
-        self._globals = np.stack([o['global'] for o in self._obs])
-        self._masks = np.stack([o['valid_action_mask'] for o in self._obs])
-        self._opp_onehots_arr = np.stack(self._opp_onehots)
-        self._privileged_arr = np.stack(self._privileged)
-        self._actions_arr = np.array(self._actions, dtype=np.int64)
-        self._lp_old = torch.stack(self._log_probs_old)    # cached once; sliced per minibatch
-        self._vals_old = torch.tensor(self._values, dtype=torch.float32)
-
     def iter_minibatches(self, batch_size, device):
         """Yield mini-batch dicts in random order.
 
         Uses pre-stacked arrays from compute_gae for O(1) per-minibatch numpy fancy-index
         instead of per-minibatch np.stack over list-indexed dicts.
         """
-        N = len(self._obs)
+        N = len(self._boards)
         perm = np.random.permutation(N)
 
         for start in range(0, N, batch_size):
@@ -150,4 +207,7 @@ class RolloutBuffer:
         self._vals_old = None
 
     def __len__(self):
+        # _boards is authoritative once populated (parallel path has no _obs dicts).
+        if self._boards is not None:
+            return len(self._boards)
         return len(self._obs)

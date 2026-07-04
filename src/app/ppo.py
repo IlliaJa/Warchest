@@ -12,18 +12,20 @@ import wandb
 
 from src.services.policy.policy import Policy, Critic
 from src.services.environment.warchest_env import (
-    WarChestEnv, WIN_REWARD, LOSS_REWARD, CLAIM_BASE_ACTION, ATTACK_ACTION,
+    WarChestEnv, WIN_REWARD,
 )
 from src.services.environment.game_state import HAND_SIZE
+from src.services.environment.rollout_core import (
+    play_episode, SHAPING_C, C_MAT, OPP_TYPE_IDX,
+)
 from src.services.opponent_pool import OpponentPool
+from src.services.rollout_collector import ParallelRolloutCollector
 from src.utils.rollout_buffer import RolloutBuffer
 from src.services.bots import GreedyBot, RandomBot
 from src.utils.elo import EloTracker
 
-SHAPING_C = 0.05
-# Material PBRS coefficient (rewards.md §9): potential over the boxed-coin differential.
-# Kept well below SHAPING_C — bases win the game, material is only a means.
-C_MAT = 0.015
+# SHAPING_C / C_MAT / OPP_TYPE_IDX are defined in rollout_core (they belong to the per-step
+# reward that lives there) and re-imported above; kept referenceable from this module.
 # The holding reward and the material PBRS term are linearly annealed from
 # SHAPING_ANNEAL_INIT down to SHAPING_ANNEAL_FINAL over the first
 # SHAPING_ANNEAL_HALF_FRAC of the run, then held at the floor. This keeps the dense
@@ -34,8 +36,6 @@ SHAPING_ANNEAL_INIT = 1.0
 SHAPING_ANNEAL_FINAL = 0.1
 SHAPING_ANNEAL_HALF_FRAC = 0.5
 use_wandb = False
-
-OPP_TYPE_IDX = {'random': 0, 'greedy': 1, 'pool': 2}
 
 logger = logging.getLogger('warchest')
 
@@ -93,7 +93,12 @@ def setup_run_logger(run_id: str) -> None:
 class PPOTrainer:
     """PPO training loop for Warchest."""
 
-    KL_TARGET = 0.015  # stop PPO epoch early if per-minibatch approx-KL exceeds this
+    KL_TARGET = 0.03  # skip a minibatch whose approx-KL exceeds this (see _update_actor).
+    # Raised from 0.015 now that offending minibatches are skipped individually rather
+    # than aborting the whole update: at 0.015, once epoch 0 moves the policy ~0.015,
+    # every later-epoch minibatch trips the gate and gets skipped, so almost no extra
+    # data is used. 0.03 lets epochs 1-3 actually contribute while the PPO clip still
+    # bounds each step.
 
     def __init__(self, env, policy, critic, actor_optimizer, critic_optimizer, policy_constructor, hp, device):
         # environment and models
@@ -126,6 +131,13 @@ class PPOTrainer:
         # anneal multiplier applied to holding + material shaping; set per batch.
         self._shaping_anneal = SHAPING_ANNEAL_INIT
         self._minibatch_size = hp['minibatch_size']
+        # Parallel rollout collection (docs/parallel_rollouts.md). n_workers<=1 => in-process
+        # path. Capped at collect_episodes so every worker gets >=1 episode.
+        self._n_workers = min(hp.get('n_workers', 1), hp['collect_episodes'])
+        self._rollout_seed = hp.get('rollout_seed', 0)
+        self._policy_hidden_dim = hp['hidden_dim']
+        self._pool_max_size = hp.get('pool_max_size', 20)
+        self._collector = None
         self._print_every = hp['print_every']
         self._eval_every = hp.get('eval_every', 10)
         self._eval_episodes = hp.get('eval_episodes', 20)
@@ -172,6 +184,7 @@ class PPOTrainer:
         self._t_env: float = 0.0
         self._t_model_play: float = 0.0
         self._t_gradient: float = 0.0
+        self._t_collect_wall: float = 0.0
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -203,212 +216,143 @@ class PPOTrainer:
         )
 
     def train(self):
-        for batch_num in range(1, self._n_batches + 1):
-            self._update_schedules(batch_num)
-            self._batch_start = time.time()
-            self._policy.to('cpu')
-            self._critic.to('cpu')
-            self._collect_batch()
-            self._policy.to(self._device)
-            self._critic.to(self._device)
-            t0 = time.perf_counter()
-            update_stats = self._run_ppo_update(batch_num)
-            self._t_gradient = time.perf_counter() - t0
-            self._pool.maybe_snapshot(self._policy)
-            self._maybe_eval(batch_num)
-            self._log_batch(batch_num, update_stats)
+        try:
+            for batch_num in range(1, self._n_batches + 1):
+                self._update_schedules(batch_num)
+                self._batch_start = time.time()
+                # Only the policy runs during rollout (single-obs act() calls); it goes to
+                # CPU to dodge batch=1 CUDA launch overhead. The critic is NOT used per step
+                # anymore — its values are computed in one batched GPU pass below — so it
+                # stays on self._device throughout. (In the parallel path the workers hold
+                # their own CPU policy copies; this keeps the main copy consistent.)
+                self._policy.to('cpu')
+                tc = time.perf_counter()
+                self._collect_batch()  # leaves the buffer stacked (serial: stack(); parallel: ingest)
+                self._compute_values_batched()
+                self._buffer.compute_gae(self._gamma, self._lam, self._device)
+                self._ret_normalizer.update(self._buffer.returns)
+                # Wall-clock of the whole collection phase. Distinct from self._t_env /
+                # self._t_model_play, which in the parallel path are SUMMED across workers
+                # (aggregate CPU-seconds > wall); this is the honest wall number.
+                self._t_collect_wall = time.perf_counter() - tc
+                self._policy.to(self._device)
+                t0 = time.perf_counter()
+                update_stats = self._run_ppo_update(batch_num)
+                self._t_gradient = time.perf_counter() - t0
+                self._pool.maybe_snapshot(self._policy)
+                self._maybe_eval(batch_num)
+                self._log_batch(batch_num, update_stats)
+        finally:
+            if self._collector is not None:
+                self._collector.shutdown()
 
     # ------------------------------------------------------------------
     # Episode collection
     # ------------------------------------------------------------------
 
+    # Cap on states per critic forward chunk; keeps the batched value pass off the
+    # OOM edge for very long batches while staying large enough to amortise launch cost.
+    _VALUE_CHUNK = 4096
+
+    def _compute_values_batched(self):
+        """Fill the buffer's per-step V(s) in a single batched pass on self._device.
+
+        The critic is unused during rollout collection; instead every stored state is
+        valued here in a few large batched forwards (GPU) rather than thousands of
+        batch=1 forwards during the episode loop. Critic weights are unchanged since
+        collection began (updates only happen in _run_ppo_update), so these values are
+        identical to the old per-step ones up to negligible batch-vs-single numerics.
+        """
+        self._critic.eval()
+        raw_values = []
+        with torch.no_grad():
+            for chunk in self._buffer.value_input_chunks(self._device, self._VALUE_CHUNK):
+                val_norm = self._critic.value_batch(chunk)
+                val_raw = self._ret_normalizer.denormalize(val_norm)
+                raw_values.append(val_raw.detach().cpu())
+        self._critic.train()
+        self._buffer.set_values(torch.cat(raw_values).numpy() if raw_values else [])
+
     def _collect_batch(self):
-        """Fill the buffer with collect_episodes episodes, then compute GAE."""
-        self._buffer.clear()
+        """Fill + stack the buffer with collect_episodes episodes (values + GAE run after).
+
+        Dispatches to the parallel worker pool when n_workers > 1, else the in-process path.
+        Both leave the buffer in the same stacked state.
+        """
         self._batch_eps = []
         self._t_env = 0.0
         self._t_model_play = 0.0
+        if self._n_workers > 1:
+            self._collect_batch_parallel()
+        else:
+            self._collect_batch_serial()
+
+    def _collect_batch_serial(self):
+        self._buffer.clear()
         self._policy.train()
         self._critic.train()
         for _ in range(self._collect_episodes):
             main_pid = np.random.choice([1, 2])
-            opp, opp_type = self._pool.sample(self._policy_constructor, self._device)
+            # Sample the opponent onto the rollout device (CPU during collection — see
+            # train()), not self._device. A pool snapshot left on the GPU would run its
+            # per-move forward at batch=1 on CUDA, exactly the launch/transfer overhead
+            # the CPU-rollout design exists to avoid — and it dominates late-run batches
+            # where p_pool -> 0.9.
+            opp, opp_type = self._pool.sample(self._policy_constructor, self._policy.device)
             ep = self._collect_episode(opp, main_pid, opp_type)
             self._batch_eps.append(ep)
-        self._buffer.compute_gae(self._gamma, self._lam, self._device)
-        self._ret_normalizer.update(self._buffer.returns)
+        self._buffer.stack()
+
+    def _collect_batch_parallel(self):
+        """Collect the batch across worker processes, then ingest their numpy transitions.
+
+        Timing note: t_env/t_model_play here are summed across workers (aggregate CPU work),
+        so they exceed the collection wall-clock — the batch `t=` (wall) is the honest number.
+        """
+        if self._collector is None:
+            self._collector = ParallelRolloutCollector(
+                self._n_workers,
+                policy_hidden_dim=self._policy_hidden_dim,
+                pool_max_size=self._pool_max_size,
+                seed_base=self._rollout_seed,
+            )
+        chunks = self._collector.collect(
+            self._policy, self._pool, self._collect_episodes,
+            gamma=self._gamma,
+            shaping_anneal=self._shaping_anneal,
+            holding_reward_rate=self._holding_reward_rate,
+            max_t=self._max_t,
+        )
+        self._buffer.ingest_chunks(chunks)
+        for c in chunks:
+            self._batch_eps.extend(c['episode_dicts'])
+            self._t_env += c['t_env']
+            self._t_model_play += c['t_model_play']
 
     def _collect_episode(self, opp, main_pid, opp_type) -> dict:
-        """Run one episode; append main-actor steps to the buffer."""
-        _pt = time.perf_counter
+        """Run one episode via the shared rollout core, then append its steps to the buffer.
 
-        t0 = _pt()
-        state, _ = self._env.reset()
-        self._t_env += _pt() - t0
-
-        outcome = 'truncated'
-        invalid_count = 0
-        claims = 0
-        main_score = 0.0
-        turns = 0
-        opp_pid = 3 - main_pid  # absolute id of the main actor's opponent
-        # score decomposition (sums to main_score) + entropy-ceiling tracking
-        r_attack = r_shaping = r_holding = r_material = r_terminal = r_other = 0.0
-        sum_log_nlegal = 0.0
-        n_decisions = 0
-
-        collect_device = self._policy.device
-        opp_onehot = np.zeros(len(OPP_TYPE_IDX), dtype=np.float32)
-        opp_onehot[OPP_TYPE_IDX[opp_type]] = 1.0
-        opp_onehot_t = torch.tensor(opp_onehot, dtype=torch.float32).unsqueeze(0).to(collect_device)
-
-        for turn in range(self._max_t):
-            acting_pid = self._env.active_player
-            turns = turn
-
-            if acting_pid == main_pid:
-                obs_before = state
-                # Privileged critic input: the opponent's true hidden coin split,
-                # captured at the main player's decision point. Never seen by the policy.
-                t0 = _pt()
-                privileged = self._env.get_privileged_features()
-                self._t_env += _pt() - t0
-                privileged_t = torch.from_numpy(privileged).unsqueeze(0)
-
-                t0 = _pt()
-                action, log_prob, _ = self._policy.act(obs_before)
-                self._t_model_play += _pt() - t0
-
-                with torch.no_grad():
-                    t0 = _pt()
-                    value_norm = self._critic.value_single(obs_before, opp_onehot_t, privileged_t)
-                    self._t_model_play += _pt() - t0
-                    value = torch.tensor(
-                        self._ret_normalizer.denormalize(value_norm.item()),
-                        dtype=torch.float32,
-                    )
-
-                # obs_before is ego-centric from main_pid (currently acting), so global[1]=my_bases/wbc
-                _wbc = self._env.winning_base_count
-                base_diff = (obs_before['global'][1] - obs_before['global'][2]) * _wbc
-                phi_before = SHAPING_C * base_diff
-                holding_reward = self._holding_reward_rate * base_diff
-                # Material PBRS potential (rewards.md §9): boxed differential, opp minus me.
-                # boxed_total is keyed by absolute pid, so no perspective flip is needed.
-                phi_mat_before = C_MAT * (
-                    self._env.boxed_total(opp_pid) - self._env.boxed_total(main_pid)
-                )
-                env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
-
-                t0 = _pt()
-                state, reward, terminated, truncated, step_info = self._env.step(env_action)
-                self._t_env += _pt() - t0
-
-                if not step_info['action'].is_valid:
-                    invalid_count += 1
-                    logger.warning(f'turn={turn} main_pid={main_pid} invalid_action={action} env_action={env_action}')
-                    t0 = _pt()
-                    state, reward, terminated, truncated, step_info = self._env.make_random_step()
-                    self._t_env += _pt() - t0
-                    log_prob = torch.tensor(0.0)
-                    value = torch.tensor(0.0)
-
-                # state obs is ego-centric from whoever is now active; flip indices if it flipped to opponent
-                if self._env.active_player == main_pid:
-                    phi_after = SHAPING_C * (state['global'][1] - state['global'][2]) * _wbc
-                else:
-                    phi_after = SHAPING_C * (state['global'][2] - state['global'][1]) * _wbc
-                phi_mat_after = C_MAT * (
-                    self._env.boxed_total(opp_pid) - self._env.boxed_total(main_pid)
-                )
-                # Base-diff PBRS is constant; holding + material shaping are annealed together.
-                base_shaping = self._gamma * phi_after - phi_before
-                material_shaping = self._gamma * phi_mat_after - phi_mat_before
-                annealed_holding = self._shaping_anneal * holding_reward
-                annealed_material = self._shaping_anneal * material_shaping
-                shaped_reward = reward + base_shaping + annealed_holding + annealed_material
-                main_score += shaped_reward
-
-                # decompose the reward so score/win decoupling is visible in the logs
-                r_shaping += base_shaping
-                r_holding += annealed_holding
-                r_material += annealed_material
-                if terminated:
-                    r_terminal += reward  # dominated by WIN_REWARD on a winning move
-                elif step_info['action'].type == ATTACK_ACTION:
-                    r_attack += reward
-                else:
-                    r_other += reward
-                n_legal = int(obs_before['valid_action_mask'].sum())
-                sum_log_nlegal += float(np.log(max(n_legal, 1)))
-                n_decisions += 1
-
-                if step_info['action'].type == CLAIM_BASE_ACTION and step_info['action'].is_valid:
-                    claims += 1
-
-                self._buffer.add_step(obs_before, action, log_prob, shaped_reward, value, opp_onehot, privileged)
-            else:
-                with torch.no_grad():
-                    t0 = _pt()
-                    action, _, _ = opp.act(state)
-                    self._t_model_play += _pt() - t0
-                env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
-                t0 = _pt()
-                state, _, terminated, truncated, step_info = self._env.step(env_action)
-                self._t_env += _pt() - t0
-                if not step_info['action'].is_valid:
-                    t0 = _pt()
-                    state, _, terminated, truncated, step_info = self._env.make_random_step()
-                    self._t_env += _pt() - t0
-
-            if terminated:
-                outcome = 'win' if acting_pid == main_pid else 'lose'
-                if acting_pid != main_pid:
-                    self._buffer.append_terminal_reward(LOSS_REWARD)
-                    main_score += LOSS_REWARD
-                    r_terminal += LOSS_REWARD
-                break
-
-            if truncated:
-                _wbc = self._env.winning_base_count
-                if self._env.active_player == main_pid:
-                    diff = (state['global'][1] - state['global'][2]) * _wbc
-                else:
-                    diff = (state['global'][2] - state['global'][1]) * _wbc
-                # Base-diff-proportional truncation reward (C17): a smoother critic
-                # target than the old 0 / -0.5 / -1.0 step function, so the critic sees
-                # lower target variance at the states the agent spends most time in.
-                # A draw from a winning position is still 0; ties and deficits scale
-                # linearly from -0.5 (tie) toward LOSS_REWARD (full-deficit rout),
-                # preserving the two anchor values of the old step function.
-                if diff > 0:
-                    trunc_reward = 0.0
-                else:
-                    deficit_frac = min(-diff, _wbc) / _wbc  # 0 at a tie ... 1 at max deficit
-                    trunc_reward = LOSS_REWARD * (0.5 + 0.5 * deficit_frac)
-                self._buffer.append_terminal_reward(trunc_reward)
-                main_score += trunc_reward
-                r_terminal += trunc_reward
-                break
-
+        The episode logic itself lives in rollout_core.play_episode (shared with the future
+        parallel workers). Here we only feed the returned transitions into the buffer and
+        fold the per-episode timing into the batch accumulators.
+        """
+        steps, ep = play_episode(
+            self._env, self._policy, opp, main_pid, opp_type,
+            gamma=self._gamma,
+            shaping_anneal=self._shaping_anneal,
+            holding_reward_rate=self._holding_reward_rate,
+            max_t=self._max_t,
+        )
+        for obs, action, log_prob, reward, opp_onehot, privileged in zip(
+            steps['obs'], steps['actions'], steps['log_probs'],
+            steps['rewards'], steps['opp_onehots'], steps['privileged'],
+        ):
+            self._buffer.add_step(obs, action, log_prob, reward, opp_onehot, privileged)
         self._buffer.end_episode()
-        return {
-            'outcome': outcome,
-            'turns': turns,
-            'invalid_count': invalid_count,
-            'claims': claims,
-            'main_score': main_score,
-            'main_pid': main_pid,
-            'opp_type': opp_type,
-            'r_attack': r_attack,
-            'r_shaping': r_shaping,
-            'r_holding': r_holding,
-            'r_material': r_material,
-            'r_terminal': r_terminal,
-            'r_other': r_other,
-            'sum_log_nlegal': sum_log_nlegal,
-            'n_decisions': n_decisions,
-        }
+
+        self._t_env += ep.pop('t_env')
+        self._t_model_play += ep.pop('t_model_play')
+        return ep
 
     # ------------------------------------------------------------------
     # PPO update
@@ -427,23 +371,22 @@ class PPOTrainer:
         clip_frac_accum = 0.0
         last_actor_grad = 0.0
         n_actor_updates = 0
-        done = False
+        n_actor_skipped = 0
 
         for epoch in range(self._ppo_epochs):
-            if done:
-                break
             for batch in self._buffer.iter_minibatches(self._minibatch_size, self._device):
                 lp_new, ent = self._policy.evaluate_actions_batch(batch)
                 lp_old = batch['log_probs_old']
                 ratio = (lp_new - lp_old).exp()
                 approx_kl = ((ratio - 1) - (lp_new - lp_old)).detach().mean().item()
                 if approx_kl > self.KL_TARGET:
-                    logger.debug(
-                        f'batch={batch_num} epoch={epoch} '
-                        f'actor early stop approx_kl={approx_kl:.4f}'
-                    )
-                    done = True
-                    break
+                    # Skip only this over-shooting minibatch, don't abort the whole
+                    # update. Aborting on the first offender wasted most collected data
+                    # (n_actor fell to ~4-7 updates/batch); this keeps applying the
+                    # in-target minibatches across all epochs. PPO clipping still bounds
+                    # each applied step, so per-minibatch KL is a safe gate.
+                    n_actor_skipped += 1
+                    continue
 
                 adv = batch['advantages']
                 clipped_ratio = ratio.clamp(1 - self._ppo_eps, 1 + self._ppo_eps)
@@ -473,6 +416,11 @@ class PPOTrainer:
                 clip_frac_accum += ((ratio - 1.0).abs() > self._ppo_eps).float().mean().item()
                 n_actor_updates += 1
 
+        if n_actor_skipped:
+            logger.debug(
+                f'batch={batch_num} actor applied={n_actor_updates} '
+                f'skipped_over_kl={n_actor_skipped}'
+            )
         denom = max(n_actor_updates, 1)
         return {
             'avg_kl': kl_accum / denom,
@@ -481,6 +429,7 @@ class PPOTrainer:
             'avg_clip_frac': clip_frac_accum / denom,
             'last_actor_grad': last_actor_grad,
             'n_actor_updates': n_actor_updates,
+            'n_actor_skipped': n_actor_skipped,
         }
 
     def _update_critic(self, batch_num: int) -> dict:
@@ -656,20 +605,24 @@ class PPOTrainer:
         )
         entropy_frac = s['avg_entropy'] / max_entropy if max_entropy > 0 else 0.0
 
-        total_t = self._t_env + self._t_model_play + self._t_gradient
-        logger.debug(
+        logger.info(
             f'batch={batch_num} n_actor={s["n_actor_updates"]} n_critic={s["n_critic_updates"]} '
             f'adv mean={self._buffer.raw_adv_mean:.4f} std={self._buffer.raw_adv_std:.4f} '
             f'ret mean={self._buffer.raw_ret_mean:.4f} std={self._buffer.raw_ret_std:.4f} '
             f'critic mean={s["avg_critic_mean"]:.4f} std={s["avg_critic_std"]:.4f} '
             f'clip_frac={s["avg_clip_frac"]:.3f} critic_mae={s["avg_critic_mae"]:.4f}'
         )
+        # total_accounted is real wall (collection wall + gradient wall), NOT the summed
+        # per-worker rollout time. The env/model_play breakdown is aggregate CPU-seconds
+        # across workers in the parallel path (so it can exceed the collection wall).
+        total_t = self._t_collect_wall + self._t_gradient
+        agg = f' (aggregate x{self._n_workers} workers)' if self._n_workers > 1 else ''
         logger.info(
             f'batch={batch_num} timing: '
-            f'env={self._t_env:.2f}s ({100*self._t_env/total_t:.0f}%) '
-            f'model_play={self._t_model_play:.2f}s ({100*self._t_model_play/total_t:.0f}%) '
+            f'collect={self._t_collect_wall:.2f}s ({100*self._t_collect_wall/total_t:.0f}%) '
             f'gradient={self._t_gradient:.2f}s ({100*self._t_gradient/total_t:.0f}%) '
-            f'total_accounted={total_t:.2f}s'
+            f'total_accounted={total_t:.2f}s | '
+            f'rollout breakdown{agg}: env={self._t_env:.2f}s model_play={self._t_model_play:.2f}s'
         )
         logger.info(
             f'batch={batch_num}/{self._n_batches} '
@@ -752,15 +705,24 @@ if __name__ == '__main__':
         'entropy_coeff_final': 0.003,  # linearly annealed from entropy_coeff over the run
         'holding_reward_rate': holding_reward_rate,
         'minibatch_size': 64,
+        # Parallel rollout collection (docs/parallel_rollouts.md). 1 = in-process; 6 leaves
+        # cores for the GPU update + IPC + OS on this 12-core box. Capped at collect_episodes.
+        'n_workers': 6,
+        'rollout_seed': 0,
         'lr_actor': 3e-4,
         'lr_critic': 3e-4,
-        'lr_final_frac': 0.0,  # LR decays linearly to lr_*_init * this (0.0 => to zero)
+        'lr_final_frac': 0.1,  # LR decays linearly to lr_*_init * this. Was 0.0 (decay to
+        # zero): the last ~25% of training then did no learning and the elo plateau in
+        # those batches was purely the vanishing LR. 0.1 keeps a small floor so late
+        # self-play refinement still moves the weights.
         'hidden_dim': 64,
         # Step 5 (docs/rewards_improvements.md): strengthen the *densifier*. The critic
         # is what turns the terminal reward into a per-step signal, so widen it alone
         # (policy left at hidden_dim) to keep the capacity A/B attributable. Safe because
         # the critic's board encoder is independent of the policy's during PPO rollout.
-        'critic_hidden_dim': 128,
+        # Raised 128 -> 192: critic_mae held at ~0.5x the return std (explains only ~half
+        # the value variance), the classic underfit signature — width is the first lever.
+        'critic_hidden_dim': 192,
         'print_every': 10,
         # opponent sampling weights — initial phase (random opponent included)
         'p_random_initial': 0.40,

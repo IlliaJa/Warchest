@@ -126,6 +126,15 @@ The verb head already groups all 6 move directions under one `V_MOVE` and all 6 
 
 **Why parked, not planned:** the channel-count saving is modest (32 → ~22), and the real cost is reworking `policy_head` from a monolithic conv into cell-logits + a conditional direction head, then re-deriving `_joint_log_probs`/masking for a third factorization level (legal directions differ between move and attack per cell — masking must stay consistent with the new hierarchy). Worth it only if move/attack direction choices turn out to share enough structure that sample efficiency is actually gated on it; no evidence either way yet. Difficulty: moderate.
 
+### 11. Parallel rollout collection — remaining phases 4 & 5
+
+Full design + phases 1-3 in `docs/parallel_rollouts.md` (Phase 1, the `rollout_core.play_episode` refactor, is implemented; Phases 2-3 build the `spawn` worker pool + scale to `n_workers=6`). These are the two **deferred** phases, worth doing only after 2-3 land and profiling justifies them:
+
+- **P11a. Dynamic work-queue load balancing.** v1 splits `collect_episodes` statically across workers; episodes vary 60-200 turns, so the batch waits on the slowest worker's longest episode. Replace with a shared task queue workers pull from until the batch quota is met, trimming the tail. Do this only if profiling shows a real imbalance (per-worker collection-time spread). Difficulty: low-moderate.
+- **P11b. Overlap collection with the update.** The policy is frozen during collection, so batch N+1's rollout can run on the workers while the main process does batch N's GPU update. Est. another ~15-20% wall-clock, but adds a pipelining stage (weight-broadcast timing, one-batch-stale snapshots) and complicates the equivalence story. Difficulty: moderate. Only after N=6 is stable and measured.
+
+Standing-rule reminder: measure `t=` distributions over ≥10 batches per config, not a single batch — spawn/import startup and pool-phase (`p_pool→0.9`) opponent cost both skew early/late batches.
+
 ---
 
 ### Tier 4 — small / cosmetic
