@@ -5,8 +5,11 @@ invariant across full random games.
 import numpy as np
 
 from src.services.environment.warchest_env import (
-    WarChestEnv, OWN_UNIT_PLANE_BASE, OPP_UNIT_PLANE_BASE, UNIT_COINS,
+    WarChestEnv, UNIT_COINS,
     DEPLOY_ACTION, RECRUIT_ACTION, MOVE_ACTION, ATTACK_ACTION,
+)
+from src.services.environment.obs_encoders.v10 import (
+    OWN_UNIT_PLANE_BASE, OPP_UNIT_PLANE_BASE,
 )
 from src.services.environment.game_state import (
     DECK, build_bag, build_supply, UNITS_PER_PLAYER,

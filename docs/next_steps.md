@@ -54,6 +54,23 @@ round-robin and the Nash direction.
 
 ## Step 1 — Round-robin gauntlet + diagnostics
 
+> **Status (implemented):** the obs-encoder was extracted from `warchest_env.py`
+> into versioned modules (`environment/obs_encoders/`, registry + `v10.py`); the
+> engine now delegates encoding and exposes stable rules-queries
+> (`unit_threat_footprint`, `attack_enabler_coins`, `unit_base_reach_cells`) so the
+> *availability model + feature layout* (the version-varying part) lives in the
+> encoder. `Policy`/`Critic` take their obs dims from the paired encoder;
+> checkpoints now carry obs-version + arch metadata (`policy/checkpoint.py`, with a
+> legacy bare-`state_dict` fallback). The in-process round-robin
+> (`services/gauntlet.py` + `app/gauntlet.py`) plays a field all-pairs with balanced
+> colors and reports the WR matrix, a Bradley-Terry (Elo-scaled) ranking, and the
+> intransitive-triple fraction. A golden-output test
+> (`tests/test_obs_golden.py`) guards the extraction byte-for-byte.
+> *Still open:* the opponent-independent quality metrics in `eval_bucketed`, and
+> pointing diagnostics at a stronger opponent (Step 2). Resurrecting pre-v10 /
+> pre-`conv` checkpoints remains the subprocess/worktree path (not built — the
+> gauntlet skips incompatible checkpoints).
+
 ### What it is (and what it is *not*)
 
 A **fixed** set of agents (checkpoints from different eras + `GreedyBot` variants) played

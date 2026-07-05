@@ -6,7 +6,7 @@
 
 ### Board encoder (CNN)
 
-The board is encoded into `BOARD_CHANNELS` (48) planes by `generate_observation()` in `warchest_env.py` (not by the policy — the policy consumes the pre-encoded tensor directly):
+The board is encoded into `BOARD_CHANNELS` (48) planes by the versioned obs encoder `obs_encoders/v10.py` (which `generate_observation()` delegates to; not by the policy — the policy consumes the pre-encoded tensor directly):
 
 | Planes | Content |
 |---|---|
@@ -35,7 +35,7 @@ HexConv2d(hidden_dim→hidden_dim) + ReLU
 
 ### Global features
 
-`global[GLOBAL_DIM]` (211) carries round/base/initiative counters and ego-centric coin-counting per type (own hand/bag/discard/supply/owned exactly; opponent's on-board/faceup/supply/owned exactly, with a bounded `hidden` pool standing in for what can't be observed), plus (OBS_VERSION 10) **2 material-at-risk scalars** (own/opp coins that can die this turn = `Σ min(hits, stack)`), a **17-wide expected-opponent-hand vector** (`hidden · opp_hand_size / hidden_total` — actor-side estimate of live counter-capacity; the critic sees the true split via `PRIV_DIM`), and **3 base-control reach scalars** (bases I can claim this turn, my bases under flip threat, and a win-proximity alarm), then the pending-tactic-continuation one-hot — see the constant block above `GLOBAL_DIM` in `warchest_env.py` and `docs/observation_improvement.md` for the exact layout and rationale.
+`global[GLOBAL_DIM]` (211) carries round/base/initiative counters and ego-centric coin-counting per type (own hand/bag/discard/supply/owned exactly; opponent's on-board/faceup/supply/owned exactly, with a bounded `hidden` pool standing in for what can't be observed), plus (OBS_VERSION 10) **2 material-at-risk scalars** (own/opp coins that can die this turn = `Σ min(hits, stack)`), a **17-wide expected-opponent-hand vector** (`hidden · opp_hand_size / hidden_total` — actor-side estimate of live counter-capacity; the critic sees the true split via `PRIV_DIM`), and **3 base-control reach scalars** (bases I can claim this turn, my bases under flip threat, and a win-proximity alarm), then the pending-tactic-continuation one-hot — see the constant block above `GLOBAL_DIM` in `obs_encoders/v10.py` and `docs/observation_improvement.md` for the exact layout and rationale.
 
 ## Feature fusion and heads
 
@@ -61,7 +61,7 @@ Linear(hidden_dim // 2 → 1)
 | `act_with_encoded(obs)` | `(action, log_prob, entropy, feat)` | Also returns encoded board features, so `Critic.value_from_features` can reuse them and skip a second board-encoder pass |
 | `evaluate_actions_batch(batch)` | `(log_probs, entropies)` | Batched re-evaluation; used in PPO update |
 
-Board/global encoding itself happens in `generate_observation()` (env), not in `Policy` — there is no separate `encode_board` step on the policy side.
+Board/global encoding itself happens in the versioned obs encoder (`obs_encoders/`, which `generate_observation()` delegates to), not in `Policy` — there is no separate `encode_board` step on the policy side. `Policy`/`Critic` read `BOARD_CHANNELS`/`GLOBAL_DIM`/`PRIV_DIM` from the encoder they are paired with (`obs_encoder=…`), not from a hardcoded env constant.
 
 ### Critic
 

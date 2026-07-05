@@ -23,14 +23,18 @@ Turn-based hex-grid strategy game with a reinforcement learning agent (PPO + GAE
 src/
   services/
     environment/    game engine (Gymnasium env, board, units, renderer)
+      obs_encoders/   versioned observation encoders (v10.py + registry); env delegates encoding
     policy/         actor-critic neural network (Policy + Critic)
+      checkpoint.py   checkpoint (de)serialization with obs-version + arch metadata
     bots/           Bot ABC, RandomBot, GreedyBot
     opponent_pool.py  weighted opponent sampler (random / greedy / pool snapshots)
+    gauntlet.py     round-robin agents + Bradley-Terry/Elo ratings + transitivity
   app/
     ppo.py          PPO training entry point (PPOTrainer class)
     reinforce.py    legacy REINFORCE+GAE trainer (retained for reference, not the primary path)
     demo.py         evaluation vs random + interactive replay
     main.py         minimal random-action smoke test
+    gauntlet.py     round-robin gauntlet CLI (WR matrix, Elo/BT ranking, transitivity)
     eval_bucketed.py  per-composition eval bucketing (see docs/IDEAS.md #1)
     policy_viz.py   export policy graph to TensorBoard
     test.py         entropy distribution visualiser

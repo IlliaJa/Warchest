@@ -5,7 +5,9 @@ import numpy as np
 
 import torch
 from src.services.policy.policy import Policy
+from src.services.policy.checkpoint import load_policy_checkpoint
 from src.services.environment.warchest_env import WarChestEnv
+from src.services.environment.obs_encoders import get_encoder
 from src.services.bots.greedy_bot import GreedyBot
 
 
@@ -115,16 +117,23 @@ if __name__ == '__main__':
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
 
-    policy = Policy(device=device, hidden_dim=args.hidden_dim).to(device)
-    policy.load_state_dict(torch.load(model_path, map_location=device))
+    # Load with metadata so the net + env are built for the checkpoint's obs
+    # version and width (falls back to CLI --hidden-dim for legacy checkpoints).
+    ckpt = load_policy_checkpoint(model_path, map_location=device,
+                                  default_hidden_dim=args.hidden_dim)
+    encoder = get_encoder(ckpt['obs_version'])
+    print(f"arch={ckpt['arch']} obs_version={ckpt['obs_version']} hidden_dim={ckpt['hidden_dim']}")
+
+    policy = Policy(device=device, hidden_dim=ckpt['hidden_dim'], obs_encoder=encoder).to(device)
+    policy.load_state_dict(ckpt['state_dict'])
     policy.eval()
 
-    # Evaluate vs random
-    env = WarChestEnv(save_game_history=False)
+    # Evaluate vs random. The env encodes with the checkpoint's obs version.
+    env = WarChestEnv(save_game_history=False, obs_encoder=get_encoder(ckpt['obs_version']))
     evaluate_agent(env, n_eval_episodes=1, policy=policy)
 
     # Rendered game
-    env_render = WarChestEnv(save_game_history=True)
+    env_render = WarChestEnv(save_game_history=True, obs_encoder=get_encoder(ckpt['obs_version']))
     if args.opponent == 'greedy':
         ai_pid = 1
         play_ai_vs_greedy(env_render, policy, ai_pid=ai_pid)

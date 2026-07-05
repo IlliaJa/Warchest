@@ -4,10 +4,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from ..environment.warchest_env import (
-    N_VERBS, BOARD_DIM, ACTION_SPACE_SIZE, GLOBAL_DIM,
-    BOARD_CHANNELS, SPATIAL_SIZE, FACEDOWN_SIZE, PRIV_DIM,
+    N_VERBS, BOARD_DIM, ACTION_SPACE_SIZE, SPATIAL_SIZE, FACEDOWN_SIZE,
     N_FACTORED_VERBS, VERB_OF_ACTION,
 )
+from ..environment.obs_encoders import latest_encoder
 
 
 class HexConv2d(nn.Module):
@@ -87,11 +87,18 @@ class Policy(nn.Module):
         44: row_coord  45: col_coord — static ego-centric position planes
     """
 
-    def __init__(self, device, hidden_dim=64):
+    def __init__(self, device, hidden_dim=64, *, obs_encoder=None):
         super().__init__()
 
+        # Observation dims come from the (versioned) encoder this net is paired
+        # with, not from a hardcoded env constant — so a policy built for one obs
+        # version sizes its input layers to that version.
+        enc = obs_encoder or latest_encoder()
+        self.board_channels = enc.board_channels
+        self.global_dim = enc.global_dim
+
         self.board_encoder = nn.Sequential(
-            HexConv2d(in_channels=BOARD_CHANNELS, out_channels=32),
+            HexConv2d(in_channels=self.board_channels, out_channels=32),
             nn.ReLU(),
             HexConv2d(in_channels=32, out_channels=hidden_dim),
             nn.ReLU(),
@@ -103,10 +110,10 @@ class Policy(nn.Module):
         # linear head for the face-down actions. The spatial head sees the full
         # per-cell feature map directly, so it was never location-blind; only the
         # pooled path (facedown_head/verb_head) needed the split pool below.
-        self.policy_head = nn.Conv2d(hidden_dim + GLOBAL_DIM, N_VERBS, kernel_size=1)
-        self.facedown_head = nn.Linear(2 * hidden_dim + GLOBAL_DIM, FACEDOWN_SIZE)
+        self.policy_head = nn.Conv2d(hidden_dim + self.global_dim, N_VERBS, kernel_size=1)
+        self.facedown_head = nn.Linear(2 * hidden_dim + self.global_dim, FACEDOWN_SIZE)
         # Top-level verb head.
-        self.verb_head = nn.Linear(2 * hidden_dim + GLOBAL_DIM, N_FACTORED_VERBS)
+        self.verb_head = nn.Linear(2 * hidden_dim + self.global_dim, N_FACTORED_VERBS)
 
         # Static flat-id -> verb-index map, and a per-verb membership matrix.
         verb_index = torch.tensor(VERB_OF_ACTION, dtype=torch.long)
@@ -126,7 +133,7 @@ class Policy(nn.Module):
     def _logits_from_feat(self, feat: torch.Tensor, global_feats: torch.Tensor):
         """feat: [B,hidden_dim,7,7], global_feats: [B,G] → (flat_logits [B,A], verb_logits [B,V])"""
         B = feat.shape[0]
-        g = global_feats.view(B, GLOBAL_DIM, 1, 1).expand(B, GLOBAL_DIM, BOARD_DIM, BOARD_DIM)
+        g = global_feats.view(B, self.global_dim, 1, 1).expand(B, self.global_dim, BOARD_DIM, BOARD_DIM)
         spatial = self.policy_head(torch.cat([feat, g], dim=1)).flatten(1)  # [B, SPATIAL_SIZE]
         pooled = _split_pool(feat)  # [B, 2*hidden_dim]
         pg = torch.cat([pooled, global_feats], dim=-1)
@@ -229,17 +236,22 @@ class Critic(nn.Module):
 
     OPP_DIM = 3
 
-    def __init__(self, device, hidden_dim=64):
+    def __init__(self, device, hidden_dim=64, *, obs_encoder=None):
         super().__init__()
+        # Obs dims (incl. the privileged vector) come from the paired encoder.
+        enc = obs_encoder or latest_encoder()
+        self.board_channels = enc.board_channels
+        self.global_dim = enc.global_dim
+        self.priv_dim = enc.priv_dim
         self.board_encoder = nn.Sequential(
-            HexConv2d(BOARD_CHANNELS, 32),
+            HexConv2d(self.board_channels, 32),
             nn.ReLU(),
             HexConv2d(32, hidden_dim),
             nn.ReLU(),
             HexConv2d(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
-        head_in = 2 * hidden_dim + GLOBAL_DIM + self.OPP_DIM + PRIV_DIM
+        head_in = 2 * hidden_dim + self.global_dim + self.OPP_DIM + self.priv_dim
         self.head = nn.Sequential(
             nn.Linear(head_in, hidden_dim),
             nn.ReLU(),

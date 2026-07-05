@@ -15,9 +15,10 @@ from collections import Counter
 import numpy as np
 
 from src.services.environment.warchest_env import (
-    THREAT_KINDS, UNCONTROLLED_BASE_CELL_ID,
+    UNCONTROLLED_BASE_CELL_ID,
     CONTROLLED_BASE_PLAYER_1_CELL_ID, CONTROLLED_BASE_PLAYER_2_CELL_ID,
 )
+from src.services.environment.obs_encoders.v10 import THREAT_KINDS
 from _helpers import (
     blank_env, place,
     SWORDSMAN, KNIGHT, BERSERKER, LIGHT_CAV, ROYAL_GUARD,

@@ -2,8 +2,12 @@
 
 `WarChestEnv` follows the [Gymnasium](https://gymnasium.farama.org/) interface. This
 describes the current full-base-game schema (`OBS_VERSION = 10`, `ACTION_SPACE_SIZE = 1875`).
-All named constants below are defined in `src/services/environment/warchest_env.py` unless
-noted otherwise.
+Action-space constants are defined in `src/services/environment/warchest_env.py`; the
+observation-schema constants (`OBS_VERSION`, `GLOBAL_DIM`, `BOARD_CHANNELS`, `PRIV_DIM`,
+`PENDING_KINDS`, …) live in the versioned encoder
+`src/services/environment/obs_encoders/v10.py` (import them from there).
+`generate_observation()` / `get_privileged_features()` delegate to the encoder the env was
+constructed with (`WarChestEnv(obs_encoder=…)`, default: latest).
 
 ## Construction
 

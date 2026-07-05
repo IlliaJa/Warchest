@@ -14,8 +14,8 @@ import numpy as np
 
 from src.services.environment.warchest_env import (
     WarChestEnv, SPATIAL_SIZE, TACTIC_VERB, SELECT_VERB, DECLINE_ACTION_ID,
-    PENDING_CTX_DIM, PENDING_KIND_IDX,
 )
+from src.services.environment.obs_encoders.v10 import PENDING_CTX_DIM, PENDING_KIND_IDX
 from src.services.environment.game_state import DECK
 from _helpers import (
     cavalry_scenario, archer_scenario, zone_plus_board, blank_env, place,

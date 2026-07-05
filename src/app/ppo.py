@@ -11,6 +11,7 @@ import time
 import wandb
 
 from src.services.policy.policy import Policy, Critic
+from src.services.policy.checkpoint import save_policy_checkpoint
 from src.services.environment.warchest_env import (
     WarChestEnv, WIN_REWARD,
 )
@@ -851,5 +852,9 @@ if __name__ == '__main__':
                 timestamp = time.strftime('%Y%m%d-%H%M')
                 filename = f'warchest_ppo_{timestamp}.pth'
                 os.makedirs('data', exist_ok=True)
-                torch.save(warchest_policy.state_dict(), f'data/{filename}')
+                save_policy_checkpoint(
+                    warchest_policy, f'data/{filename}',
+                    obs_version=environment._obs_encoder.version,
+                    hidden_dim=hp['hidden_dim'],
+                )
                 logger.info(f'Model saved to data/{filename}')

@@ -144,108 +144,8 @@ def verb_of_action(action_id: int) -> int:
 # Static map flat action id -> verb index; consumed by the factored policy head.
 VERB_OF_ACTION = np.array([verb_of_action(a) for a in range(ACTION_SPACE_SIZE)], dtype=np.int64)
 
-# Board planes: 6 terrain/base/exploration + one stack-valued plane per unit type
-# per side (own then opp). Only the ~4 drafted types per side are ever nonzero.
-N_BASE_PLANES = 6
-OWN_UNIT_PLANE_BASE = N_BASE_PLANES               # 6
-OPP_UNIT_PLANE_BASE = N_BASE_PLANES + NUM_UNIT_TYPES  # 22
-
-# Threat planes (C16/architectural note in docs/IDEAS.md): graded hit-count a
-# side could land on each cell *this turn*, split by delivery mechanism so the
-# CNN doesn't have to re-derive tactic geometry from raw unit-type identity.
-#   melee  — adjacent (hex-distance 1) attacks, incl. Marshall-granted ones
-#            and the Berserker chain's distance-1 contribution
-#   ranged — Archer/Crossbowman's ranged_attack tactic (no movement)
-#   charge — a move-then-strike mechanic landing at hex-distance >= 2
-#            (Lancer's line_charge, Cavalry's move_then_attack, and the
-#            Berserker chain's distance->=2 contribution)
-# See WarChestEnv._threat_contributions / _threat_grids for the derivation.
-THREAT_KINDS = ('melee', 'ranged', 'charge')
-N_THREAT_KINDS = len(THREAT_KINDS)
-N_THREAT_PLANES = 2 * N_THREAT_KINDS  # own_* + enemy_* per kind = 6
-OWN_THREAT_PLANE_BASE = OPP_UNIT_PLANE_BASE + NUM_UNIT_TYPES     # 38
-ENEMY_THREAT_PLANE_BASE = OWN_THREAT_PLANE_BASE + N_THREAT_KINDS  # 41
-THREAT_NORM = MAX_TOTAL  # 5 — same normaliser as unit stacks; clipped to 1.0
-
-# Coordinate planes: ego-centric row/col index, static (no per-step compute).
-# Board geometry (Board.default_bases) confirms `q` (column) is the flank axis
-# — P1's bases sit at low q, P2's at high q — so col_coord is what lets the
-# pooled/verb-level features distinguish "which side" a threat is on.
-N_COORD_PLANES = 2
-COORD_PLANE_BASE = ENEMY_THREAT_PLANE_BASE + N_THREAT_KINDS  # 44
-ROW_COORD_PLANE = COORD_PLANE_BASE       # 44
-COL_COORD_PLANE = COORD_PLANE_BASE + 1   # 45
-
-# Base-control reach planes (docs/IDEAS.md "base-control reach planes"): the
-# objective-analogue of the threat planes. A 0/1 grid marking each base cell a
-# side could move a unit onto (then claim) this turn — uncontrolled or
-# opponent-held bases, gated by coin availability (own hand / opponent hidden
-# pool, worst-case, exactly as the threat planes gate). own_base_reach = bases I
-# can take; enemy_base_reach = my bases (and neutrals) the opponent can take.
-N_BASE_REACH_PLANES = 2
-BASE_REACH_PLANE_BASE = COORD_PLANE_BASE + N_COORD_PLANES  # 46
-OWN_BASE_REACH_PLANE = BASE_REACH_PLANE_BASE       # 46
-ENEMY_BASE_REACH_PLANE = BASE_REACH_PLANE_BASE + 1  # 47
-
-BOARD_CHANNELS = BASE_REACH_PLANE_BASE + N_BASE_REACH_PLANES  # 6 + 32 + 6 + 2 + 2 = 48
-
 # Unit coin types (deployable); the royal coin has no board unit.
 UNIT_COINS = UNIT_IDS
-STACK_NORM = MAX_TOTAL  # 5 — max coins of one type on one stack
-# Max coins a player can hold across hand+bag (4 units × total + 1 royal); bag-size norm.
-OWNED_TOTAL = UNITS_PER_PLAYER * MAX_TOTAL + 1  # 21
-
-# Global feature layout (ego-centric, OBS_VERSION 4). Per-type vectors run over
-# the full coin universe (DECK, len C=17) or the unit types (U=16); absent types
-# are zero. Counts normalized per type by total owned (or supply capacity).
-#   [0] round fraction  [1] my bases  [2] opp bases  [3] my initiative
-#   own (known): hand[C] bag[C] discard[C] supply[U] bag_size[1] owned[C]
-#   opponent (public): on_board[U] faceup[C] supply[U] hidden_pool[C] owned[C]
-#                      opp_hand_size[1]
-#   [.] initiative already transferred this round
-#   material-at-risk (OBS_VERSION 10): own_at_risk[1] opp_at_risk[1] — coins of my
-#     (their) on-board material that can die this turn (min(enemy_hits, stack) summed
-#     over my (their) units), from the raw threat grids; see docs/observation_improvement.md
-#   E_opp_hand[C] (OBS_VERSION 10): expected copies of each type in the opponent's
-#     hand right now = hidden_pool * opp_hand_size / hidden_total (actor-side estimate
-#     of live counter-capacity; the critic already sees the true split via PRIV_DIM)
-#   base-control reach scalars (OBS_VERSION 10): bases_i_can_claim[1]
-#     my_bases_under_flip_threat[1] win_proximity_alarm[1]
-#   + pending-context one-hot (PENDING_CTX_DIM): which mid-tactic continuation, if any
-#
-# Pending-context one-hot (Phase 4): slot 0 = no pending (normal play); the rest are
-# one slot per kind in PENDING_KINDS. This is what lets the policy read an otherwise
-# ambiguous move/attack click as "a Cavalry follow-up" vs "a normal maneuver". Adding
-# a kind extends this vector → bump OBS_VERSION (a schema change), as for any phase.
-PENDING_KINDS = (
-    'move_then_attack:move',   # Cavalry: the move stage
-    'move_then_attack:attack',  # Cavalry: the (optional) attack stage
-    'ranged_attack',            # Archer/Crossbowman: SELECT a ranged target
-    'bonus_move',               # Swordsman: an optional free move after attacking
-    'extra_maneuver',           # Berserker: pay a stack coin to maneuver again
-    'bonus_action',             # Warrior Priest: spend a freshly drawn coin at once
-    'move_to',                  # Light Cavalry / Royal Guard: SELECT a destination ≤N away
-    'line_charge',              # Lancer: SELECT an in-line enemy, then move+attack
-    'grant_attack:select',      # Marshall: SELECT a friendly unit within range
-    'grant_attack:strike',      # Marshall: the chosen unit makes a normal attack
-    'grant_move:select',        # Ensign: SELECT a friendly unit within range
-    'grant_move:step',          # Ensign: the chosen unit makes a normal move
-    'free_maneuver',            # Mercenary: a free maneuver after its coin is recruited
-    'footman_maneuver',         # Footman: one maneuver with each Footman on the board
-)
-PENDING_CTX_DIM = 1 + len(PENDING_KINDS)  # 15
-PENDING_KIND_IDX = {k: i for i, k in enumerate(PENDING_KINDS)}
-# 8 coin-vectors (hand,bag,discard,owned,opp_faceup,opp_hidden,opp_owned,E_opp_hand)
-# + 3 unit-vectors (supply,opp_on_board,opp_supply) + 12 standalone scalars
-# (4 header + bag_size + opp_hand_size + init_transferred + 2 material-at-risk
-#  + 3 base-reach) + pending one-hot.
-GLOBAL_DIM = 8 * N_COIN_TYPES + 3 * NUM_UNIT_TYPES + 12 + PENDING_CTX_DIM  # 211
-OBS_VERSION = 10  # material-at-risk + E_opp_hand globals; base-control reach planes
-                  # (BOARD_CHANNELS 46 -> 48, GLOBAL_DIM 189 -> 211)
-
-# Privileged critic-only features: the opponent's true hidden split, per coin (C).
-#   [0:C] opp hand   [C:2C] opp bag   [2C:3C] opp face-down discard
-PRIV_DIM = 3 * N_COIN_TYPES  # 51
 
 MOVE_EXPLORE_REWARD_MAX_TURN = 5
 MOVE_EXPLORE_REWARD_PER_TURN = 0.1
@@ -336,9 +236,19 @@ class WarChestEnv(gym.Env):
             verb_rot = verb
         return WarChestEnv.encode_action(verb_rot, r_rot, q_rot)
 
-    def __init__(self, save_game_history: bool = False, debug_mode: bool = False):
+    def __init__(self, save_game_history: bool = False, debug_mode: bool = False,
+                 obs_encoder=None):
         super().__init__()
         self.debug_mode = debug_mode
+
+        # Versioned observation encoder (obs_encoders/). The engine itself is
+        # obs-version-agnostic and delegates encoding to this object; default to
+        # the newest registered version. Lazily imported to avoid a module-level
+        # import cycle (the encoder imports action-space constants from here).
+        if obs_encoder is None:
+            from .obs_encoders import latest_encoder
+            obs_encoder = latest_encoder()
+        self._obs_encoder = obs_encoder
 
         self.state = None
         self.history = [] if save_game_history else None
@@ -657,228 +567,15 @@ class WarChestEnv(gym.Env):
         return x, y
 
     def get_observation_space(self):
-        return gym.spaces.Dict({
-            'board': gym.spaces.Box(
-                low=0.0, high=1.0,
-                shape=(BOARD_CHANNELS, BOARD_DIM, BOARD_DIM),
-                dtype=np.float32,
-            ),
-            'global': gym.spaces.Box(low=0.0, high=1.0, shape=(GLOBAL_DIM,), dtype=np.float32),
-            'valid_action_mask': gym.spaces.Box(
-                low=0, high=1, shape=(ACTION_SPACE_SIZE,), dtype=np.float32
-            ),
-            'active_player': gym.spaces.Discrete(2),
-        })
+        return self._obs_encoder.observation_space()
 
     def generate_observation(self):
-        active = self.active_player
-        opponent = 3 - active
-        s = self.board.board_size - 1  # 6
-
-        raw_board = self.board.board
-        expl = self.exploration_map_dict[active]
-        if active == 2:
-            raw_board = np.rot90(raw_board, 2).copy()
-            expl = np.rot90(expl, 2).copy()
-
-        # Build encoded board (ego-centric, already rotated for P2).
-        board_enc = np.zeros((BOARD_CHANNELS, BOARD_DIM, BOARD_DIM), dtype=np.float32)
-        board_enc[0] = (raw_board == INVALID_CELL_ID)
-        board_enc[1] = (raw_board == EMPTY_CELL_ID)
-        board_enc[2] = (raw_board == UNCONTROLLED_BASE_CELL_ID)
-        my_base_id = CONTROLLED_BASE_PLAYER_1_CELL_ID if active == 1 else CONTROLLED_BASE_PLAYER_2_CELL_ID
-        opp_base_id = CONTROLLED_BASE_PLAYER_2_CELL_ID if active == 1 else CONTROLLED_BASE_PLAYER_1_CELL_ID
-        board_enc[3] = (raw_board == my_base_id)
-        board_enc[4] = (raw_board == opp_base_id)
-        visits = np.clip(expl, 0, None).astype(np.float32)
-        board_enc[5] = visits / (visits.max() + 1e-5)
-        # Unit planes: one stack-valued plane per unit type per owner, ego-centric.
-        #   own types -> planes [OWN_UNIT_PLANE_BASE : +NUM_UNIT_TYPES]
-        #   opp types -> planes [OPP_UNIT_PLANE_BASE : +NUM_UNIT_TYPES]
-        # plane index within a side = unit id - 1 (ids run 1..16).
-        for u in self.board.units:
-            r, q = u.loc
-            if active == 2:
-                r, q = s - r, s - q
-            owner_base = OWN_UNIT_PLANE_BASE if u.player_id == active else OPP_UNIT_PLANE_BASE
-            board_enc[owner_base + (u.id - 1), r, q] = u.stack / STACK_NORM
-        # Coordinate planes: static, ego-centric row/col index (see COORD_PLANE_BASE).
-        board_enc[ROW_COORD_PLANE] = _ROW_COORD_ROT if active == 2 else _ROW_COORD_RAW
-        board_enc[COL_COORD_PLANE] = _COL_COORD_ROT if active == 2 else _COL_COORD_RAW
-        # Global features [GLOBAL_DIM] — ego-centric coin-counting (OBS_VERSION 4).
-        my_bases = len(self.board.get_controlled_bases(active))
-        opp_bases = len(self.board.get_controlled_bases(opponent))
-
-        own_hand = self.state.hands[active]
-        own_bag = self.state.bags[active]
-        own_discard = self.state.discard_faceup[active] + self.state.discard_facedown[active]
-        own_supply = self.state.supply[active]
-
-        # On-board counts are stack heights (committed coins), one unit per type.
-        opp_on_board = Counter()
-        for u in self.board.units:
-            if u.player_id == opponent:
-                opp_on_board[u.id] += u.stack
-        opp_faceup = self.state.discard_faceup[opponent]
-        opp_supply = self.state.supply[opponent]
-
-        def in_play(pid):
-            """Coins still in the cycle = owned-by-composition minus boxed."""
-            o = self.state.owned(pid)
-            b = self.state.boxed[pid]
-            return Counter({c: o[c] - b[c] for c in DECK})
-
-        own_owned = in_play(active)
-        opp_owned = in_play(opponent)
-
-        # Threat planes: opponent coin-availability is bounded (hand+bag+facedown
-        # discard, unknown split) since only the aggregate is observable; own
-        # availability is exact (own_hand, above). See _threat_grids.
-        opp_hidden = Counter({
-            c: opp_owned[c] - opp_on_board[c] - opp_faceup[c] - opp_supply[c] for c in UNIT_IDS
-        })
-        threat_grids = self._threat_grids(active, own_hand, opp_hidden)
-        for i, kind in enumerate(THREAT_KINDS):
-            own_grid = threat_grids[(active, kind)]
-            enemy_grid = threat_grids[(opponent, kind)]
-            if active == 2:
-                own_grid = np.rot90(own_grid, 2)
-                enemy_grid = np.rot90(enemy_grid, 2)
-            board_enc[OWN_THREAT_PLANE_BASE + i] = np.clip(own_grid / THREAT_NORM, 0.0, 1.0)
-            board_enc[ENEMY_THREAT_PLANE_BASE + i] = np.clip(enemy_grid / THREAT_NORM, 0.0, 1.0)
-
-        # Material-at-risk (globals): coins of on-board material that can die this turn,
-        # min(hits, stack) summed per side. Uses the RAW threat grids (pre-clip) so the
-        # count is comparable to stack height; grids and u.loc are both absolute coords.
-        enemy_hits = sum(threat_grids[(opponent, k)] for k in THREAT_KINDS)
-        own_hits = sum(threat_grids[(active, k)] for k in THREAT_KINDS)
-        own_at_risk = opp_at_risk = 0.0
-        for u in self.board.units:
-            if u.player_id == active:
-                own_at_risk += min(enemy_hits[u.loc], u.stack)
-            else:
-                opp_at_risk += min(own_hits[u.loc], u.stack)
-
-        # Base-control reach planes + scalars (objective-analogue of the threat planes).
-        base_reach = self._base_reach_grids(active, own_hand, opp_hidden)
-        own_reach, enemy_reach = base_reach[active], base_reach[opponent]
-        bases_i_can_claim = float(own_reach.sum())
-        my_bases_under_flip = sum(
-            enemy_reach[loc] for loc in self.board.get_controlled_bases(active))
-        # The most decisive state in the game: opponent one base from winning AND able
-        # to take a base this turn unless answered.
-        win_alarm = float(opp_bases == self.winning_base_count - 1 and enemy_reach.sum() > 0)
-        if active == 2:
-            own_reach = np.rot90(own_reach, 2)
-            enemy_reach = np.rot90(enemy_reach, 2)
-        board_enc[OWN_BASE_REACH_PLANE] = own_reach
-        board_enc[ENEMY_BASE_REACH_PLANE] = enemy_reach
-
-        # Convert all counters to dense numpy vectors; remaining ops are vectorised.
-        hand_v    = _counter_to_deck_vec(own_hand)
-        bag_v     = _counter_to_deck_vec(own_bag)
-        discard_v = _counter_to_deck_vec(own_discard)
-        supply_v  = _counter_to_unit_vec(own_supply)
-        owned_v   = _counter_to_deck_vec(own_owned)
-        onboard_v = _counter_to_unit_vec(opp_on_board)
-        faceup_v  = _counter_to_deck_vec(opp_faceup)
-        opp_sup_v = _counter_to_unit_vec(opp_supply)
-        opp_own_v = _counter_to_deck_vec(opp_owned)
-
-        # opp_hidden: expand unit-only vectors to DECK-length, then subtract.
-        onboard_deck = np.zeros(N_COIN_TYPES, dtype=np.float32)
-        onboard_deck[_UNIT_IN_DECK] = onboard_v
-        opp_sup_deck = np.zeros(N_COIN_TYPES, dtype=np.float32)
-        opp_sup_deck[_UNIT_IN_DECK] = opp_sup_v
-        hidden_v = opp_own_v - onboard_deck - faceup_v - opp_sup_deck
-
-        # E_opp_hand: expected copies of each type in the opponent's hand right now,
-        # = hidden_pool * opp_hand_size / hidden_total (hypergeometric mean). Actor-side
-        # estimate of what they can play against me this round; decays to 0 as they empty
-        # their hand. hidden_v may carry tiny negatives from the unknown split — clip.
-        opp_hand_size = sum(self.state.hands[opponent].values())
-        hidden_nonneg = np.clip(hidden_v, 0.0, None)
-        hidden_total = hidden_nonneg.sum()
-        e_opp_hand = hidden_nonneg * (opp_hand_size / hidden_total) if hidden_total > 0 \
-            else np.zeros(N_COIN_TYPES, dtype=np.float32)
-
-        global_feats = np.concatenate([
-            np.array([
-                min(self.state.round_number / self.max_rounds, 1.0),
-                my_bases / self.winning_base_count,
-                opp_bases / self.winning_base_count,
-                float(self.state.initiative_owner == active),
-            ], dtype=np.float32),
-            hand_v / _TOTAL_COINS_VEC,
-            bag_v / _TOTAL_COINS_VEC,
-            discard_v / _TOTAL_COINS_VEC,
-            supply_v / _SUPPLY_CAP_VEC,
-            np.array([sum(own_bag.values()) / OWNED_TOTAL], dtype=np.float32),
-            owned_v / _TOTAL_COINS_VEC,
-            onboard_v / _TOTAL_COINS_UNIT_VEC,
-            faceup_v / _TOTAL_COINS_VEC,
-            opp_sup_v / _SUPPLY_CAP_VEC,
-            hidden_v / _TOTAL_COINS_VEC,
-            opp_own_v / _TOTAL_COINS_VEC,
-            np.array([
-                opp_hand_size / HAND_SIZE,
-                float(self.state.initiative_transferred_this_round),
-            ], dtype=np.float32),
-            # material-at-risk (OBS_VERSION 10)
-            np.array([
-                min(own_at_risk / OWNED_TOTAL, 1.0),
-                min(opp_at_risk / OWNED_TOTAL, 1.0),
-            ], dtype=np.float32),
-            # expected opponent hand, per type (OBS_VERSION 10)
-            e_opp_hand / _TOTAL_COINS_VEC,
-            # base-control reach scalars (OBS_VERSION 10)
-            np.array([
-                min(bases_i_can_claim / self.winning_base_count, 1.0),
-                min(my_bases_under_flip / self.winning_base_count, 1.0),
-                win_alarm,
-            ], dtype=np.float32),
-        ])
-
-        # Pending-context one-hot: which mid-tactic continuation (if any) is being
-        # asked for. Slot 0 = normal play; this disambiguates a reused move/attack
-        # click as a Cavalry follow-up vs an ordinary maneuver.
-        ctx = np.zeros(PENDING_CTX_DIM, dtype=np.float32)
-        if self.state.pending is None:
-            ctx[0] = 1.0
-        else:
-            ctx[1 + PENDING_KIND_IDX[self.state.pending.kind]] = 1.0
-        global_feats = np.concatenate([global_feats, ctx])
-        # Valid action mask [ACTION_SPACE_SIZE]
-        valid_ids = self.get_possible_actions()
-        mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.bool_)
-        if active == 2:
-            mask[_REMAP_TABLE[np.array(valid_ids, dtype=np.int64)]] = True
-        else:
-            mask[valid_ids] = True
-        return {
-            'board': board_enc,
-            'global': global_feats,
-            'valid_action_mask': mask,
-            'active_player': active,
-        }
+        """Encode the current state via the configured (versioned) obs encoder."""
+        return self._obs_encoder.encode(self)
 
     def get_privileged_features(self):
-        """Opponent's true hidden coin split — critic-only (never given to the policy).
-
-        Ego-centric: the opponent is 3 - active. Per coin {S,K,R}: hand, bag, face-down
-        discard counts, normalized by initial owned. These are exactly the quantities the
-        policy can only estimate via `hidden_pool`.
-        """
-        opp = 3 - self.active_player
-        hand = self.state.hands[opp]
-        bag = self.state.bags[opp]
-        fd = self.state.discard_facedown[opp]
-        feats = (
-            [hand[c] / TOTAL_COINS[c] for c in DECK]
-            + [bag[c] / TOTAL_COINS[c] for c in DECK]
-            + [fd[c] / TOTAL_COINS[c] for c in DECK]
-        )
-        return np.array(feats, dtype=np.float32)
+        """Critic-only privileged features via the configured obs encoder."""
+        return self._obs_encoder.encode_privileged(self)
 
     def get_possible_actions(self):
         """Return valid action IDs in absolute (non-rotated) frame."""
@@ -1622,9 +1319,18 @@ class WarChestEnv(gym.Env):
                 out[cell] = stack - d + 1
         return out
 
-    def _threat_contributions(self, unit):
+    def unit_threat_footprint(self, unit):
         """[(cell, kind, hits), ...] this unit could produce with a single
-        enabling coin this turn. kind is one of THREAT_KINDS."""
+        enabling coin this turn. kind is one of THREAT_KINDS.
+
+        Rules-query (stable across obs versions): a pure function of the unit's
+        abilities + board geometry. All unit-attribute knowledge (which tactic,
+        can_normal_attack, stack-chaining) is confined here, so an observation
+        encoder can aggregate footprints without reading unit internals. The
+        *availability model* (which coins gate the footprint) lives separately in
+        `attack_enabler_coins`; how footprints are weighted/normalized into planes
+        is the encoder's concern, not the engine's.
+        """
         info = UNIT_BY_ID[unit.id]
         origin = unit.loc
         out = []
@@ -1649,53 +1355,28 @@ class WarChestEnv(gym.Env):
             out += [(c, 'melee', 1) for c in self.board.get_adjacent_cells(*origin)]
         return out
 
-    def _threat_grids(self, active, own_hand, opp_hidden):
-        """{(player_id, kind): np.ndarray[BOARD_DIM,BOARD_DIM]} raw hit-count grids,
-        in ABSOLUTE board coordinates (not yet ego-rotated for player 2).
+    def attack_enabler_coins(self, unit):
+        """Set of coin ids whose availability would let `unit` attack this turn.
 
-        Computed for BOTH physical players regardless of whose turn it is.
-        `own_hand`/`opp_hidden` give exact vs. bounded coin-availability for
-        whichever side is `active` vs. its opponent (see generate_observation).
-
-        Known simplification: Ensign's grant_move can reposition a friendly
-        Berserker before its chain would be evaluated (extending its reach by
-        up to 1 hex in a narrow set of directions); not modeled here — the
-        added complexity isn't justified by that marginal reach gain.
+        Rules-query (stable across obs versions): the unit's own coin, plus any
+        friendly Marshall (grant_attack) in range if the unit can normal-attack.
+        This encapsulates the Marshall-grant + unit-attribute logic so the
+        observation encoder only has to ask "is any enabler coin available?"
+        (worst-case, probability-weighted, ...) without touching unit internals.
         """
-        opponent = 3 - active
+        info = UNIT_BY_ID[unit.id]
+        coins = {unit.id}
+        if info.can_normal_attack:
+            for m in self.board.units:
+                if (m.player_id == unit.player_id
+                        and UNIT_BY_ID[m.id].tactic == 'grant_attack'
+                        and self._hex_distances(m.loc, 2).get(unit.loc, 0) > 0):
+                    coins.add(m.id)
+        return coins
 
-        def coin_gate(side, coin_id):
-            return (own_hand[coin_id] >= 1) if side == active else (opp_hidden[coin_id] >= 1)
-
-        grids = {(side, kind): np.zeros((BOARD_DIM, BOARD_DIM), dtype=np.float32)
-                 for side in (1, 2) for kind in THREAT_KINDS}
-
-        for side in (1, 2):
-            marshalls = [u for u in self.board.units if u.player_id == side
-                         and UNIT_BY_ID[u.id].tactic == 'grant_attack']
-            for u in self.board.units:
-                if u.player_id != side:
-                    continue
-                info = UNIT_BY_ID[u.id]
-                own_ok = coin_gate(side, u.id)
-                grant_ok = bool(marshalls) and info.can_normal_attack and any(
-                    coin_gate(side, m.id) and self._hex_distances(m.loc, 2).get(u.loc, 0) > 0
-                    for m in marshalls
-                )
-                if not (own_ok or grant_ok):
-                    continue
-                for cell, kind, hits in self._threat_contributions(u):
-                    grids[(side, kind)][cell] += hits
-        return grids
-
-    # ------------------------------------------------------------------
-    # Base-control reach map (observation-only). The objective-analogue of
-    # the threat map: 0/1 grids marking base cells a side could move a unit
-    # onto and claim this turn. Like the threat helpers these are
-    # side-effect-free, evaluated for both physical players, and must NOT
-    # read self.active_player — `_reachable` is player-agnostic and safe to
-    # mirror. See docs/IDEAS.md "base-control reach planes".
-    # ------------------------------------------------------------------
+    def _threat_grids(self, active, own_hand, opp_hidden):
+        """Delegate to the obs encoder (kept for tests / internal callers)."""
+        return self._obs_encoder.threat_grids(self, active, own_hand, opp_hidden)
 
     def _maneuver_range(self, unit) -> int:
         """How many empty cells `unit` can move through this turn to end on a base.
@@ -1705,7 +1386,7 @@ class WarChestEnv(gym.Env):
         Royal Guard's royal_move is restricted to controlled cells in play, but the
         unit can still normal-maneuver 1 step anywhere, so treating it as an
         unrestricted range-2 mover is a mild worst-case (accepted, cf. the Ensign
-        simplification in _threat_grids).
+        simplification in the threat grids).
         """
         info = UNIT_BY_ID[unit.id]
         if info.extra_maneuvers_from_stack:      # Berserker
@@ -1722,25 +1403,21 @@ class WarChestEnv(gym.Env):
                       else CONTROLLED_BASE_PLAYER_1_CELL_ID)
         return marker in (other_base, UNCONTROLLED_BASE_CELL_ID)
 
-    def _base_reach_grids(self, active, own_hand, opp_hidden):
-        """{side: np.ndarray[BOARD_DIM,BOARD_DIM]} 0/1 grids of claimable base cells a
-        side could move a unit onto (then claim) this turn. ABSOLUTE coords (not yet
-        ego-rotated). Coin-availability gated exactly as _threat_grids (own hand /
-        opponent hidden pool, worst-case)."""
-        def coin_gate(side, coin_id):
-            return (own_hand[coin_id] >= 1) if side == active else (opp_hidden[coin_id] >= 1)
+    def unit_base_reach_cells(self, unit):
+        """Set of claimable base cells `unit` could move onto (then claim) this turn.
 
-        grids = {side: np.zeros((BOARD_DIM, BOARD_DIM), dtype=np.float32) for side in (1, 2)}
-        for side in (1, 2):
-            for u in self.board.units:
-                if u.player_id != side or not coin_gate(side, u.id):
-                    continue
-                cells = set(self._reachable(u.loc, self._maneuver_range(u)))
-                cells.add(u.loc)  # a unit already on a claimable base can claim in place
-                for cell in cells:
-                    if self._is_claimable_base(side, cell):
-                        grids[side][cell] = 1.0
-        return grids
+        Rules-query (stable across obs versions): pure maneuver-reach geometry
+        against the base markers, ignoring coin availability. A unit already on a
+        claimable base can claim in place. Confines the maneuver-range +
+        claimable-base rules here so the encoder only applies its availability
+        model on top (via `unit`'s own coin)."""
+        cells = set(self._reachable(unit.loc, self._maneuver_range(unit)))
+        cells.add(unit.loc)
+        return {cell for cell in cells if self._is_claimable_base(unit.player_id, cell)}
+
+    def _base_reach_grids(self, active, own_hand, opp_hidden):
+        """Delegate to the obs encoder (kept for tests / internal callers)."""
+        return self._obs_encoder.base_reach_grids(self, active, own_hand, opp_hidden)
 
     def _continuation_actions(self):
         """Legal continuation ids for the current pending sub-turn (absolute frame)."""
@@ -2120,54 +1797,3 @@ class WarChestEnv(gym.Env):
 
     def get_active_player_units(self):
         return [u for u in self.board.units if u.player_id == self.active_player]
-
-
-# Precomputed full remap table — vectorises the P2 ego-centric mask translation.
-# Shape (ACTION_SPACE_SIZE,); face-down actions are identity, spatial actions are
-# rotated 180°. Built once at import time (~400 µs), reused every observation call.
-_REMAP_TABLE = np.array([WarChestEnv.remap_action(a) for a in range(ACTION_SPACE_SIZE)], dtype=np.int64)
-
-# Coordinate planes (row_coord, col_coord): static per-cell values, so both the
-# raw and P2-rotated variants are built once at import time. Rotating a raw
-# index grid 180° automatically yields the correctly-flipped ego-centric values
-# (cell (r,q) of the rotated array holds the raw value at (s-r, s-q)), the same
-# trick already used for raw_board/expl in generate_observation.
-_COORD_NORM = BOARD_DIM - 1  # 6
-_ROW_COORD_RAW = (np.arange(BOARD_DIM, dtype=np.float32)[:, None] / _COORD_NORM).repeat(BOARD_DIM, axis=1)
-_COL_COORD_RAW = (np.arange(BOARD_DIM, dtype=np.float32)[None, :] / _COORD_NORM).repeat(BOARD_DIM, axis=0)
-_ROW_COORD_ROT = np.rot90(_ROW_COORD_RAW, 2).copy()
-_COL_COORD_ROT = np.rot90(_COL_COORD_RAW, 2).copy()
-
-# ---------------------------------------------------------------------------
-# Vectorised obs_global helpers.
-# All arrays are built once at import time and reused every generate_observation call.
-# _counter_to_deck_vec / _counter_to_unit_vec iterate only over non-zero Counter
-# entries (typically 3–5), replacing O(17) or O(16) per-element Python loops.
-# ---------------------------------------------------------------------------
-_DECK_LIST = list(DECK)                                          # stable DECK iteration order
-_DECK_COIN_TO_IDX = {c: i for i, c in enumerate(_DECK_LIST)}    # coin → position in DECK vec
-_TOTAL_COINS_VEC = np.array([TOTAL_COINS[c] for c in _DECK_LIST], dtype=np.float32)
-_UNIT_COIN_TO_IDX = {c: i for i, c in enumerate(UNIT_COINS)}    # coin → position in unit vec
-_TOTAL_COINS_UNIT_VEC = np.array([TOTAL_COINS[c] for c in UNIT_COINS], dtype=np.float32)
-_SUPPLY_CAP_VEC = np.array([SUPPLY_CAP[c] for c in RECRUIT_TYPES], dtype=np.float32)
-_UNIT_IN_DECK = np.array([_DECK_COIN_TO_IDX[c] for c in UNIT_COINS], dtype=np.int64)
-
-
-def _counter_to_deck_vec(counter) -> np.ndarray:
-    """Counter → float32[N_COIN_TYPES] in _DECK_LIST order; iterates only non-zero entries."""
-    v = np.zeros(N_COIN_TYPES, dtype=np.float32)
-    for coin, cnt in counter.items():
-        i = _DECK_COIN_TO_IDX.get(coin)
-        if i is not None:
-            v[i] = cnt
-    return v
-
-
-def _counter_to_unit_vec(counter) -> np.ndarray:
-    """Counter → float32[NUM_UNIT_TYPES] in UNIT_COINS order; iterates only non-zero entries."""
-    v = np.zeros(NUM_UNIT_TYPES, dtype=np.float32)
-    for coin, cnt in counter.items():
-        i = _UNIT_COIN_TO_IDX.get(coin)
-        if i is not None:
-            v[i] = cnt
-    return v

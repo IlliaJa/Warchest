@@ -8,8 +8,11 @@ from collections import Counter
 from src.services.environment.warchest_env import (
     WarChestEnv,
     DECK, UNIT_COINS, RECRUIT_TYPES, N_COIN_TYPES, NUM_UNIT_TYPES,
-    TOTAL_COINS, SUPPLY_CAP, OWNED_TOTAL, HAND_SIZE, GLOBAL_DIM, THREAT_KINDS,
-    PENDING_CTX_DIM, PENDING_KIND_IDX,
+    TOTAL_COINS, SUPPLY_CAP, HAND_SIZE,
+)
+# Obs-layout constants and the vectorised global-feature helpers live in the v10 encoder.
+from src.services.environment.obs_encoders.v10 import (
+    OWNED_TOTAL, GLOBAL_DIM, THREAT_KINDS, PENDING_CTX_DIM, PENDING_KIND_IDX,
     _DECK_LIST, _DECK_COIN_TO_IDX, _TOTAL_COINS_VEC,
     _UNIT_COIN_TO_IDX, _TOTAL_COINS_UNIT_VEC, _SUPPLY_CAP_VEC, _UNIT_IN_DECK,
     _counter_to_deck_vec, _counter_to_unit_vec,

@@ -1,13 +1,13 @@
 """Threat/reach planes (docs/IDEAS.md "the agent can't see the board as one
 position", Part A). Covers the Berserker closed-form reach, the Cavalry/Lancer
 charge geometry, ranged targeting, and the Marshall grant-activation path,
-mostly against `_threat_contributions`/`_threat_berserker_reach`/`_threat_grids`
+mostly against `unit_threat_footprint`/`_threat_berserker_reach`/`_threat_grids`
 directly (bypassing bag/supply bookkeeping) since those are the novel,
 error-prone pieces; one end-to-end test checks the `generate_observation` wiring.
 """
 from collections import Counter
 
-from src.services.environment.warchest_env import (
+from src.services.environment.obs_encoders.v10 import (
     BOARD_CHANNELS, THREAT_KINDS, OWN_THREAT_PLANE_BASE, ENEMY_THREAT_PLANE_BASE,
     ROW_COORD_PLANE, COL_COORD_PLANE, THREAT_NORM,
     OWN_BASE_REACH_PLANE, ENEMY_BASE_REACH_PLANE,
@@ -66,7 +66,7 @@ def test_berserker_contribution_kind_split_by_adjacency():
     env = blank_env()
     origin = (3, 3)
     be = place(env, BERSERKER, player=1, loc=origin, stack=3)
-    contributions = env._threat_contributions(be)
+    contributions = env.unit_threat_footprint(be)
     kinds_by_cell = {cell: kind for cell, kind, _ in contributions}
     adjacent = set(env.board.get_adjacent_cells(*origin))
     assert all(kinds_by_cell[c] == 'melee' for c in kinds_by_cell if c in adjacent)
@@ -86,7 +86,7 @@ def test_cavalry_cells_more_permissive_than_straight_line_charge():
     assert straight_line_only.issubset(cavalry_cells)
     assert len(cavalry_cells) > len(straight_line_only)  # off-axis attacks included
 
-    contributions = env._threat_contributions(cav)
+    contributions = env.unit_threat_footprint(cav)
     charge_cells = {c for c, kind, _ in contributions if kind == 'charge'}
     melee_cells = {c for c, kind, _ in contributions if kind == 'melee'}
     assert charge_cells == cavalry_cells
@@ -99,7 +99,7 @@ def test_lancer_charge_cells():
     lancer = place(env, LANCER, player=1, loc=loc, stack=1)
     cells = env._threat_charge_cells(loc, max_dist=2)
     assert (3, 5) in cells  # straight line via offsets[2]=(0,1) twice: distance 3
-    contributions = env._threat_contributions(lancer)
+    contributions = env.unit_threat_footprint(lancer)
     assert all(kind == 'charge' for _, kind, _ in contributions)
     assert not any(kind == 'melee' for _, kind, _ in contributions)  # can_normal_attack=False
 
@@ -110,7 +110,7 @@ def test_lancer_charge_cells():
 
 def test_archer_ranged_cells_any_direction():
     env, archer, _ = archer_scenario()
-    contributions = env._threat_contributions(archer)
+    contributions = env.unit_threat_footprint(archer)
     assert all(kind == 'ranged' for _, kind, _ in contributions)
     dists = env._hex_distances(archer.loc, 2)
     expected = {c for c, d in dists.items() if d == 2}
