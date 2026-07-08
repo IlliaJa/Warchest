@@ -9,6 +9,7 @@ dependencies = [
     "torch",
     "wandb",
     "tensorboard",
+    "tqdm",
 ]
 
 [tool.uv]

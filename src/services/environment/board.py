@@ -18,6 +18,15 @@ class Board:
         CONTROLLED_BASE_PLAYER_2_CELL_ID: [(2, 5), (5, 6)],
         UNCONTROLLED_BASE_CELL_ID: [(0, 1), (2, 2), (5, 3), (1, 3), (4, 4), (6, 5)],
     }
+    # {(r, q): [neighbor, ...]} — the hex grid's shape (which cells are INVALID vs.
+    # in-bounds) is identical for every Board ever constructed, so this is computed
+    # once, lazily, and shared across all instances instead of redoing the 6-neighbour
+    # scan (with per-cell numpy scalar indexing) on every get_adjacent_cells() call —
+    # a hot path called tens of thousands of times per search (docs/lookahead_bot_plan.md).
+    _adjacency_cache = None
+    # [(r, q), ...] of every non-INVALID cell — same invariant as above, computed once
+    # instead of an `np.where` full-array scan on every `all_cells_list` access.
+    _all_cells_cache = None
 
     def __init__(self):
         self._create_hex_board()
@@ -39,6 +48,24 @@ class Board:
                 board[r, q] = cell_id
 
         self.board = board
+        if Board._adjacency_cache is None:
+            Board._adjacency_cache = self._compute_adjacency()
+        if Board._all_cells_cache is None:
+            Board._all_cells_cache = list(zip(*np.where(self.board != INVALID_CELL_ID)))
+
+    def _compute_adjacency(self):
+        rows, cols = self.board.shape
+        adjacency = {}
+        for r in range(rows):
+            for q in range(cols):
+                cells = []
+                for r_offset, q_offset in self.offsets:
+                    new_r, new_q = r + r_offset, q + q_offset
+                    if (0 <= new_r < rows and 0 <= new_q < cols
+                            and self.board[new_r, new_q] != INVALID_CELL_ID):
+                        cells.append((new_r, new_q))
+                adjacency[(r, q)] = cells
+        return adjacency
 
     def get_controlled_bases(self, player_id: int):
         cell_id = CONTROLLED_BASE_PLAYER_1_CELL_ID if player_id == 1 else CONTROLLED_BASE_PLAYER_2_CELL_ID
@@ -56,24 +83,16 @@ class Board:
         unit.place_on_board(place)
 
     def get_adjacent_cells(self, r: int, q: int):
-        valid_cells = []
-        for r_offset, q_offset in self.offsets:
-            new_r = r + r_offset
-            new_q = q + q_offset
-            if 0 <= new_r < self.board.shape[0] \
-                and 0 <= new_q < self.board.shape[1] \
-                and self.board[new_r, new_q] != INVALID_CELL_ID:
-                valid_cells.append((new_r, new_q))
-        return valid_cells
+        return Board._adjacency_cache.get((r, q), [])
 
     def get_free_adjacent_cells(self, r: int, q: int):
-        current_units_loc = [u.loc for u in self.units]
+        current_units_loc = {u.loc for u in self.units}
         adj_cells = self.get_adjacent_cells(r, q)
         return [cell for cell in adj_cells if cell not in current_units_loc]
 
     @property
     def all_cells_list(self):
-        return list(zip(*np.where(self.board != INVALID_CELL_ID)))
+        return Board._all_cells_cache
 
     def get_unit_at(self, r: int, q: int):
         for u in self.units:

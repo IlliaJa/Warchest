@@ -16,15 +16,16 @@ Usage:
 import argparse
 import csv
 import glob
-import time
 from collections import Counter, defaultdict
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from src.services.policy.policy import Policy
 from src.services.environment.warchest_env import (
-    WarChestEnv, VERB_OF_ACTION, V_TACTIC, V_BOLSTER, DECLINE_ACTION_ID,
+    WarChestEnv, VERB_OF_ACTION, V_TACTIC, V_BOLSTER, V_CLAIM, V_ATTACK, V_CONTROL,
+    DECLINE_ACTION_ID,
 )
 from src.services.environment.roster import UNIT_BY_ID
 from src.services.bots.greedy_bot import GreedyBot
@@ -57,6 +58,19 @@ def play_one_game(env, policy, bot, main_pid, max_t):
     supply_left_sum = Counter()       # sum of coins-left-in-supply over those bolsters
     chain_offered = 0
     chain_used = 0
+    # Initiative can only be claimed by the round's non-owner (the player who is
+    # about to play the round's *last* coin under normal symmetric hands), so a
+    # successful claim tends to hand that same player the next round's *first*
+    # coin too — two consecutive actions with no opposing move in between. We
+    # track: how often main_pid claims (`initiative_claims`), how often that
+    # claim actually materializes as them opening the next round (`double_turns`,
+    # detected via the env.state.round_number step-over-step boundary), and how
+    # often that opening move is a productive one — attack or claim_base.
+    initiative_claims = 0
+    double_turns = 0
+    productive_double_turns = 0
+    claimed_initiative_this_round = False
+    expect_double_turn_check = False
     acting_pid = main_pid
     terminated = truncated = False
     for _ in range(max_t):
@@ -75,6 +89,14 @@ def play_one_game(env, policy, bot, main_pid, max_t):
             chain_offered += 1
             chain_used += int(action != DECLINE_ACTION_ID)
         env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
+
+        if expect_double_turn_check:
+            if acting_pid == main_pid:
+                double_turns += 1
+                if VERB_OF_ACTION[env_action] in (V_ATTACK, V_CONTROL):
+                    productive_double_turns += 1
+            expect_double_turn_check = False
+
         if acting_pid == main_pid and VERB_OF_ACTION[env_action] == V_TACTIC:
             used_tactic = True
         if acting_pid == main_pid and VERB_OF_ACTION[env_action] == V_BOLSTER:
@@ -93,9 +115,20 @@ def play_one_game(env, policy, bot, main_pid, max_t):
                 if supply_left > 0:
                     bolsters_with_supply[bunit.id] += 1
                     supply_left_sum[bunit.id] += supply_left
+        round_before = env.state.round_number
         state, _, terminated, truncated, step_info = env.step(env_action)
-        if not step_info['action'].is_valid:
+        action_valid = step_info['action'].is_valid
+        if not action_valid:
             state, _, terminated, truncated, step_info = env.make_random_step()
+
+        if acting_pid == main_pid and action_valid and VERB_OF_ACTION[env_action] == V_CLAIM:
+            claimed_initiative_this_round = True
+            initiative_claims += 1
+        if env.state.round_number > round_before:
+            if claimed_initiative_this_round:
+                expect_double_turn_check = True
+            claimed_initiative_this_round = False
+
         if terminated or truncated:
             break
 
@@ -113,6 +146,9 @@ def play_one_game(env, policy, bot, main_pid, max_t):
         'has_stack_chain_unit': bool(_STACK_CHAIN_UNIT_IDS & set(env.state.compositions[main_pid])),
         'chain_offered': chain_offered,
         'chain_used': chain_used,
+        'initiative_claims': initiative_claims,
+        'double_turns': double_turns,
+        'productive_double_turns': productive_double_turns,
         'my_bases': my_bases,
         'opp_bases': opp_bases,
         'used_tactic': used_tactic,
@@ -162,6 +198,52 @@ def _print_unit_breakdown(records, title, composition_key):
         wo_str = f'{wr_wo:.2f}±{se_wo:.2f}({n_wo})' if n_wo else 'n/a'
         swing_str = f'{swing:+.2f}' if swing == swing else 'n/a'
         print(f'{name:<16} {w_str:<16} {wo_str:<16} {swing_str:>7}')
+
+
+def _print_initiative_breakdown(records):
+    """How often main_pid claims initiative (`claim_initiative`), and — the metric
+    of interest — how often that claim actually buys a double turn (claiming is
+    only legal for the round's non-owner, who under normal symmetric hands also
+    plays the round's last coin, so a successful claim tends to hand them the next
+    round's first coin too, i.e. two consecutive actions with no opposing move in
+    between). Of those double turns, we further split out how many were spent
+    productively — the opening move of the new round was an attack or claim_base —
+    versus 'wasted' on a quieter move/deploy/bolster/recruit/pass."""
+    n = len(records)
+    total_claims = sum(r['initiative_claims'] for r in records)
+    total_double_turns = sum(r['double_turns'] for r in records)
+    total_productive = sum(r['productive_double_turns'] for r in records)
+    claim_games = [r for r in records if r['initiative_claims'] > 0]
+    print(f'\n=== Initiative seizing (claim_initiative -> double turn across the round boundary) ===')
+    print(f'Claimed initiative at least once: {len(claim_games)}/{n} games '
+          f'({len(claim_games) / n:.1%}), {total_claims} claims total ({total_claims / n:.2f} per game)')
+    if total_claims == 0:
+        print('  (policy never claims initiative)')
+        return
+    dt_share = total_double_turns / total_claims
+    print(f'  Claim materialized into a double turn (also opened next round): '
+          f'{total_double_turns}/{total_claims} ({dt_share:.1%})')
+    if total_double_turns > 0:
+        prod_share = total_productive / total_double_turns
+        print(f'  Of those double turns, opening move was attack/claim_base: '
+              f'{total_productive}/{total_double_turns} ({prod_share:.1%})')
+
+    wr_claim, se_claim = _wr_and_se(sum(r['outcome'] == 'win' for r in claim_games), len(claim_games))
+    no_claim = [r for r in records if r['initiative_claims'] == 0]
+    wr_no, se_no = _wr_and_se(sum(r['outcome'] == 'win' for r in no_claim), len(no_claim))
+    print(f'  WR when claimed initiative >=1: {wr_claim:.3f} ± {se_claim:.3f} (n={len(claim_games)})')
+    print(f'  WR when never claimed:          {wr_no:.3f} ± {se_no:.3f} (n={len(no_claim)})')
+
+    productive_games = [r for r in records if r['productive_double_turns'] > 0]
+    non_productive_claim_games = [r for r in claim_games if r['productive_double_turns'] == 0]
+    if productive_games and non_productive_claim_games:
+        wr_prod, se_prod = _wr_and_se(sum(r['outcome'] == 'win' for r in productive_games), len(productive_games))
+        wr_nonprod, se_nonprod = _wr_and_se(
+            sum(r['outcome'] == 'win' for r in non_productive_claim_games), len(non_productive_claim_games))
+        print(f'  WR when a double turn opened with attack/claim_base: '
+              f'{wr_prod:.3f} ± {se_prod:.3f} (n={len(productive_games)})')
+        print(f'  WR when claimed but never landed a productive double turn: '
+              f'{wr_nonprod:.3f} ± {se_nonprod:.3f} (n={len(non_productive_claim_games)})')
 
 
 def _print_bolster_breakdown(records):
@@ -256,12 +338,9 @@ def main():
     env = WarChestEnv(save_game_history=False)
 
     records = []
-    t0 = time.time()
-    for i in range(args.games):
+    for _ in tqdm(range(args.games), desc='games'):
         main_pid = int(np.random.choice([1, 2]))
         records.append(play_one_game(env, policy, bot, main_pid, args.max_t))
-        if (i + 1) % max(1, args.games // 10) == 0:
-            print(f'  {i + 1}/{args.games} games played ({time.time() - t0:.0f}s elapsed)')
 
     decisive = [r for r in records if r['outcome'] != 'truncated']
     wins = sum(r['outcome'] == 'win' for r in decisive)
@@ -283,6 +362,7 @@ def main():
     print(f'  WR when tactic NOT used: {wr_no_tactic:.3f} ± {se_no_tactic:.3f} (n={len(no_tactic_games)})')
 
     _print_bolster_breakdown(decisive)
+    _print_initiative_breakdown(decisive)
 
     # Stack-chain units (Berserker: extra_maneuvers_from_stack) never touch V_TACTIC —
     # their ability triggers via the 'extra_maneuver' pending state instead, so this

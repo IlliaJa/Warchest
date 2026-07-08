@@ -11,7 +11,7 @@ import time
 import wandb
 
 from src.services.policy.policy import Policy, Critic
-from src.services.policy.checkpoint import save_policy_checkpoint
+from src.services.policy.checkpoint import save_policy_checkpoint, save_critic_checkpoint
 from src.services.environment.warchest_env import (
     WarChestEnv, WIN_REWARD,
 )
@@ -742,7 +742,7 @@ if __name__ == '__main__':
     )
 
     hp = {
-        'n_batches': 600,
+        'n_batches': 1500,
         'collect_episodes': 64,
         'max_t': 1000,
         'gamma': 0.99,
@@ -851,10 +851,17 @@ if __name__ == '__main__':
             if save_model:
                 timestamp = time.strftime('%Y%m%d-%H%M')
                 filename = f'warchest_ppo_{timestamp}.pth'
+                critic_filename = f'warchest_critic_{timestamp}.pth'
                 os.makedirs('data', exist_ok=True)
                 save_policy_checkpoint(
                     warchest_policy, f'data/{filename}',
                     obs_version=environment._obs_encoder.version,
                     hidden_dim=hp['hidden_dim'],
                 )
+                save_critic_checkpoint(
+                    warchest_critic, f'data/{critic_filename}',
+                    obs_version=environment._obs_encoder.version,
+                    hidden_dim=hp['critic_hidden_dim'],
+                )
                 logger.info(f'Model saved to data/{filename}')
+                logger.info(f'Critic saved to data/{critic_filename}')

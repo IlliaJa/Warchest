@@ -1275,6 +1275,17 @@ wheels = [
 ]
 
 [[package]]
+name = "tqdm"
+version = "4.66.5"
+source = { registry = "https://download.pytorch.org/whl/cu126" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+]
+wheels = [
+    { url = "https://download.pytorch.org/whl/tqdm-4.66.5-py3-none-any.whl", hash = "sha256:90279a3770753eafc9194a0364852159802111925aa30eb3f9d85b0e805ac7cd", upload-time = "2024-10-30T00:09:55Z" },
+]
+
+[[package]]
 name = "triton"
 version = "3.7.1"
 source = { registry = "https://download.pytorch.org/whl/cu126" }
@@ -1362,6 +1373,7 @@ dependencies = [
     { name = "numpy" },
     { name = "tensorboard" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "wandb" },
 ]
 
@@ -1372,6 +1384,7 @@ requires-dist = [
     { name = "numpy", specifier = "<2" },
     { name = "tensorboard" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "wandb" },
 ]
 

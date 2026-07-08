@@ -406,6 +406,20 @@ class WarChestEnv(gym.Env):
         self.state.last_coin_player = active
 
     def step(self, action_id):
+        action = self._apply_action(action_id)
+        truncated = self.state.round_number >= self.max_rounds
+        if self.debug_mode:
+            print(f'Got action_id {action.id} type={action.type} args={action.additional_info}')
+        return self.generate_observation(), action.reward, action.finishes_game, truncated, {'action': action}
+
+    def _apply_action(self, action_id) -> Action:
+        """Apply one action id to `self.state` and return the resulting `Action`.
+
+        The pure state-transition half of `step()`, with no observation encoding —
+        pulled out so forward-simulating callers (search-based bots) can replay many
+        actions per real decision without paying the encoder's cost each time. `step()`
+        is unchanged behaviourally; it just adds the observation on top of this.
+        """
         # During a pending sub-turn (a tactic mid-resolution) the same player keeps
         # acting and the action is a continuation click, dispatched separately from
         # the normal verb table; the turn only passes once `pending` clears.
@@ -444,10 +458,7 @@ class WarChestEnv(gym.Env):
             if self.debug_mode and not action.finishes_game and not self.get_possible_actions():
                 action.finishes_game = True
                 action.reward += WIN_REWARD
-        truncated = self.state.round_number >= self.max_rounds
-        if self.debug_mode:
-            print(f'Got action_id {action.id} type={action.type} args={action.additional_info}')
-        return self.generate_observation(), action.reward, action.finishes_game, truncated, {'action': action}
+        return action
 
     def render(self, ax=None, player_labels=None):
         created_ax = False

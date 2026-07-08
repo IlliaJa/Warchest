@@ -1,98 +1,53 @@
 import argparse
 import glob
-import os
-import numpy as np
 
 import torch
+
 from src.services.policy.policy import Policy
 from src.services.policy.checkpoint import load_policy_checkpoint
 from src.services.environment.warchest_env import WarChestEnv
 from src.services.environment.obs_encoders import get_encoder
-from src.services.bots.greedy_bot import GreedyBot
+from src.services.gauntlet import PolicyAgent, greedy_agent, random_agent, lookahead_agent
+
+AGENT_KINDS = ('policy', 'greedy', 'random', 'lookahead')
 
 
-def evaluate_agent(_env, n_eval_episodes, policy):
-    episode_rewards = []
-    ai_win_cnt = 0
-    random_bot_win_cnt = 0
-    draw_cnt = 0
-    for episode in range(n_eval_episodes):
-        _state, _ = _env.reset()
-        ai_rewards_ep = 0
-        random_bot_rewards_ep = 0
-        turn_num = 0
-        while True:
-            action, _, _ = policy.act(_state)
-            env_action = WarChestEnv.remap_action(action) if _env.active_player == 2 else action
-            _state, reward, terminated, truncated, info = _env.step(env_action)
-            ai_rewards_ep += reward
-            if not info['action'].is_valid:
-                raise ValueError('Invalid action taken by the agent')
-            if terminated:
-                ai_win_cnt += 1
-                break
-            if truncated:
-                draw_cnt += 1
-                break
-
-            possible_actions = _env.get_possible_actions()
-            action_id = np.random.choice(possible_actions)
-            _state, reward, terminated, truncated, info = _env.step(action_id)
-            random_bot_rewards_ep += reward
-            if terminated:
-                random_bot_win_cnt += 1
-                break
-            if truncated:
-                draw_cnt += 1
-                break
-            turn_num += 1
-        print(f'Game {episode} finished, turn {turn_num}, AI reward: {ai_rewards_ep:.1f}, Random reward: {random_bot_rewards_ep:.1f}')
-        episode_rewards.append(ai_rewards_ep)
-    mean_reward = np.mean(episode_rewards)
-    std_reward = np.std(episode_rewards)
-    print(f'Total: {n_eval_episodes}, AI wins: {ai_win_cnt}, Draws: {draw_cnt}, Random wins: {random_bot_win_cnt}, Mean reward: {mean_reward:.3f} +/- {std_reward:.3f}')
-    return ai_win_cnt, draw_cnt, random_bot_win_cnt, mean_reward, std_reward
+def build_agent(kind, name, *, policy=None, encoder=None, lookahead_kwargs=None):
+    """Construct a `GauntletAgent`-compatible player (`act(env)`) of the given kind."""
+    if kind == 'policy':
+        if policy is None:
+            raise ValueError(f'{name}: a loaded policy is required (--model-path)')
+        return PolicyAgent(name, policy, encoder)
+    if kind == 'greedy':
+        return greedy_agent(name, encoder)
+    if kind == 'random':
+        return random_agent(name, encoder)
+    if kind == 'lookahead':
+        return lookahead_agent(name, **(lookahead_kwargs or {}))
+    raise ValueError(f'Unknown agent kind: {kind}')
 
 
-def play_ai_vs_ai(_env, policy):
-    _state, _ = _env.reset()
-    rewards = []
-    while True:
-        action, _, _ = policy.act(_state)
-        env_action = WarChestEnv.remap_action(action) if _env.active_player == 2 else action
-        _state, reward, terminated, truncated, info = _env.step(env_action)
-        rewards.append(reward)
+def play_game(env, agent_p1, agent_p2, max_turns=2000):
+    """Play one game between two `act(env)` agents and render it.
+
+    Mirrors gauntlet.play_game's loop (illegal proposals fall back to a random
+    legal move) but keeps history so the caller can render afterwards.
+    """
+    env.reset()
+    agents = {1: agent_p1, 2: agent_p2}
+    for _ in range(max_turns):
+        pid = env.active_player
+        action = agents[pid].act(env)
+        _, _, terminated, truncated, info = env.step(action)
         if not info['action'].is_valid:
-            _state, reward, terminated, truncated, info = _env.make_random_step()
-        if terminated or truncated:
-            print('AI vs AI game finished')
-            break
-    return _env, rewards
-
-
-def play_ai_vs_greedy(_env, policy, ai_pid=1):
-    greedy_pid = 3 - ai_pid
-    print(f'AI vs Greedy: AI=P{ai_pid}, Greedy=P{greedy_pid}')
-    bot = GreedyBot()
-    _state, _ = _env.reset()
-    while True:
-        pid = _env.active_player
-        if pid == ai_pid:
-            action, _, _ = policy.act(_state)
-        else:
-            action, _, _ = bot.act(_state)
-        env_action = WarChestEnv.remap_action(action) if pid == 2 else action
-        _state, _, terminated, truncated, info = _env.step(env_action)
-        if not info['action'].is_valid:
-            _state, _, terminated, truncated, info = _env.make_random_step()
+            _, _, terminated, truncated, info = env.make_random_step()
         if terminated:
-            winner = 'AI' if _env.active_player != ai_pid else 'Greedy'
-            print(f'AI vs Greedy finished — {winner} wins (turn {_env.action_count})')
-            break
+            print(f'{agents[pid].name} (P{pid}) wins on turn {env.action_count}')
+            return
         if truncated:
-            print(f'AI vs Greedy truncated after {_env.action_count} turns')
-            break
-    return _env
+            print(f'Game truncated after {env.action_count} turns')
+            return
+    print(f'Game hit max_turns ({max_turns}) without a result')
 
 
 def _find_latest_model() -> str:
@@ -103,42 +58,53 @@ def _find_latest_model() -> str:
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Evaluate a saved Warchest policy.')
+    parser = argparse.ArgumentParser(description='Play out and render a Warchest game between two agents.')
     parser.add_argument('--model-path', type=str, default=None,
-                        help='Path to .pth file. Defaults to the latest data/warchest_ppo_*.pth.')
-    parser.add_argument('--opponent', type=str, default='random', choices=['random', 'greedy'],
-                        help='Opponent for the rendered game (default: random).')
-    parser.add_argument('--hidden-dim', type=int, default=64)
+                        help='Path to .pth file for the policy agent(s). Defaults to the latest data/warchest_ppo_*.pth.')
+    parser.add_argument('--hidden-dim', type=int, default=64,
+                        help='Fallback hidden dim for legacy checkpoints without arch metadata.')
+    parser.add_argument('--p1', type=str, default='policy', choices=AGENT_KINDS,
+                        help='Player 1 agent (default: policy).')
+    parser.add_argument('--p2', type=str, default='greedy', choices=AGENT_KINDS,
+                        help='Player 2 agent (default: greedy).')
+    parser.add_argument('--lookahead-time-budget', type=float, default=0.5,
+                        help='Per-move search budget in seconds, for lookahead agents.')
+    parser.add_argument('--lookahead-max-branching', type=int, default=8,
+                        help='Branching cap per search node, for lookahead agents.')
+    parser.add_argument('--lookahead-blind', action='store_true',
+                        help="Lookahead agent doesn't read the opponent's real hand (fair mode).")
     args = parser.parse_args()
 
-    model_path = args.model_path or _find_latest_model()
-    print(f'Loading model: {model_path}')
+    lookahead_kwargs = dict(
+        time_budget=args.lookahead_time_budget,
+        max_branching=args.lookahead_max_branching,
+        see_opponent_hand=not args.lookahead_blind,
+    )
 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    print('Using device:', device)
+    policy, encoder = None, None
+    if 'policy' in (args.p1, args.p2):
+        model_path = args.model_path or _find_latest_model()
+        print(f'Loading model: {model_path}')
 
-    # Load with metadata so the net + env are built for the checkpoint's obs
-    # version and width (falls back to CLI --hidden-dim for legacy checkpoints).
-    ckpt = load_policy_checkpoint(model_path, map_location=device,
-                                  default_hidden_dim=args.hidden_dim)
-    encoder = get_encoder(ckpt['obs_version'])
-    print(f"arch={ckpt['arch']} obs_version={ckpt['obs_version']} hidden_dim={ckpt['hidden_dim']}")
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        print('Using device:', device)
 
-    policy = Policy(device=device, hidden_dim=ckpt['hidden_dim'], obs_encoder=encoder).to(device)
-    policy.load_state_dict(ckpt['state_dict'])
-    policy.eval()
+        # Load with metadata so the net is built for the checkpoint's obs version and width
+        # (falls back to CLI --hidden-dim for legacy checkpoints).
+        ckpt = load_policy_checkpoint(model_path, map_location=device,
+                                      default_hidden_dim=args.hidden_dim)
+        encoder = get_encoder(ckpt['obs_version'])
+        print(f"arch={ckpt['arch']} obs_version={ckpt['obs_version']} hidden_dim={ckpt['hidden_dim']}")
 
-    # Evaluate vs random. The env encodes with the checkpoint's obs version.
-    env = WarChestEnv(save_game_history=False, obs_encoder=get_encoder(ckpt['obs_version']))
-    evaluate_agent(env, n_eval_episodes=1, policy=policy)
+        policy = Policy(device=device, hidden_dim=ckpt['hidden_dim'], obs_encoder=encoder).to(device)
+        policy.load_state_dict(ckpt['state_dict'])
+        policy.eval()
 
-    # Rendered game
-    env_render = WarChestEnv(save_game_history=True, obs_encoder=get_encoder(ckpt['obs_version']))
-    if args.opponent == 'greedy':
-        ai_pid = 1
-        play_ai_vs_greedy(env_render, policy, ai_pid=ai_pid)
-        labels = {ai_pid: 'Policy', 3 - ai_pid: 'Greedy'}
-    else:
-        play_ai_vs_ai(env_render, policy)
-        labels = {1: 'Policy', 2: 'Policy'}
-    env_render.render_game(player_labels=labels)
+    agent_p1 = build_agent(args.p1, args.p1.capitalize(), policy=policy, encoder=encoder,
+                            lookahead_kwargs=lookahead_kwargs)
+    agent_p2 = build_agent(args.p2, args.p2.capitalize(), policy=policy, encoder=encoder,
+                            lookahead_kwargs=lookahead_kwargs)
+
+    env = WarChestEnv(save_game_history=True, obs_encoder=encoder)
+    play_game(env, agent_p1, agent_p2)
+    env.render_game(player_labels={1: agent_p1.name, 2: agent_p2.name})

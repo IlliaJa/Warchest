@@ -22,6 +22,8 @@ from .environment.warchest_env import WarChestEnv
 from .environment.obs_encoders import get_encoder, latest_encoder
 from .bots.greedy_bot import GreedyBot
 from .bots.random_bot import RandomBot
+from .bots.lookahead_bot import LookaheadBot
+from .bots.lookahead_critic_bot import LookaheadCriticBot
 
 
 # --------------------------------------------------------------------------- #
@@ -73,6 +75,18 @@ def greedy_agent(name='greedy', encoder=None):
 
 def random_agent(name='random', encoder=None):
     return HeuristicAgent(name, RandomBot(), encoder)
+
+
+def lookahead_agent(name='lookahead', **kwargs):
+    """LookaheadBot already speaks `act(env)` + `.name` (docs/lookahead_bot_plan.md),
+    so it drops into the gauntlet directly — no HeuristicAgent/obs-encoding wrapper.
+    """
+    return LookaheadBot(name=name, **kwargs)
+
+
+def lookahead_critic_agent(name='lookahead_critic', **kwargs):
+    """LookaheadCriticBot, same `act(env)` contract as LookaheadBot — drops in directly."""
+    return LookaheadCriticBot(name=name, **kwargs)
 
 
 # --------------------------------------------------------------------------- #

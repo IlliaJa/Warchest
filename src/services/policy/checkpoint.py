@@ -1,9 +1,9 @@
-"""Policy checkpoint (de)serialization with obs-version + architecture metadata.
+"""Policy/critic checkpoint (de)serialization with obs-version + architecture metadata.
 
 A bare `state_dict` is meaningless without knowing which obs encoder and network
 architecture produced it (docs/next_steps.md Step 1 "the compatibility blocker").
-Checkpoints are therefore saved as a metadata envelope so any era's policy can be
-reconstructed and dropped into the round-robin gauntlet.
+Checkpoints are therefore saved as a metadata envelope so any era's policy (or
+critic) can be reconstructed and dropped into the round-robin gauntlet.
 
 Envelope (torch.save of a dict):
     {'format': 1, 'arch': str, 'obs_version': int, 'hidden_dim': int,
@@ -12,6 +12,12 @@ Envelope (torch.save of a dict):
 Legacy checkpoints (a bare state_dict saved before this existed) are still
 loadable — they are assumed to be the current arch at the latest obs version,
 which is what they were in practice when saved.
+
+The critic was historically never persisted (training-only, discarded after each
+run) — `save_critic_checkpoint`/`load_critic_checkpoint` mirror the policy pair
+exactly, saved as a separate file alongside the policy checkpoint rather than a
+new key on the existing envelope, so `load_policy_checkpoint` and every existing
+caller (gauntlet.py) are untouched.
 """
 import torch
 
@@ -20,6 +26,8 @@ from ..environment.obs_encoders import LATEST_VERSION
 # Architecture id for the current factored-head Policy. Bump (and register a
 # loader) when the network class changes; the gauntlet keys reconstruction on it.
 CURRENT_ARCH = 'policy_factored_v1'
+# Architecture id for the current Critic (docs/rewards.md's widened critic-only trunk).
+CURRENT_CRITIC_ARCH = 'critic_v1'
 
 
 def save_policy_checkpoint(policy, path, *, obs_version, hidden_dim, arch=CURRENT_ARCH):
@@ -53,4 +61,30 @@ def load_policy_checkpoint(path, map_location='cpu', *, default_hidden_dim=64):
         'obs_version': LATEST_VERSION,
         'arch': CURRENT_ARCH,
         'hidden_dim': default_hidden_dim,
+    }
+
+
+def save_critic_checkpoint(critic, path, *, obs_version, hidden_dim, arch=CURRENT_CRITIC_ARCH):
+    """Save `critic`'s weights plus the metadata needed to rebuild it later."""
+    payload = {
+        'format': 1,
+        'arch': arch,
+        'obs_version': obs_version,
+        'hidden_dim': hidden_dim,
+        'state_dict': {k: v.detach().cpu() for k, v in critic.state_dict().items()},
+    }
+    torch.save(payload, path)
+
+
+def load_critic_checkpoint(path, map_location='cpu', *, default_hidden_dim=64):
+    """Return {'state_dict', 'obs_version', 'arch', 'hidden_dim'} for any critic
+    checkpoint saved by `save_critic_checkpoint`. No legacy format exists for the
+    critic (it was never persisted before this pair was added).
+    """
+    obj = torch.load(path, map_location=map_location, weights_only=False)
+    return {
+        'state_dict': obj['state_dict'],
+        'obs_version': obj['obs_version'],
+        'arch': obj.get('arch', CURRENT_CRITIC_ARCH),
+        'hidden_dim': obj.get('hidden_dim', default_hidden_dim),
     }

@@ -1,14 +1,14 @@
 """Round-robin gauntlet CLI (docs/next_steps.md Step 1).
 
-Plays a fixed field of agents — trained checkpoints plus GreedyBot / RandomBot
-baselines — all-pairs with balanced colors, then prints the win-rate matrix, a
-Bradley-Terry (Elo-scaled) ranking anchored to the field, and the intransitive-
-triple fraction (rock-paper-scissors detector).
+Plays a fixed field of agents — trained checkpoints plus the GreedyBot baseline —
+all-pairs with balanced colors, then prints the win-rate matrix, a Bradley-Terry
+(Elo-scaled) ranking anchored to the field, and the intransitive-triple fraction
+(rock-paper-scissors detector).
 
 Examples:
     python src/app/gauntlet.py                         # all data/*.pth + baselines
     python src/app/gauntlet.py --checkpoints a.pth b.pth --k-games 40
-    python src/app/gauntlet.py --no-random             # drop the random baseline
+    python src/app/gauntlet.py --no-lookahead           # drop the LookaheadBot baseline
 """
 import argparse
 import glob
@@ -23,7 +23,10 @@ import torch
 from src.services.policy.policy import Policy
 from src.services.policy.checkpoint import load_policy_checkpoint
 from src.services.environment.obs_encoders import get_encoder
-from src.services.gauntlet import round_robin, greedy_agent, random_agent, PolicyAgent
+from src.services.gauntlet import (
+    round_robin, greedy_agent, lookahead_agent, lookahead_critic_agent, PolicyAgent,
+)
+from src.services.bots.lookahead_critic_bot import DEFAULT_CRITIC_PATH
 
 
 def _checkpoint_agent(path, device):
@@ -46,6 +49,28 @@ def _checkpoint_agent(path, device):
     policy.eval()
     name = os.path.splitext(os.path.basename(path))[0].replace('warchest_ppo_', 'ckpt_')
     return PolicyAgent(f'{name}[v{meta["obs_version"]}]', policy, encoder)
+
+
+def _lookahead_critic_agent(args, device):
+    """Build the LookaheadCriticBot baseline, or None if its checkpoint is missing.
+
+    On by default (like LookaheadBot), but unlike LookaheadBot it depends on a
+    critic checkpoint file that may not exist in every environment (e.g. a fresh
+    checkout with no training run yet) — skip with a warning rather than crash.
+    """
+    if not os.path.exists(args.lookahead_critic_path):
+        print(f'  ! skipping lookahead_critic: checkpoint not found at '
+              f'{args.lookahead_critic_path}')
+        return None
+    return lookahead_critic_agent(
+        'lookahead_critic',
+        critic_path=args.lookahead_critic_path,
+        beam_width=args.lookahead_critic_beam_width,
+        max_branching=args.lookahead_critic_max_branching,
+        time_budget=args.lookahead_critic_time_budget,
+        see_opponent_hand=not args.lookahead_critic_blind,
+        device=device,
+    )
 
 
 def _print_report(out):
@@ -79,7 +104,32 @@ def main():
                         help='Games per pair (colors balanced). Default 20.')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--no-greedy', action='store_true', help='Drop the GreedyBot baseline.')
-    parser.add_argument('--no-random', action='store_true', help='Drop the RandomBot baseline.')
+    parser.add_argument('--no-lookahead', action='store_true',
+                        help='Drop the LookaheadBot baseline (on by default; its search '
+                             'budget makes every game much slower than the other baselines).')
+    parser.add_argument('--lookahead-time-budget', type=float, default=0.1,
+                        help='Per-move search budget in seconds, for LookaheadBot.')
+    parser.add_argument('--lookahead-max-branching', type=int, default=8,
+                        help='Branching cap per search node, for LookaheadBot.')
+    parser.add_argument('--lookahead-blind', action='store_true',
+                        help="LookaheadBot doesn't read the opponent's real hand (fair mode).")
+    parser.add_argument('--no-lookahead-critic', action='store_true',
+                        help='Drop the LookaheadCriticBot baseline (on by default; skipped '
+                             'automatically if its checkpoint is missing).')
+    parser.add_argument('--lookahead-critic-path', default=DEFAULT_CRITIC_PATH,
+                        help='Critic checkpoint path, for LookaheadCriticBot.')
+    parser.add_argument('--lookahead-critic-beam-width', type=int, default=5,
+                        help='Children kept per node, for LookaheadCriticBot.')
+    parser.add_argument('--lookahead-critic-max-branching', type=int, default=8,
+                        help='Raw legal-action cap per node before critic scoring, '
+                             'for LookaheadCriticBot.')
+    parser.add_argument('--lookahead-critic-time-budget', type=float, default=0.5,
+                        help='Per-move search budget in seconds, for LookaheadCriticBot '
+                             '(higher than LookaheadBot\'s default: the critic\'s forward '
+                             'pass costs much more per node than a hand-crafted heuristic).')
+    parser.add_argument('--lookahead-critic-blind', action='store_true',
+                        help="LookaheadCriticBot doesn't read the opponent's real hand "
+                             "(fair mode).")
     args = parser.parse_args()
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -91,8 +141,14 @@ def main():
     agents = [a for a in (_checkpoint_agent(p, device) for p in paths) if a is not None]
     if not args.no_greedy:
         agents.append(greedy_agent('greedy'))
-    if not args.no_random:
-        agents.append(random_agent('random'))
+    if not args.no_lookahead:
+        agents.append(lookahead_agent('lookahead', time_budget=args.lookahead_time_budget,
+                                       max_branching=args.lookahead_max_branching,
+                                       see_opponent_hand=not args.lookahead_blind))
+    if not args.no_lookahead_critic:
+        critic_agent = _lookahead_critic_agent(args, device)
+        if critic_agent is not None:
+            agents.append(critic_agent)
 
     if len(agents) < 2:
         raise SystemExit('Need at least 2 agents; pass --checkpoints or keep the baselines.')
