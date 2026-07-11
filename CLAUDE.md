@@ -16,6 +16,7 @@ Turn-based hex-grid strategy game with a reinforcement learning agent (PPO + GAE
 - [RL algorithms](docs/rl_algorithms.md) — GAE, PPO, DQN, and alternatives with Warchest-specific trade-offs
 - [Metrics reference](docs/METRICS.md) — W&B metrics explained: ideal ranges, trends, warning signs
 - [Web agent](docs/web_agent.md) — design for driving warchestonline.com with a trained checkpoint via Playwright (not yet implemented; `config/web_agent.sample.toml` is the sketch)
+- [Bots](docs/bots.md) — non-learned/search-based bots overview; `LookaheadCriticBot` bugs found, fixes, and experiment log
 
 ## Quick orientation
 

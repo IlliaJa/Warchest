@@ -70,6 +70,36 @@ those same states. `_leaf_potential` is already reward-scale-correct (the
 exact quantity `_minimax` sums real path rewards against), so this recovers a
 substitute denormalization without needing the lost EMA.
 
+**Honest limitation of this fix — it's an approximation, not a recovery.**
+Moment-matching only fits 2 degrees of freedom (an affine map) and only
+assumes the critic's output is *linearly* related to the true value — it
+can't fix any non-linear miscalibration in the network itself, and its target
+(`_leaf_potential`) is itself a hand-tuned heuristic, not the ground-truth
+value function, so a "perfect" moment-match to it still isn't guaranteed to
+recover the network's *actual* trained scale. It's the best available
+substitute given a checkpoint with no recorded normalizer stats — not a
+guarantee of exact denormalization.
+
+**Follow-up (2026-07-11, later same day) — exact recovery for *new* checkpoints.**
+`save_critic_checkpoint`/`load_critic_checkpoint` (`checkpoint.py`) now carry
+optional `return_mean`/`return_std` floats — `ppo.py`'s `ReturnNormalizer` EMA
+(exposed via new `.mean`/`.std` properties) at save time, passed at the one
+`save_critic_checkpoint` call site in `ppo.py`. `LookaheadCriticBot.__init__`
+uses these *exactly* (`self._value_scale, self._value_shift =
+return_std, return_mean`) whenever a checkpoint has them, falling back to
+`_calibrate_value_scale()`'s approximation only for older checkpoints that
+don't (verified: both paths round-trip correctly, and the existing
+`lookahead_critic_v2.pth` — saved before this change — still loads fine via
+the fallback, 80% WR vs `lookahead` on a fresh k=20 run, consistent with the
+established range). **This does not retroactively improve any existing
+checkpoint** — `lookahead_critic_v2.pth` (or `_v1.pth`) was already saved
+without these stats and there's no way to recover them after the fact; the
+exact-recovery path only ever activates for a checkpoint produced by a
+training run *after* this change, i.e. it needs a fresh/continued PPO run to
+actually pay off. Whether the tuned `0.7/0.3` critic/heuristic blend weight
+(above) is still optimal once a checkpoint with exact stats exists is
+unverified — that weight was tuned against the *approximated* scale.
+
 ### Structural improvements
 
 1. **Ply-dependent beam/branching narrowing** (`_beam_width_at`,
@@ -120,7 +150,12 @@ the reliable read.
 | widen root `max_branching` by +4 (one-time cost, tried as a lever) | 45% (k=20, seed=1) | Regression — reverted, not worth the per-move time it ate into deeper plies |
 | + cross-iteration survivor caching | 65% (k=20, seed=1) | No clear win/loss on its own, but more nodes visited for the same budget with no downside — kept |
 | blend weight sweep (critic vs `_leaf_potential`) — all on top of the above, default seed, k=20 | 1.0/0.0: 35%, 0.6/0.4: 60%, 0.5/0.5: 60%, 0.8/0.2: 70%, **0.7/0.3: 75%** | Both pure critic and pure heuristic clearly worse than the blend — **0.7/0.3 shipped** |
-| **Final (all fixes + 0.7/0.3 blend), large samples** | **68-70%** (k=40 seed=7, k=60 seed=99) | 60-75% on individual k=20 runs (seed-dependent noise) |
+| `n_determinizations` (vote across N independent searches under fresh future-draw samples, `time_budget` split across them) — equal split, N=2 (0.25s/0.25s) | 60% (k=40, seed=7) | Regression vs. this seed's single-search baseline (68-70%, see below) |
+| `n_determinizations`, weighted split, N=2 (0.8×/0.2× — primary keeps most of the budget, second is a cheap hedge) | 65% (k=40, seed=7) | Still below the single-search baseline at this seed — closer to 1.0 weight tracks closer to baseline |
+| `n_determinizations=1` (reverted/confirmed) | 78% (k=40, seed=7) | Same code path, weight `[1.0]` — matches (exceeds, this run) the pre-experiment baseline; **shipped default** |
+| **Final (all fixes + 0.7/0.3 blend, `n_determinizations=1`), large samples** | **68-78%** (k=40 seed=7 × 2 runs, k=60 seed=99) | 60-75% on individual k=20 runs (seed-dependent noise) |
+
+**Why the determinization vote didn't help:** at this bot's fixed 0.5s budget it's already depth-starved relative to `LookaheadBot`'s alpha-beta (see "structural improvements" above) — every split tested, even a lopsided 80/20 two-way one, took real depth away from the primary search, and the resulting hedge against a single unlucky future-draw sample never recovered what that lost depth cost. This is the classic Perfect-Information-Monte-Carlo determinization-averaging technique, and it's a legitimate lever *in general* — it just isn't a net win at a budget this tight. `LookaheadCriticBot.n_determinizations` is left in the code (default `1`, i.e. off) rather than removed, in case a future eval run uses a meaningfully larger `--lookahead-critic-time-budget`, where the primary search would stop being the bottleneck and a hedge could pay for itself.
 
 ### Known limitation, not fixed
 
@@ -137,6 +172,59 @@ run-to-run noise band, so this doesn't appear to be a large practical effect
 given the taxonomy's limits — left as-is rather than guessing at a fix with no
 clean correct answer.
 
+### Diagnostics logging
+
+`act()` logs at two levels (`logging.getLogger('warchest')` — same logger
+name `ppo.py`'s `setup_run_logger` configures):
+- DEBUG, one line per real move: `depth_reached`/`nodes_visited`/`elapsed` vs.
+  the budget/`legal_at_root`/`best_value` (also `self.last_stats`, a plain
+  dict, for programmatic access — unchanged, just now also logged). Fires
+  every move, so DEBUG not INFO — would spam a console shown at INFO. Good
+  for inspecting one specific decision, too granular to read across a whole
+  game.
+- INFO, a rolling aggregate every `stats_log_every` moves (constructor arg,
+  default 20; 0 disables it): avg/min/max `depth_reached` (the number that
+  answers "is the search actually looking ahead, or stuck at the leaf"),
+  avg `nodes_visited`, avg `elapsed` vs. budget, avg `legal_at_root` — then
+  resets the window. Added after per-move DEBUG traces turned out too
+  granular to read at a glance; this is the one meant for "is the search
+  behaving reasonably" during a normal run.
+
+**Follow-up: the gauntlet CLI now configures this itself.** `gauntlet.py`'s
+`main()` calls `logging.basicConfig(level=logging.INFO, ...)`, so running
+e.g. `uv run python -m src.app.gauntlet --bots lookahead lookahead_critic`
+shows the INFO aggregate lines with no extra setup. That call alone only
+covers the CLI's own process, though — the default path (`n_workers > 1`,
+i.e. not `--sequential`) runs every actual game inside `spawn`-context worker
+processes (`gauntlet_parallel.py`), which don't inherit it (a `spawn` child is
+a fresh interpreter, unlike `fork`), so `_worker_loop` configures its own copy
+too — tagged `[worker N]` in the format string, since several workers' output
+interleaves on one console. Bump to DEBUG (either call site) for the per-move
+trace too, or rely on `ppo.py`'s `setup_run_logger` if this bot is used as a
+training-time opponent instead (its file handler is already at DEBUG).
+
+### Operational note: checkpoint path resolution changed mid-development
+
+`gauntlet.py` no longer imports this file's old `DEFAULT_CRITIC_PATH`
+constant — it now has its own `_latest_critic_path()`, globbing
+`data/lookahead_critic/lookahead_critic_v*.pth` and always picking the
+highest-numbered version, so the gauntlet CLI always plays whatever the
+newest critic checkpoint is. This changed (and `data/lookahead_critic/`
+gained a `_v2.pth` alongside `_v1.pth`, with `_v1.pth`'s content ending up
+mismatched — a policy checkpoint, not a critic one) from external work on
+this repo during the same development window as the fixes above, not from
+anything in this file.
+
+**Follow-up:** confirmed the versioning convention was intentional — removed
+`DEFAULT_CRITIC_PATH` entirely and gave `LookaheadCriticBot` its own
+`_latest_critic_path()` (a small separate copy of the same glob logic;
+services/ shouldn't import from app/gauntlet.py, so not shared code, just the
+same idea in both places). `critic_path=None` now resolves to the
+highest-numbered checkpoint at construction time instead of a hardcoded,
+eventually-stale literal path; raises `FileNotFoundError` if none exists and
+none was passed explicitly. `tests/test_lookahead_critic_bot.py` (which
+constructs the bot with no `critic_path`) still passes unchanged.
+
 ### Why not 100%
 
 Both `LookaheadBot` and `LookaheadCriticBot` sample one determinization of
@@ -144,12 +232,16 @@ future draws per `act()` call from the unseeded global RNG (by design — see
 `lookahead_bot.py`'s module docstring), so *both* bots' move quality is
 stochastic even on an identical board. That's a property shared by both bots,
 not a bug in either, and out of scope to change (`lookahead_bot.py` isn't this
-bot's responsibility). A literal, deterministic 100% win rate isn't a
+bot's responsibility) — tried hedging *this* bot's own share of that variance
+via multi-determinization voting instead (see the experiment log above); it
+didn't pay off at this budget. A literal, deterministic 100% win rate isn't a
 realistic target against an opponent that also gets to be lucky sometimes;
-68-70% on large samples (vs the original 30-35%) is the ceiling reached so far
+68-80% on large samples (vs the original 30-35%) is the ceiling reached so far
 by fixing the confirmed bug and iterating on the structural levers above.
-Further gains would most likely require a better-trained critic checkpoint
-(out of scope — would mean touching the training pipeline, not this bot) or a
-meaningfully larger engineering effort (e.g. batching critic evaluation across
-whole tree levels rather than per-node, or a smarter search shape than beam +
-iterative deepening).
+Further gains would most likely require a better-trained (or just better-
+calibrated, now that a checkpoint *can* carry exact `return_mean`/`return_std`
+— see the follow-up above) critic checkpoint — which needs a fresh/continued
+training run to produce, not a code change here — or a meaningfully larger
+engineering effort (e.g. batching critic evaluation across whole tree levels
+rather than per-node, or a smarter search shape than beam + iterative
+deepening).

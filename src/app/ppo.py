@@ -72,6 +72,14 @@ class ReturnNormalizer:
     def denormalize(self, x):
         return x * self._std + self._mean
 
+    @property
+    def mean(self):
+        return self._mean
+
+    @property
+    def std(self):
+        return self._std
+
 
 def setup_run_logger(run_id: str) -> None:
     os.makedirs('logs', exist_ok=True)
@@ -862,6 +870,8 @@ if __name__ == '__main__':
                     warchest_critic, f'data/{critic_filename}',
                     obs_version=environment._obs_encoder.version,
                     hidden_dim=hp['critic_hidden_dim'],
+                    return_mean=trainer._ret_normalizer.mean,
+                    return_std=trainer._ret_normalizer.std,
                 )
                 logger.info(f'Model saved to data/{filename}')
                 logger.info(f'Critic saved to data/{critic_filename}')

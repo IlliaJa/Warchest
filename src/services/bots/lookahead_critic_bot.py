@@ -70,7 +70,11 @@ count before any of the expensive per-action work happens; `time_budget`
 defaults higher (this bot is eval-only per docs/lookahead_bot_plan.md's scope
 note, never in the rollout hot path, so there's no speed floor to hit).
 """
+import glob
+import logging
+import os
 import random
+import re
 import time
 import types
 
@@ -84,7 +88,37 @@ from ..environment.rollout_core import OPP_TYPE_IDX
 from ..policy.checkpoint import load_critic_checkpoint
 from ..policy.policy import Critic
 
-DEFAULT_CRITIC_PATH = 'data/lookahead_critic/lookahead_critic_v1.pth'
+CRITIC_GLOB = 'data/lookahead_critic/lookahead_critic_v*.pth'
+
+
+def _latest_critic_path():
+    """Highest-numbered `lookahead_critic_v{N}.pth` under `data/lookahead_critic/`,
+    or None if no such checkpoint exists. Mirrors `gauntlet.py`'s own
+    `_latest_critic_path` (a separate small copy rather than a shared import —
+    services/ shouldn't depend on app/gauntlet.py) so this bot's own default
+    stays correct the same way the gauntlet CLI's does, rather than pointing at
+    one hardcoded, eventually-stale version.
+    """
+    candidates = glob.glob(CRITIC_GLOB)
+    if not candidates:
+        return None
+
+    def version(path):
+        m = re.search(r'_v(\d+)\.pth$', os.path.basename(path))
+        return int(m.group(1)) if m else -1
+
+    return max(candidates, key=version)
+
+
+# Same logger name ppo.py's setup_run_logger configures (file handler at DEBUG,
+# console at INFO). `act()` logs at two levels: DEBUG per real move (detailed,
+# would spam a console shown at INFO — see `_record_agg_stats`'s docstring for
+# the INFO-level rolling summary meant to be readable at a glance instead).
+# Silent by default: neither gauntlet.py nor gauntlet_parallel.py configures
+# any handler, so `logging.basicConfig(level=logging.INFO)` (DEBUG for the
+# per-move trace too; or attach a handler to this 'warchest' logger
+# specifically) is needed to actually see either.
+logger = logging.getLogger('warchest')
 
 
 class _Child:
@@ -109,8 +143,12 @@ class LookaheadCriticBot(LookaheadBot):
 
     Args:
         critic_path: path to a checkpoint saved by
-            `policy.checkpoint.save_critic_checkpoint`. Defaults to the critic
-            saved alongside the 2026-07-07 1500-episode PPO run.
+            `policy.checkpoint.save_critic_checkpoint`. Defaults to
+            `_latest_critic_path()` — the highest-numbered
+            `data/lookahead_critic/lookahead_critic_v{N}.pth` — so this always
+            picks up the newest trained critic rather than a version pinned in
+            code (mirrors `gauntlet.py`'s own default resolution). Raises
+            `FileNotFoundError` if none exists and none was passed explicitly.
         beam_width: how many children survive (and get recursed into) at each
             node — see module docstring for why this is per-node, not global.
         max_branching: cap on raw legal actions considered per node, applied
@@ -127,16 +165,41 @@ class LookaheadCriticBot(LookaheadBot):
             — the critic was trained conditioned on this, and there's no
             "unknown opponent" slot to fall back on. `'pool'` (self-play
             snapshots) is the closest analogue to an arbitrary eval opponent.
+        n_determinizations: independent `_act_once` searches per `act()` call,
+            each under a fresh sampled future-draw order, weighted-vote
+            combined (see `act()`) — hedges this bot's own single-
+            determinization variance without changing the total per-move time
+            budget. Defaults to 1 (off): measured *worse* than 1 at every
+            split tried (even a lopsided 80/20 two-way split) at this bot's
+            0.5s default budget — the search is already too depth-starved
+            relative to `LookaheadBot`'s alpha-beta for taking any of that
+            budget away from the primary search to be worth the hedge (see
+            docs/bots.md's experiment log). Left available, not deleted, for
+            a meaningfully larger `time_budget` where the primary search
+            stops being the bottleneck.
+        stats_log_every: log an aggregated-statistics summary (see `act()`)
+            every this many real moves, rolling — 0 disables it.
         device: torch device for the critic's forward passes.
     """
 
-    def __init__(self, critic_path=DEFAULT_CRITIC_PATH, beam_width=5, max_branching=8,
+    def __init__(self, critic_path=None, beam_width=5, max_branching=8,
                  time_budget=0.5, see_opponent_hand=True, max_depth=40, gamma=0.99,
-                 opp_type='pool', device='cpu', name='lookahead_critic'):
+                 opp_type='pool', n_determinizations=1, stats_log_every=20,
+                 device='cpu', name='lookahead_critic'):
+        if critic_path is None:
+            critic_path = _latest_critic_path()
+            if critic_path is None:
+                raise FileNotFoundError(
+                    f'No checkpoint matching {CRITIC_GLOB} — pass critic_path '
+                    f'explicitly, or train and save one first.'
+                )
         super().__init__(time_budget=time_budget, max_branching=max_branching,
                           see_opponent_hand=see_opponent_hand, max_depth=max_depth,
                           gamma=gamma, shaping_anneal=1.0, name=name)
         self.beam_width = beam_width
+        self.n_determinizations = n_determinizations
+        self.stats_log_every = stats_log_every
+        self._reset_agg_stats()
         self.device = device
 
         meta = load_critic_checkpoint(critic_path, map_location=device)
@@ -157,24 +220,38 @@ class LookaheadCriticBot(LookaheadBot):
         self._opp_onehot = torch.from_numpy(opp_onehot).to(device)
 
         self._value_scale, self._value_shift = 1.0, 0.0
-        self._calibrate_value_scale()
+        if meta.get('return_mean') is not None and meta.get('return_std') is not None:
+            # Exact recovery: this checkpoint was saved with `save_critic_checkpoint`'s
+            # optional return_mean/return_std (ppo.py's ReturnNormalizer EMA at save
+            # time, see checkpoint.py's module docstring) — denormalize precisely
+            # instead of approximating via `_calibrate_value_scale`'s moment-match.
+            self._value_scale = float(meta['return_std'])
+            self._value_shift = float(meta['return_mean'])
+            logger.debug('lookahead_critic: using exact checkpoint return_mean=%.4f return_std=%.4f',
+                         self._value_shift, self._value_scale)
+        else:
+            self._calibrate_value_scale()
 
     def _calibrate_value_scale(self, n_games=8, n_samples=160, seed=12345):
-        """One-time affine fit recovering the critic's real reward-scale.
+        """One-time affine fit *approximating* the critic's real reward-scale —
+        the fallback for checkpoints saved before `save_critic_checkpoint` grew
+        its optional `return_mean`/`return_std` (see `__init__`, which uses
+        those directly, exactly, whenever a checkpoint has them; this method
+        only runs for older checkpoints that don't).
 
         `Critic.value_batch` was trained against *normalised* returns (ppo.py's
         `ReturnNormalizer`: an EMA of return mean/std, used to keep the critic's
         loss scale stable — see its docstring). `ppo.py` always denormalises
         (`value * std + mean`) before treating the critic's output as a real
-        value anywhere (rollout bootstrapping, GAE). That EMA is training-loop
-        state, never written to the checkpoint (`checkpoint.py` only saves
+        value anywhere (rollout bootstrapping, GAE). Older checkpoints never
+        recorded that EMA (`checkpoint.py` only saved
         `state_dict`/`obs_version`/`arch`/`hidden_dim`), so the exact
-        denormalisation used when this checkpoint was saved can't be recovered
-        — feeding the network's raw output straight into `_beam_value`, which
-        sums it with real reward-scale path returns, was giving the critic's
-        contribution an arbitrary, depth-dependent weight relative to the real
-        rewards it's added to (nodes reached via more/fewer real-reward-bearing
-        steps ended up on incommensurable scales — confirmed to be the fix that
+        denormalisation used when such a checkpoint was saved can't be
+        recovered — feeding the network's raw output straight into
+        `_beam_value`, which sums it with real reward-scale path returns, was
+        giving the critic's contribution an arbitrary, depth-dependent weight
+        relative to the real rewards it's added to (nodes reached via more/fewer
+        real-reward-bearing steps ended up on incommensurable scales — confirmed to be the fix that
         matters: swapping this bot's scoring for `_leaf_potential` outright,
         same beam-search shape otherwise, beat GreedyBot 5/6 games where the raw
         critic scored ~25%).
@@ -224,14 +301,125 @@ class LookaheadCriticBot(LookaheadBot):
         self._value_shift = float(heur.mean() - self._value_scale * raw.mean())
 
     def act(self, env) -> int:
+        """Vote across `n_determinizations` independent searches instead of
+        betting the whole decision on one sampled future-draw order.
+
+        `_prepare_root` samples a fresh, unseeded determinization every time
+        it's called (`LookaheadBot`'s single-determinization design — one
+        sample per search, reused across that search's whole tree, cheaper
+        than resampling per node). A single sample can make a node's estimated
+        value swing on a guessed-future that never happens, which is pure
+        noise in the decision, not signal — this bot has no control over
+        `LookaheadBot`'s own single-determinization variance (not this bot's
+        file to change), but its *own* variance from the same mechanism is
+        fully fixable here: split `time_budget` across `n_determinizations`
+        independent `_act_once` searches (same total wall-clock per move) and
+        vote, rather than spend the whole budget on one draw of the dice. Each
+        individual search gets a smaller sub-budget (shallower/narrower), but
+        the resulting decision is hedged against any single one of them
+        guessing an unlucky future — the classic determinization-averaging
+        fix for imperfect-information game search (Perfect Information Monte
+        Carlo), applied to the one piece of hidden information (draw order)
+        this search has to guess at all.
+        """
         root_player = env.active_player
         legal = env.get_possible_actions()
         if len(legal) <= 1:
             return legal[0]
 
+        n = max(1, self.n_determinizations)
+        # An *equal* split measured worse than n=1 (0.30s/0.30s beat 0.60s
+        # solo by vote, but 0.25s/0.25s lost to 0.50s solo — see docs/bots.md):
+        # this search is already depth-starved at 0.5s (LookaheadBot reaches
+        # depth 4-6 here in a fifth of the time), so halving the budget costs
+        # a whole ply more often than the vote recovers. Weighting it instead
+        # — one primary search keeps most of the budget (nearly the full
+        # single-search depth), the rest are cheap hedges — was the config
+        # that actually held up: a second opinion on whether the primary's
+        # single determinization got unlucky, without sacrificing the
+        # primary's own depth to buy it.
+        if n == 1:
+            weights = [1.0]
+        else:
+            weights = [0.8] + [0.2 / (n - 1)] * (n - 1)
+        votes, val_weighted, stats_list = {}, {}, []
+        for w in weights:
+            action, val, stats = self._act_once(env, root_player, legal, self.time_budget * w)
+            votes[action] = votes.get(action, 0.0) + w
+            val_weighted[action] = val_weighted.get(action, 0.0) + w * (val if val is not None else 0.0)
+            stats_list.append(stats)
+        # Weighted-plurality vote across determinizations; ties broken by
+        # whichever tied action scored better on average where it did win.
+        best_action = max(votes, key=lambda a: (votes[a], val_weighted[a] / votes[a]))
+        self.last_stats = {
+            'depth_reached': max(s['depth_reached'] for s in stats_list),
+            'depths': [s['depth_reached'] for s in stats_list],
+            'nodes_visited': sum(s['nodes_visited'] for s in stats_list),
+            'elapsed': sum(s['elapsed'] for s in stats_list),
+            'legal_at_root': len(legal),
+            'best_value': val_weighted[best_action] / votes[best_action],
+            'determinization_votes': votes,
+        }
+        # DEBUG (not INFO): fires once per real move, so this would spam a
+        # console that shows INFO — see the `logger` module-docstring comment
+        # for how to actually surface it.
+        logger.debug(
+            'lookahead_critic act(): depth_reached=%d (per-search=%s) nodes_visited=%d '
+            'elapsed=%.3fs/%.3fs budget legal_at_root=%d best_value=%.4f',
+            self.last_stats['depth_reached'], self.last_stats['depths'],
+            self.last_stats['nodes_visited'], self.last_stats['elapsed'], self.time_budget,
+            self.last_stats['legal_at_root'], self.last_stats['best_value'],
+        )
+        self._record_agg_stats()
+        return best_action
+
+    def _reset_agg_stats(self):
+        self._agg = {
+            'n': 0, 'nodes_visited': 0, 'depth_sum': 0, 'depth_min': None, 'depth_max': None,
+            'elapsed_sum': 0.0, 'legal_at_root_sum': 0,
+        }
+
+    def _record_agg_stats(self):
+        """Roll `self.last_stats` into a running window and, every
+        `stats_log_every` real moves, log it as one human-readable INFO
+        summary — min/avg/max depth_reached (the number that answers "is the
+        search actually looking ahead, or stuck at the leaf") alongside
+        nodes_visited and elapsed vs. budget, instead of the per-move DEBUG
+        trace above (still there for inspecting one specific decision, but
+        too granular to read across a whole game at a glance).
+        """
+        if not self.stats_log_every:
+            return
+        a = self._agg
+        s = self.last_stats
+        a['n'] += 1
+        a['nodes_visited'] += s['nodes_visited']
+        a['depth_sum'] += s['depth_reached']
+        a['depth_min'] = s['depth_reached'] if a['depth_min'] is None else min(a['depth_min'], s['depth_reached'])
+        a['depth_max'] = s['depth_reached'] if a['depth_max'] is None else max(a['depth_max'], s['depth_reached'])
+        a['elapsed_sum'] += s['elapsed']
+        a['legal_at_root_sum'] += s['legal_at_root']
+        if a['n'] < self.stats_log_every:
+            return
+        logger.info(
+            'lookahead_critic: last %d move(s) — depth_reached avg=%.2f min=%d max=%d, '
+            'nodes_visited avg=%.1f, elapsed avg=%.3fs/%.3fs budget, legal_at_root avg=%.1f',
+            a['n'], a['depth_sum'] / a['n'], a['depth_min'], a['depth_max'],
+            a['nodes_visited'] / a['n'], a['elapsed_sum'] / a['n'], self.time_budget,
+            a['legal_at_root_sum'] / a['n'],
+        )
+        self._reset_agg_stats()
+
+    def _act_once(self, env, root_player, legal, time_budget):
+        """One full iterative-deepening beam search under a fresh
+        determinization and its own (possibly split) time budget — the body
+        `act()` ran directly before `n_determinizations` voting was added.
+        Returns `(action, value, stats)` instead of mutating `self.last_stats`
+        directly, so `act()` can combine several of these.
+        """
         root_state, root_queues = self._prepare_root(env, root_player)
         start = time.monotonic()
-        deadline = start + self.time_budget
+        deadline = start + time_budget
         best_action = legal[0]
         best_val = None
         depth = 0
@@ -260,14 +448,12 @@ class LookaheadCriticBot(LookaheadBot):
             if time.monotonic() >= deadline:
                 break
             depth += 1
-        self.last_stats = {
+        stats = {
             'depth_reached': depth_reached,
             'nodes_visited': self._nodes_visited,
             'elapsed': time.monotonic() - start,
-            'legal_at_root': len(legal),
-            'best_value': best_val,
         }
-        return best_action
+        return best_action, best_val, stats
 
     # ------------------------------------------------------------------
 

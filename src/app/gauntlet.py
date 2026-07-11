@@ -13,6 +13,7 @@ Examples:
 """
 import argparse
 import glob
+import logging
 import os
 import re
 import sys
@@ -102,7 +103,9 @@ def _validate_specs(specs, device):
             agent = build_agent(spec, device=device)
         except Exception as e:  # 'policy' failures are already reported by build_agent
             if spec['kind'] != 'policy':
-                print(f"  ! skipping {spec.get('name', spec['kind'])}: {e}")
+                path = spec.get('kwargs', {}).get('critic_path')
+                where = f' (checkpoint: {path})' if path else ''
+                print(f"  ! skipping {spec.get('name', spec['kind'])}{where}: {e}")
             continue
         if spec['kind'] == 'policy':
             spec = {**spec, 'name': agent.name}
@@ -135,6 +138,16 @@ def _print_report(out):
 
 
 def main():
+    # 'warchest' is the logger name every bot/ppo.py logs to (LookaheadCriticBot's
+    # per-move/aggregate search stats among them — see lookahead_critic_bot.py). No
+    # handler is configured anywhere else in this CLI's path, so without this,
+    # nothing above WARNING ever prints. Only covers this (main) process directly —
+    # the default parallel path (n_workers > 1) runs every actual game in spawned
+    # worker processes that don't inherit this, so gauntlet_parallel.py's
+    # `_worker_loop` configures its own copy too.
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s',
+                         datefmt='%Y-%m-%d %H:%M:%S')
+
     parser = argparse.ArgumentParser(description='Warchest round-robin gauntlet.')
     parser.add_argument('--bots', nargs='+', default=['policy', 'greedy', 'lookahead', 'lookahead_critic'],
                         choices=['policy', 'greedy', 'random', 'lookahead', 'lookahead_critic'],
@@ -160,7 +173,7 @@ def main():
     parser.add_argument('--lookahead-critic-max-branching', type=int, default=8,
                         help='Raw legal-action cap per node before critic scoring, '
                              'for LookaheadCriticBot.')
-    parser.add_argument('--lookahead-critic-time-budget', type=float, default=0.5,
+    parser.add_argument('--lookahead-critic-time-budget', type=float, default=2.5,
                         help='Per-move search budget in seconds, for LookaheadCriticBot '
                              '(higher than LookaheadBot\'s default: the critic\'s forward '
                              'pass costs much more per node than a hand-crafted heuristic).')

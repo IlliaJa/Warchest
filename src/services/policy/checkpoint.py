@@ -18,6 +18,12 @@ run) — `save_critic_checkpoint`/`load_critic_checkpoint` mirror the policy pai
 exactly, saved as a separate file alongside the policy checkpoint rather than a
 new key on the existing envelope, so `load_policy_checkpoint` and every existing
 caller (gauntlet.py) are untouched.
+
+Critic envelopes additionally carry optional `return_mean`/`return_std` floats
+— the `ReturnNormalizer` EMA (ppo.py) in effect when the checkpoint was saved,
+letting a consumer outside the training loop (`LookaheadCriticBot`) recover the
+critic's real reward-scale value exactly instead of approximating it. Absent
+(`None`) on any checkpoint saved before this pair of fields existed.
 """
 import torch
 
@@ -49,10 +55,17 @@ def load_policy_checkpoint(path, map_location='cpu', *, default_hidden_dim=64):
     """
     obj = torch.load(path, map_location=map_location, weights_only=False)
     if isinstance(obj, dict) and 'state_dict' in obj and 'obs_version' in obj:
+        arch = obj.get('arch', CURRENT_ARCH)
+        if arch == CURRENT_CRITIC_ARCH:
+            raise ValueError(
+                f"{path!r} is a CRITIC checkpoint (arch={arch!r}), not a policy checkpoint "
+                f"— it was likely copied from a data/warchest_critic_*.pth file by mistake. "
+                f"Use the matching data/warchest_ppo_*.pth from the same training run instead."
+            )
         return {
             'state_dict': obj['state_dict'],
             'obs_version': obj['obs_version'],
-            'arch': obj.get('arch', CURRENT_ARCH),
+            'arch': arch,
             'hidden_dim': obj.get('hidden_dim', default_hidden_dim),
         }
     # Legacy: a bare state_dict (OrderedDict of param -> tensor) with no metadata.
@@ -64,8 +77,22 @@ def load_policy_checkpoint(path, map_location='cpu', *, default_hidden_dim=64):
     }
 
 
-def save_critic_checkpoint(critic, path, *, obs_version, hidden_dim, arch=CURRENT_CRITIC_ARCH):
-    """Save `critic`'s weights plus the metadata needed to rebuild it later."""
+def save_critic_checkpoint(critic, path, *, obs_version, hidden_dim, arch=CURRENT_CRITIC_ARCH,
+                            return_mean=None, return_std=None):
+    """Save `critic`'s weights plus the metadata needed to rebuild it later.
+
+    `return_mean`/`return_std`: the `ReturnNormalizer` EMA in effect at save time
+    (ppo.py) — the critic is trained to predict *normalised* returns
+    (`(return - mean) / std`), and that normalisation is undone
+    (`value * std + mean`) everywhere the critic's output is treated as a real
+    value during training (rollout bootstrapping, GAE). Without these, nothing
+    records what that undoing needs to be: a consumer outside the training loop
+    (`LookaheadCriticBot`) has no way to recover the network's real-reward
+    scale and has to approximate it (see `_calibrate_value_scale`'s docstring).
+    Optional and omitted by default (`None`) so existing call sites don't need
+    to change; a checkpoint saved without them just has no `return_mean`/
+    `return_std` keys, same as every checkpoint saved before this pair existed.
+    """
     payload = {
         'format': 1,
         'arch': arch,
@@ -73,18 +100,38 @@ def save_critic_checkpoint(critic, path, *, obs_version, hidden_dim, arch=CURREN
         'hidden_dim': hidden_dim,
         'state_dict': {k: v.detach().cpu() for k, v in critic.state_dict().items()},
     }
+    if return_mean is not None and return_std is not None:
+        payload['return_mean'] = float(return_mean)
+        payload['return_std'] = float(return_std)
     torch.save(payload, path)
 
 
 def load_critic_checkpoint(path, map_location='cpu', *, default_hidden_dim=64):
-    """Return {'state_dict', 'obs_version', 'arch', 'hidden_dim'} for any critic
-    checkpoint saved by `save_critic_checkpoint`. No legacy format exists for the
-    critic (it was never persisted before this pair was added).
+    """Return {'state_dict', 'obs_version', 'arch', 'hidden_dim', 'return_mean',
+    'return_std'} for any critic checkpoint saved by `save_critic_checkpoint`.
+    No legacy format exists for the critic (it was never persisted before this
+    pair was added). `return_mean`/`return_std` are `None` for checkpoints
+    saved before that pair of fields existed — callers must handle that case,
+    there's no way to recover them after the fact (see `save_critic_checkpoint`).
     """
     obj = torch.load(path, map_location=map_location, weights_only=False)
+    arch = obj.get('arch', CURRENT_CRITIC_ARCH)
+    if arch == CURRENT_ARCH:
+        # The #1 real-world cause: someone copied a data/warchest_ppo_*.pth (policy)
+        # over the critic path by mistake. Catching it here, keyed on the saved
+        # `arch` metadata, turns a cryptic "Missing/Unexpected key(s)" state_dict
+        # error into an actionable one.
+        raise ValueError(
+            f"{path!r} is a POLICY checkpoint (arch={arch!r}), not a critic checkpoint "
+            f"— it was likely copied from a data/warchest_ppo_*.pth file by mistake. "
+            f"Copy the matching data/warchest_critic_*.pth from the same training run "
+            f"to this path instead."
+        )
     return {
         'state_dict': obj['state_dict'],
         'obs_version': obj['obs_version'],
-        'arch': obj.get('arch', CURRENT_CRITIC_ARCH),
+        'arch': arch,
         'hidden_dim': obj.get('hidden_dim', default_hidden_dim),
+        'return_mean': obj.get('return_mean'),
+        'return_std': obj.get('return_std'),
     }

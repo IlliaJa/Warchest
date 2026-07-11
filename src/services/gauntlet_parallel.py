@@ -58,6 +58,18 @@ def _worker_loop(worker_id, task_q, result_q, agent_specs):
     if root not in sys.path:
         sys.path.insert(0, root)
 
+    # A spawned process (`mp.get_context('spawn')`, module docstring) is a fresh
+    # interpreter — it does not inherit gauntlet.py main()'s logging.basicConfig,
+    # so every actual game (and every bot's act()-time logging, e.g.
+    # LookaheadCriticBot's per-move/aggregate search stats) would otherwise log to
+    # nothing. `worker_id` (not just the OS pid) tags each line so interleaved
+    # output from multiple workers stays attributable.
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f'%(asctime)s [%(levelname)s] [worker {worker_id}] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+
     import torch
     torch.set_num_threads(1)  # CRITICAL: else N workers x intra-op threads oversubscribe cores
     # (doubly so for LookaheadCriticBot: wall-clock-budgeted *and* torch-driven per search node)
