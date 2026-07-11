@@ -20,57 +20,70 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 import torch
 
-from src.services.policy.policy import Policy
-from src.services.policy.checkpoint import load_policy_checkpoint
-from src.services.environment.obs_encoders import get_encoder
-from src.services.gauntlet import (
-    round_robin, greedy_agent, lookahead_agent, lookahead_critic_agent, PolicyAgent,
-)
+from src.services.gauntlet import round_robin, build_agent
+from src.services.gauntlet_parallel import round_robin_parallel
 from src.services.bots.lookahead_critic_bot import DEFAULT_CRITIC_PATH
 
 
-def _checkpoint_agent(path, device):
-    """Build a PolicyAgent from a checkpoint, or None if it can't be reconstructed.
+def _build_specs(args):
+    """Turn CLI args into agent specs (picklable, order matches the field/report).
 
-    A bare legacy checkpoint from an older architecture / obs version (different
-    layer names or dims) is not loadable into the current code — resurrecting those
-    is the subprocess/worktree path (docs/next_steps.md), out of scope here. We
-    skip them with a warning so the gauntlet still runs on the loadable field.
+    A spec fully describes how to (re)build one agent via `gauntlet.build_agent` —
+    used directly by the sequential path (built once, in-process) and shipped as-is
+    to parallel workers (each worker rebuilds the whole field once from these specs;
+    see `gauntlet_parallel.py` for why live agent objects can't just be pickled).
     """
-    try:
-        meta = load_policy_checkpoint(path, map_location=device)
-        encoder = get_encoder(meta['obs_version'])
-        policy = Policy(device=device, hidden_dim=meta['hidden_dim'], obs_encoder=encoder).to(device)
-        policy.load_state_dict(meta['state_dict'])
-    except Exception as e:  # unreadable file, or incompatible arch/obs/dims
-        reason = str(e).splitlines()[0] if str(e).strip() else type(e).__name__
-        print(f'  ! skipping {os.path.basename(path)}: {reason}')
-        return None
-    policy.eval()
-    name = os.path.splitext(os.path.basename(path))[0].replace('warchest_ppo_', 'ckpt_')
-    return PolicyAgent(f'{name}[v{meta["obs_version"]}]', policy, encoder)
+    specs = []
+    paths = args.checkpoints
+    if paths is None:
+        paths = sorted(glob.glob('data/warchest_ppo_*.pth'))
+    for path in paths:
+        specs.append({'kind': 'policy', 'path': path})
+    if not args.no_greedy:
+        specs.append({'kind': 'greedy', 'name': 'greedy'})
+    if not args.no_lookahead:
+        specs.append({'kind': 'lookahead', 'name': 'lookahead', 'kwargs': {
+            'time_budget': args.lookahead_time_budget,
+            'max_branching': args.lookahead_max_branching,
+            'see_opponent_hand': not args.lookahead_blind,
+        }})
+    if not args.no_lookahead_critic:
+        # Depends on a critic checkpoint that may not exist in every environment (e.g. a
+        # fresh checkout with no training run yet) — skip with a warning rather than crash.
+        if not os.path.exists(args.lookahead_critic_path):
+            print(f'  ! skipping lookahead_critic: checkpoint not found at '
+                  f'{args.lookahead_critic_path}')
+        else:
+            specs.append({'kind': 'lookahead_critic', 'name': 'lookahead_critic', 'kwargs': {
+                'critic_path': args.lookahead_critic_path,
+                'beam_width': args.lookahead_critic_beam_width,
+                'max_branching': args.lookahead_critic_max_branching,
+                'time_budget': args.lookahead_critic_time_budget,
+                'see_opponent_hand': not args.lookahead_critic_blind,
+            }})
+    return specs
 
 
-def _lookahead_critic_agent(args, device):
-    """Build the LookaheadCriticBot baseline, or None if its checkpoint is missing.
-
-    On by default (like LookaheadBot), but unlike LookaheadBot it depends on a
-    critic checkpoint file that may not exist in every environment (e.g. a fresh
-    checkout with no training run yet) — skip with a warning rather than crash.
+def _validate_specs(specs, device):
+    """Dry-run build every spec once, dropping any that fail (missing/incompatible
+    checkpoint) with a warning — so parallel workers never hit the same failure N times.
+    Returns `(kept_specs, agents)`: the built agents (on `device`) double as the
+    sequential path's live field, and as the source of each agent's display name
+    (a 'policy' spec's name is only known after a real build, from the checkpoint path).
     """
-    if not os.path.exists(args.lookahead_critic_path):
-        print(f'  ! skipping lookahead_critic: checkpoint not found at '
-              f'{args.lookahead_critic_path}')
-        return None
-    return lookahead_critic_agent(
-        'lookahead_critic',
-        critic_path=args.lookahead_critic_path,
-        beam_width=args.lookahead_critic_beam_width,
-        max_branching=args.lookahead_critic_max_branching,
-        time_budget=args.lookahead_critic_time_budget,
-        see_opponent_hand=not args.lookahead_critic_blind,
-        device=device,
-    )
+    kept_specs, agents = [], []
+    for spec in specs:
+        try:
+            agent = build_agent(spec, device=device)
+        except Exception as e:  # 'policy' failures are already reported by build_agent
+            if spec['kind'] != 'policy':
+                print(f"  ! skipping {spec.get('name', spec['kind'])}: {e}")
+            continue
+        if spec['kind'] == 'policy':
+            spec = {**spec, 'name': agent.name}
+        kept_specs.append(spec)
+        agents.append(agent)
+    return kept_specs, agents
 
 
 def _print_report(out):
@@ -116,8 +129,6 @@ def main():
     parser.add_argument('--no-lookahead-critic', action='store_true',
                         help='Drop the LookaheadCriticBot baseline (on by default; skipped '
                              'automatically if its checkpoint is missing).')
-    parser.add_argument('--lookahead-critic-path', default=DEFAULT_CRITIC_PATH,
-                        help='Critic checkpoint path, for LookaheadCriticBot.')
     parser.add_argument('--lookahead-critic-beam-width', type=int, default=5,
                         help='Children kept per node, for LookaheadCriticBot.')
     parser.add_argument('--lookahead-critic-max-branching', type=int, default=8,
@@ -130,32 +141,42 @@ def main():
     parser.add_argument('--lookahead-critic-blind', action='store_true',
                         help="LookaheadCriticBot doesn't read the opponent's real hand "
                              "(fair mode).")
+    parser.add_argument('--n-workers', type=int, default=min(os.cpu_count() or 4, 8),
+                        help='Parallel worker processes for game play. Default: '
+                             'min(cpu_count, 8). 1 (or --sequential) plays in-process on '
+                             'cuda if available (matching pre-parallel behavior exactly); >1 '
+                             'always evaluates on CPU in every worker (mirrors '
+                             'rollout_collector.py\'s convention), since broadcasting live GPU '
+                             'modules to worker processes is the fragile case that convention '
+                             'avoids. LookaheadBot/LookaheadCriticBot use a wall-clock search '
+                             'budget, so heavy oversubscription (n-workers well above physical '
+                             'cores) silently reduces their effective search depth per game — '
+                             'cap at physical core count for serious lookahead evals.')
+    parser.add_argument('--sequential', action='store_true',
+                        help='Shorthand for --n-workers 1.')
     args = parser.parse_args()
+    if args.sequential:
+        args.n_workers = 1
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
 
-    paths = args.checkpoints
-    if paths is None:
-        paths = sorted(glob.glob('data/warchest_ppo_*.pth'))
-    agents = [a for a in (_checkpoint_agent(p, device) for p in paths) if a is not None]
-    if not args.no_greedy:
-        agents.append(greedy_agent('greedy'))
-    if not args.no_lookahead:
-        agents.append(lookahead_agent('lookahead', time_budget=args.lookahead_time_budget,
-                                       max_branching=args.lookahead_max_branching,
-                                       see_opponent_hand=not args.lookahead_blind))
-    if not args.no_lookahead_critic:
-        critic_agent = _lookahead_critic_agent(args, device)
-        if critic_agent is not None:
-            agents.append(critic_agent)
+    specs = _build_specs(args)
+    validate_device = device if args.n_workers <= 1 else torch.device('cpu')
+    specs, agents = _validate_specs(specs, validate_device)
+    names = [a.name for a in agents]
 
-    if len(agents) < 2:
+    if len(specs) < 2:
         raise SystemExit('Need at least 2 agents; pass --checkpoints or keep the baselines.')
 
-    print(f'Field ({len(agents)}): ' + ', '.join(a.name for a in agents))
+    print(f'Field ({len(specs)}): ' + ', '.join(names))
     print(f'Playing {args.k_games} games/pair ...')
-    out = round_robin(agents, k_games=args.k_games, seed=args.seed)
+    if args.n_workers <= 1:
+        out = round_robin(agents, k_games=args.k_games, seed=args.seed)
+    else:
+        print(f'Using {args.n_workers} parallel worker processes (CPU-only evaluation).')
+        out = round_robin_parallel(specs, names, k_games=args.k_games, seed=args.seed,
+                                    n_workers=args.n_workers)
     _print_report(out)
 
 

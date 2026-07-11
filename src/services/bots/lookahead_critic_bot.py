@@ -83,7 +83,7 @@ from ..environment.rollout_core import OPP_TYPE_IDX
 from ..policy.checkpoint import load_critic_checkpoint
 from ..policy.policy import Critic
 
-DEFAULT_CRITIC_PATH = 'data/warchest_critic_20260707-0026.pth'
+DEFAULT_CRITIC_PATH = 'data/lookahead_critic/lookahead_critic_v1.pth'
 
 
 class _Child:

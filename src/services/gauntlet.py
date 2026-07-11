@@ -15,6 +15,7 @@ versions can play a single game through one WarChestEnv. Reconstructing a matchi
 policy.checkpoint + obs_encoders); the gauntlet only needs callable agents.
 """
 import itertools
+import os
 
 import numpy as np
 
@@ -24,6 +25,8 @@ from .bots.greedy_bot import GreedyBot
 from .bots.random_bot import RandomBot
 from .bots.lookahead_bot import LookaheadBot
 from .bots.lookahead_critic_bot import LookaheadCriticBot
+from .policy.checkpoint import load_policy_checkpoint
+from .policy.policy import Policy
 
 
 # --------------------------------------------------------------------------- #
@@ -89,6 +92,55 @@ def lookahead_critic_agent(name='lookahead_critic', **kwargs):
     return LookaheadCriticBot(name=name, **kwargs)
 
 
+def checkpoint_agent(path, device):
+    """Build a PolicyAgent from a checkpoint, or None if it can't be reconstructed.
+
+    A bare legacy checkpoint from an older architecture / obs version (different
+    layer names or dims) is not loadable into the current code — resurrecting those
+    is the subprocess/worktree path (docs/next_steps.md), out of scope here. We
+    skip them with a warning so the gauntlet still runs on the loadable field.
+    """
+    try:
+        meta = load_policy_checkpoint(path, map_location=device)
+        encoder = get_encoder(meta['obs_version'])
+        policy = Policy(device=device, hidden_dim=meta['hidden_dim'], obs_encoder=encoder).to(device)
+        policy.load_state_dict(meta['state_dict'])
+    except Exception as e:  # unreadable file, or incompatible arch/obs/dims
+        reason = str(e).splitlines()[0] if str(e).strip() else type(e).__name__
+        print(f'  ! skipping {os.path.basename(path)}: {reason}')
+        return None
+    policy.eval()
+    name = os.path.splitext(os.path.basename(path))[0].replace('warchest_ppo_', 'ckpt_')
+    return PolicyAgent(f'{name}[v{meta["obs_version"]}]', policy, encoder)
+
+
+def build_agent(spec, *, device):
+    """Rebuild a `GauntletAgent` from a small picklable `spec` dict.
+
+    Needed because live `LookaheadBot`/`LookaheadCriticBot` instances are
+    unconditionally unpicklable (both monkeypatch `_sim_env._draw_one` with a
+    bound method whose `__name__` doesn't match the attribute it's stored under,
+    which breaks pickle's bound-method reduction) — so parallel gauntlet workers
+    rebuild every agent from a spec rather than receiving live objects, uniformly
+    across all agent kinds (see `gauntlet_parallel.py`).
+    """
+    kind = spec['kind']
+    if kind == 'greedy':
+        return greedy_agent(spec['name'])
+    if kind == 'random':
+        return random_agent(spec['name'])
+    if kind == 'lookahead':
+        return lookahead_agent(spec['name'], **spec.get('kwargs', {}))
+    if kind == 'lookahead_critic':
+        return lookahead_critic_agent(spec['name'], device=device, **spec.get('kwargs', {}))
+    if kind == 'policy':
+        agent = checkpoint_agent(spec['path'], device)
+        if agent is None:
+            raise ValueError(f"could not build policy agent from checkpoint {spec['path']!r}")
+        return agent
+    raise ValueError(f'unknown agent spec kind: {kind!r}')
+
+
 # --------------------------------------------------------------------------- #
 # Game driver
 # --------------------------------------------------------------------------- #
@@ -123,39 +175,46 @@ def play_game(agent_p1, agent_p2, *, seed=None, max_turns=2000):
 # --------------------------------------------------------------------------- #
 # Round-robin + ratings
 # --------------------------------------------------------------------------- #
-def round_robin(agents, *, k_games=20, seed=0):
-    """Play every pair K games with balanced colors.
+def build_task_list(n, *, k_games, seed):
+    """Deterministic `(i, j, game_seed, p1_is_i)` tasks for an n-agent round-robin.
 
-    Returns a dict with agent names, the wins/games/win-rate matrices (wins counts
-    draws as 0.5 to each side), Bradley-Terry ratings (Elo-scaled), and the
-    intransitive-triple fraction.
+    Pair order (`itertools.combinations`) and per-pair game/seed/color order are
+    fixed here so both the sequential and parallel round-robin paths hand out the
+    exact same seed to the exact same pairing regardless of dispatch order —
+    which is what lets a parallel run reproduce a sequential run's result matrix
+    bit-for-bit at a given seed (see `gauntlet_parallel.py`).
     """
-    n = len(agents)
-    names = [a.name for a in agents]
-    wins = np.zeros((n, n), dtype=np.float64)   # wins[i,j] = i's score vs j (draw=0.5)
-    games = np.zeros((n, n), dtype=np.float64)
-
+    tasks = []
     rng_seed = seed
     for i, j in itertools.combinations(range(n), 2):
         for g in range(k_games):
             # Alternate colors: even games i=P1, odd games j=P1.
-            if g % 2 == 0:
-                res = play_game(agents[i], agents[j], seed=rng_seed)
-                winner = i if res == 1 else (j if res == 2 else None)
-            else:
-                res = play_game(agents[j], agents[i], seed=rng_seed)
-                winner = j if res == 1 else (i if res == 2 else None)
+            tasks.append((i, j, rng_seed, g % 2 == 0))
             rng_seed += 1
-            games[i, j] += 1
-            games[j, i] += 1
-            if winner is None:      # draw
-                wins[i, j] += 0.5
-                wins[j, i] += 0.5
-            elif winner == i:
-                wins[i, j] += 1.0
-            else:
-                wins[j, i] += 1.0
+    return tasks
 
+
+def record_result(wins, games, i, j, p1_is_i, res):
+    """Fold one game's raw `play_game` result (0/1/2) into the `wins`/`games` matrices."""
+    if res == 1:
+        winner = i if p1_is_i else j
+    elif res == 2:
+        winner = j if p1_is_i else i
+    else:
+        winner = None
+    games[i, j] += 1
+    games[j, i] += 1
+    if winner is None:      # draw
+        wins[i, j] += 0.5
+        wins[j, i] += 0.5
+    elif winner == i:
+        wins[i, j] += 1.0
+    else:
+        wins[j, i] += 1.0
+
+
+def _finalize_report(names, wins, games):
+    """Shared post-processing: win-rate matrix, BT ratings, intransitivity."""
     with np.errstate(invalid='ignore', divide='ignore'):
         win_rate = np.where(games > 0, wins / games, np.nan)
 
@@ -170,6 +229,28 @@ def round_robin(agents, *, k_games=20, seed=0):
         'ratings': dict(zip(names, ratings)),
         'intransitive_fraction': transitivity,
     }
+
+
+def round_robin(agents, *, k_games=20, seed=0):
+    """Play every pair K games with balanced colors.
+
+    Returns a dict with agent names, the wins/games/win-rate matrices (wins counts
+    draws as 0.5 to each side), Bradley-Terry ratings (Elo-scaled), and the
+    intransitive-triple fraction.
+    """
+    n = len(agents)
+    names = [a.name for a in agents]
+    wins = np.zeros((n, n), dtype=np.float64)   # wins[i,j] = i's score vs j (draw=0.5)
+    games = np.zeros((n, n), dtype=np.float64)
+
+    for i, j, game_seed, p1_is_i in build_task_list(n, k_games=k_games, seed=seed):
+        if p1_is_i:
+            res = play_game(agents[i], agents[j], seed=game_seed)
+        else:
+            res = play_game(agents[j], agents[i], seed=game_seed)
+        record_result(wins, games, i, j, p1_is_i, res)
+
+    return _finalize_report(names, wins, games)
 
 
 def _bradley_terry_elo(wins, *, n_iter=10000, tol=1e-10, anchor=1000.0, reg=1.0):
