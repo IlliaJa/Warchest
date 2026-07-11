@@ -50,12 +50,12 @@ def _build_specs(args):
     if not args.no_lookahead_critic:
         # Depends on a critic checkpoint that may not exist in every environment (e.g. a
         # fresh checkout with no training run yet) — skip with a warning rather than crash.
-        if not os.path.exists(args.lookahead_critic_path):
+        if not os.path.exists(DEFAULT_CRITIC_PATH):
             print(f'  ! skipping lookahead_critic: checkpoint not found at '
-                  f'{args.lookahead_critic_path}')
+                  f'{DEFAULT_CRITIC_PATH}')
         else:
             specs.append({'kind': 'lookahead_critic', 'name': 'lookahead_critic', 'kwargs': {
-                'critic_path': args.lookahead_critic_path,
+                'critic_path': DEFAULT_CRITIC_PATH,
                 'beam_width': args.lookahead_critic_beam_width,
                 'max_branching': args.lookahead_critic_max_branching,
                 'time_budget': args.lookahead_critic_time_budget,
