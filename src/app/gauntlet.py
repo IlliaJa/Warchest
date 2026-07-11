@@ -14,6 +14,7 @@ Examples:
 import argparse
 import glob
 import os
+import re
 import sys
 
 # Make `import src...` work when run as `python src/app/gauntlet.py` from the root.
@@ -23,7 +24,24 @@ import torch
 
 from src.services.gauntlet import round_robin, build_agent
 from src.services.gauntlet_parallel import round_robin_parallel
-from src.services.bots.lookahead_critic_bot import DEFAULT_CRITIC_PATH
+
+CRITIC_GLOB = 'data/lookahead_critic/lookahead_critic_v*.pth'
+
+
+def _latest_critic_path():
+    """Highest-numbered `lookahead_critic_v{N}.pth` under `data/lookahead_critic/`,
+    or None if no such checkpoint exists (gauntlet always plays the newest critic,
+    never a version pinned in code).
+    """
+    candidates = glob.glob(CRITIC_GLOB)
+    if not candidates:
+        return None
+
+    def version(path):
+        m = re.search(r'_v(\d+)\.pth$', os.path.basename(path))
+        return int(m.group(1)) if m else -1
+
+    return max(candidates, key=version)
 
 
 def _build_specs(args):
@@ -57,12 +75,12 @@ def _build_specs(args):
     if 'lookahead_critic' in args.bots:
         # Depends on a critic checkpoint that may not exist in every environment (e.g. a
         # fresh checkout with no training run yet) — skip with a warning rather than crash.
-        if not os.path.exists(DEFAULT_CRITIC_PATH):
-            print(f'  ! skipping lookahead_critic: checkpoint not found at '
-                  f'{DEFAULT_CRITIC_PATH}')
+        critic_path = _latest_critic_path()
+        if critic_path is None:
+            print(f'  ! skipping lookahead_critic: no checkpoint matching {CRITIC_GLOB}')
         else:
             specs.append({'kind': 'lookahead_critic', 'name': 'lookahead_critic', 'kwargs': {
-                'critic_path': DEFAULT_CRITIC_PATH,
+                'critic_path': critic_path,
                 'beam_width': args.lookahead_critic_beam_width,
                 'max_branching': args.lookahead_critic_max_branching,
                 'time_budget': args.lookahead_critic_time_budget,
