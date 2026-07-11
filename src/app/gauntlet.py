@@ -8,7 +8,8 @@ all-pairs with balanced colors, then prints the win-rate matrix, a Bradley-Terry
 Examples:
     python src/app/gauntlet.py                         # all data/*.pth + baselines
     python src/app/gauntlet.py --checkpoints a.pth b.pth --k-games 40
-    python src/app/gauntlet.py --no-lookahead           # drop the LookaheadBot baseline
+    python src/app/gauntlet.py --bots lookahead lookahead_critic policy greedy
+    python src/app/gauntlet.py --bots policy greedy    # drop the lookahead baselines
 """
 import argparse
 import glob
@@ -32,22 +33,28 @@ def _build_specs(args):
     used directly by the sequential path (built once, in-process) and shipped as-is
     to parallel workers (each worker rebuilds the whole field once from these specs;
     see `gauntlet_parallel.py` for why live agent objects can't just be pickled).
+
+    `args.bots` selects which participant kinds enter the field; a kind not listed
+    is simply skipped.
     """
     specs = []
-    paths = args.checkpoints
-    if paths is None:
-        paths = sorted(glob.glob('data/warchest_ppo_*.pth'))
-    for path in paths:
-        specs.append({'kind': 'policy', 'path': path})
-    if not args.no_greedy:
+    if 'policy' in args.bots:
+        paths = args.checkpoints
+        if paths is None:
+            paths = sorted(glob.glob('data/warchest_ppo_*.pth'))
+        for path in paths:
+            specs.append({'kind': 'policy', 'path': path})
+    if 'greedy' in args.bots:
         specs.append({'kind': 'greedy', 'name': 'greedy'})
-    if not args.no_lookahead:
+    if 'random' in args.bots:
+        specs.append({'kind': 'random', 'name': 'random'})
+    if 'lookahead' in args.bots:
         specs.append({'kind': 'lookahead', 'name': 'lookahead', 'kwargs': {
             'time_budget': args.lookahead_time_budget,
             'max_branching': args.lookahead_max_branching,
             'see_opponent_hand': not args.lookahead_blind,
         }})
-    if not args.no_lookahead_critic:
+    if 'lookahead_critic' in args.bots:
         # Depends on a critic checkpoint that may not exist in every environment (e.g. a
         # fresh checkout with no training run yet) — skip with a warning rather than crash.
         if not os.path.exists(DEFAULT_CRITIC_PATH):
@@ -111,24 +118,25 @@ def _print_report(out):
 
 def main():
     parser = argparse.ArgumentParser(description='Warchest round-robin gauntlet.')
+    parser.add_argument('--bots', nargs='+', default=['policy', 'greedy', 'lookahead', 'lookahead_critic'],
+                        choices=['policy', 'greedy', 'random', 'lookahead', 'lookahead_critic'],
+                        help='Participant kinds to include in the field. Default: '
+                             'policy greedy lookahead lookahead_critic. "policy" loads '
+                             'checkpoints per --checkpoints (or the data/*.pth glob); '
+                             'lookahead_critic is skipped with a warning if its checkpoint '
+                             'is missing.')
     parser.add_argument('--checkpoints', nargs='*', default=None,
-                        help='Policy .pth paths. Defaults to data/warchest_ppo_*.pth.')
+                        help='Policy .pth paths (used when "policy" is in --bots). '
+                             'Defaults to data/warchest_ppo_*.pth.')
     parser.add_argument('--k-games', type=int, default=20,
                         help='Games per pair (colors balanced). Default 20.')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--no-greedy', action='store_true', help='Drop the GreedyBot baseline.')
-    parser.add_argument('--no-lookahead', action='store_true',
-                        help='Drop the LookaheadBot baseline (on by default; its search '
-                             'budget makes every game much slower than the other baselines).')
     parser.add_argument('--lookahead-time-budget', type=float, default=0.1,
                         help='Per-move search budget in seconds, for LookaheadBot.')
     parser.add_argument('--lookahead-max-branching', type=int, default=8,
                         help='Branching cap per search node, for LookaheadBot.')
     parser.add_argument('--lookahead-blind', action='store_true',
                         help="LookaheadBot doesn't read the opponent's real hand (fair mode).")
-    parser.add_argument('--no-lookahead-critic', action='store_true',
-                        help='Drop the LookaheadCriticBot baseline (on by default; skipped '
-                             'automatically if its checkpoint is missing).')
     parser.add_argument('--lookahead-critic-beam-width', type=int, default=5,
                         help='Children kept per node, for LookaheadCriticBot.')
     parser.add_argument('--lookahead-critic-max-branching', type=int, default=8,
@@ -158,16 +166,23 @@ def main():
     if args.sequential:
         args.n_workers = 1
 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    print('Using device:', device)
+    detected_device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    # Gameplay device, not just what's auto-detected: parallel workers always force CPU
+    # (see --n-workers help), so `detected_device` is only actually used when sequential.
+    exec_device = detected_device if args.n_workers <= 1 else torch.device('cpu')
+    if args.n_workers > 1 and detected_device.type != 'cpu':
+        print(f'Using device: {exec_device} (auto-detected {detected_device} is unused — '
+              f'{args.n_workers} parallel workers always run on CPU)')
+    else:
+        print(f'Using device: {exec_device}')
 
     specs = _build_specs(args)
-    validate_device = device if args.n_workers <= 1 else torch.device('cpu')
-    specs, agents = _validate_specs(specs, validate_device)
+    specs, agents = _validate_specs(specs, exec_device)
     names = [a.name for a in agents]
 
     if len(specs) < 2:
-        raise SystemExit('Need at least 2 agents; pass --checkpoints or keep the baselines.')
+        raise SystemExit('Need at least 2 agents; pass --bots with more kinds (and '
+                          '--checkpoints if using policy).')
 
     print(f'Field ({len(specs)}): ' + ', '.join(names))
     print(f'Playing {args.k_games} games/pair ...')

@@ -70,6 +70,7 @@ count before any of the expensive per-action work happens; `time_budget`
 defaults higher (this bot is eval-only per docs/lookahead_bot_plan.md's scope
 note, never in the rollout hot path, so there's no speed floor to hit).
 """
+import random
 import time
 import types
 
@@ -155,6 +156,73 @@ class LookaheadCriticBot(LookaheadBot):
         opp_onehot[OPP_TYPE_IDX[opp_type]] = 1.0
         self._opp_onehot = torch.from_numpy(opp_onehot).to(device)
 
+        self._value_scale, self._value_shift = 1.0, 0.0
+        self._calibrate_value_scale()
+
+    def _calibrate_value_scale(self, n_games=8, n_samples=160, seed=12345):
+        """One-time affine fit recovering the critic's real reward-scale.
+
+        `Critic.value_batch` was trained against *normalised* returns (ppo.py's
+        `ReturnNormalizer`: an EMA of return mean/std, used to keep the critic's
+        loss scale stable — see its docstring). `ppo.py` always denormalises
+        (`value * std + mean`) before treating the critic's output as a real
+        value anywhere (rollout bootstrapping, GAE). That EMA is training-loop
+        state, never written to the checkpoint (`checkpoint.py` only saves
+        `state_dict`/`obs_version`/`arch`/`hidden_dim`), so the exact
+        denormalisation used when this checkpoint was saved can't be recovered
+        — feeding the network's raw output straight into `_beam_value`, which
+        sums it with real reward-scale path returns, was giving the critic's
+        contribution an arbitrary, depth-dependent weight relative to the real
+        rewards it's added to (nodes reached via more/fewer real-reward-bearing
+        steps ended up on incommensurable scales — confirmed to be the fix that
+        matters: swapping this bot's scoring for `_leaf_potential` outright,
+        same beam-search shape otherwise, beat GreedyBot 5/6 games where the raw
+        critic scored ~25%).
+
+        Matching the raw output's mean/std to `_leaf_potential`'s over a
+        handful of quick self-play rollouts recovers a substitute affine
+        correction: `_leaf_potential` is already reward-scale-correct (the
+        exact quantity `_minimax` sums real path rewards against), so aligning
+        the critic's first two moments to it makes the critic's *directional*
+        signal usable at a compatible scale, without needing the lost EMA.
+        """
+        rng = random.Random(seed)
+        states = []
+        env = self._sim_env
+        for g in range(n_games):
+            if len(states) >= n_samples:
+                break
+            env.reset(seed=seed + g)
+            done = False
+            while not done and len(states) < n_samples:
+                legal = env.get_possible_actions()
+                # Mostly the cheap ordering-key's pick (docs/lookahead_bot_plan.md's
+                # move-ordering heuristic) rather than pure uniform-random, so the
+                # sampled states resemble ones a real game/search actually reaches
+                # (random-vs-random wanders into board configurations neither this
+                # bot nor a real opponent would ever produce) — with a random
+                # fallback slice for state diversity.
+                if legal and rng.random() < 0.8:
+                    mover = env.active_player
+                    dist_grid = self._dist_grid_to_targets(self._capturable_bases(mover))
+                    melee_threat = self._melee_threatened_cells(mover)
+                    action = min(legal, key=lambda a: self._ordering_key(a, dist_grid, melee_threat, mover))
+                else:
+                    action = rng.choice(legal)
+                _, _, term, trunc, _ = env.step(action)
+                done = term or trunc
+                if not done:
+                    states.append(_clone_state(env.state))
+        if len(states) < 2:
+            return
+        raw = np.array(self._critic_values_raw(states))
+        heur = np.array([self._leaf_potential(s, s.active_player) for s in states])
+        raw_std = raw.std()
+        if raw_std < 1e-6:
+            return
+        self._value_scale = float(heur.std() / raw_std)
+        self._value_shift = float(heur.mean() - self._value_scale * raw.mean())
+
     def act(self, env) -> int:
         root_player = env.active_player
         legal = env.get_possible_actions()
@@ -169,10 +237,21 @@ class LookaheadCriticBot(LookaheadBot):
         depth = 0
         depth_reached = -1
         self._nodes_visited = 0
+        # Iterative deepening re-enters the *same* tree (root_state/root_queues
+        # are fixed for this whole act() call) at depth=0,1,2,... — every node
+        # a shallower pass already fully expanded, critic-scored and pruned to
+        # its beam survivors gets identically re-expanded from scratch by each
+        # deeper pass, since nothing about it changed. Caching a node's
+        # survivors, keyed by the path of action ids taken from root, turns
+        # each new outer-loop iteration into "extend the previous one" instead
+        # of "redo it plus one more ply" — the redundant work was small early
+        # on but geometric in the beam width, so it was a real fraction of the
+        # 0.5s budget by the time depth reached 2-3.
+        self._survivor_cache = {}
         while depth <= self.max_depth:
             try:
                 val, action = self._beam_value(root_state, root_queues, root_player,
-                                                depth, deadline, ply=0)
+                                                depth, deadline, ply=0, path=())
             except _TimeUp:
                 break
             if action is not None:
@@ -192,7 +271,32 @@ class LookaheadCriticBot(LookaheadBot):
 
     # ------------------------------------------------------------------
 
-    def _beam_value(self, state, queues, root_player, depth, deadline, ply):
+    def _beam_width_at(self, ply):
+        """Beam width narrows with ply: the root's own decision (`ply == 0`)
+        is what `act()` actually returns, so it keeps the full configured
+        width; deeper plies only exist to sanity-check that decision against a
+        real reply, so a narrower beam there is the cheap way to buy depth
+        instead of width. Per-node cost is critic-forward-dominated (module
+        docstring profiling), and cost multiplies across recursion levels, so
+        without this the search rarely got past depth 2-3 in the 0.5s budget
+        (vs. `LookaheadBot`'s alpha-beta reaching depth 4-6 in a fifth of the
+        time) — this bot only ever loses tactical races it can't see coming.
+        """
+        if ply <= 1:
+            return self.beam_width
+        return max(2, self.beam_width - (ply - 1))
+
+    def _max_branching_at(self, ply):
+        """Same rationale as `_beam_width_at`, applied to the raw-action cap
+        before cloning/applying/critic-scoring even starts.
+        """
+        if not self.max_branching:
+            return None
+        if ply <= 1:
+            return self.max_branching
+        return max(3, self.max_branching - 2 * (ply - 1))
+
+    def _beam_value(self, state, queues, root_player, depth, deadline, ply, path):
         """Root-perspective value of `state` plus the action that achieves it,
         searching `depth` more levels of beam-limited recursion.
 
@@ -206,49 +310,74 @@ class LookaheadCriticBot(LookaheadBot):
         shallow estimate with the deeper value, keeping the best/worst of those
         depending on `maximizing` — mirrors `_minimax`'s alpha-beta shape
         without the alpha-beta (pruning already happened via the critic).
+
+        `path` (the action ids taken from root to get here) identifies this
+        node stably across iterative-deepening passes within one `act()` call
+        (root_state/root_queues/the determinized future draws are all fixed
+        for the whole call, so the same path always reaches the same state) —
+        see `act()`'s `_survivor_cache` docstring.
         """
         if time.monotonic() >= deadline:
             raise _TimeUp
         self._nodes_visited += 1
 
-        mover = state.active_player
-        legal = self._legal_from(state)
-        maximizing = (mover == root_player)
-        holding = self._holding_reward(state, root_player) if maximizing else 0.0
-        discount = self.gamma ** ply
+        cached = self._survivor_cache.get(path)
+        if cached is not None:
+            survivors, maximizing = cached
+        else:
+            mover = state.active_player
+            legal = self._legal_from(state)
+            maximizing = (mover == root_player)
+            holding = self._holding_reward(state, root_player) if maximizing else 0.0
+            discount = self.gamma ** ply
+            max_branching = self._max_branching_at(ply)
 
-        if self.max_branching and len(legal) > self.max_branching:
-            dist_grid = self._dist_grid_to_targets(self._capturable_bases(mover))
-            melee_threat = self._melee_threatened_cells(mover)
-            legal = sorted(legal, key=lambda a: self._ordering_key(a, dist_grid, melee_threat, mover))
-            legal = legal[:self.max_branching]
+            if max_branching and len(legal) > max_branching:
+                dist_grid = self._dist_grid_to_targets(self._capturable_bases(mover))
+                melee_threat = self._melee_threatened_cells(mover)
+                legal = sorted(legal, key=lambda a: self._ordering_key(a, dist_grid, melee_threat, mover))
+                legal = legal[:max_branching]
 
-        children = []
-        for action_id in legal:
-            child_state = _clone_state(state)
-            child_queues = {1: list(queues[1]), 2: list(queues[2])}
-            result = self._apply(child_state, child_queues, action_id)
-            own_action = (result.player_id == root_player)
-            if result.finishes_game:
-                step_reward = result.reward if own_action else -result.reward
-                children.append(_Child(action_id, discount * step_reward, None, None, True))
-                continue
-            step_reward = (self._own_action_reward(result) if own_action else 0.0) + holding
-            partial = discount * step_reward
-            if child_state.round_number >= self._sim_env.max_rounds:
-                trunc = self._truncation_value(child_state, root_player) * self.gamma ** (ply + 1)
-                children.append(_Child(action_id, partial + trunc, None, None, True))
-            else:
-                children.append(_Child(action_id, partial, child_state, child_queues, False))
+            children = []
+            for action_id in legal:
+                child_state = _clone_state(state)
+                child_queues = {1: list(queues[1]), 2: list(queues[2])}
+                result = self._apply(child_state, child_queues, action_id)
+                own_action = (result.player_id == root_player)
+                if result.finishes_game:
+                    step_reward = result.reward if own_action else -result.reward
+                    children.append(_Child(action_id, discount * step_reward, None, None, True))
+                    continue
+                step_reward = (self._own_action_reward(result) if own_action else 0.0) + holding
+                partial = discount * step_reward
+                if child_state.round_number >= self._sim_env.max_rounds:
+                    trunc = self._truncation_value(child_state, root_player) * self.gamma ** (ply + 1)
+                    children.append(_Child(action_id, partial + trunc, None, None, True))
+                else:
+                    children.append(_Child(action_id, partial, child_state, child_queues, False))
 
-        pending = [c for c in children if not c.terminal]
-        if pending:
-            values = self._critic_root_values([c.state for c in pending], root_player)
-            for c, v in zip(pending, values):
-                c.est = c.partial_value + self.gamma ** (ply + 1) * v
+            pending = [c for c in children if not c.terminal]
+            if pending:
+                values = self._critic_root_values([c.state for c in pending], root_player)
+                for c, v in zip(pending, values):
+                    # Mostly critic, blended with `_leaf_potential`: the
+                    # critic is only ever calibrated to a *moment-matched*
+                    # scale (see `_calibrate_value_scale` — the checkpoint has
+                    # no ground truth to denormalise against), so blending in
+                    # the heuristic that `_minimax` already relies on
+                    # successfully hedges against the critic's own directional
+                    # accuracy being noisier than a fully-trained value
+                    # function's would be (this checkpoint is a 1500-episode
+                    # run — see module docstring). 0.7/0.3 measured best
+                    # against LookaheadBot (swept 1.0/0.5/0.4/0.3/0.2/0.0
+                    # critic weight; both a pure critic and a pure heuristic
+                    # scored markedly worse than this blend).
+                    heur = self._leaf_potential(c.state, root_player)
+                    c.est = c.partial_value + self.gamma ** (ply + 1) * (0.7 * v + 0.3 * heur)
 
-        children.sort(key=lambda c: c.est, reverse=maximizing)
-        survivors = children[:self.beam_width]
+            children.sort(key=lambda c: c.est, reverse=maximizing)
+            survivors = children[:self._beam_width_at(ply)]
+            self._survivor_cache[path] = (survivors, maximizing)
 
         if depth <= 0:
             best = survivors[0]
@@ -257,23 +386,22 @@ class LookaheadCriticBot(LookaheadBot):
         best_val, best_action = None, None
         for c in survivors:
             val = c.est if c.terminal else self._beam_value(
-                c.state, c.queues, root_player, depth - 1, deadline, ply + 1)[0]
+                c.state, c.queues, root_player, depth - 1, deadline, ply + 1, path + (c.action_id,))[0]
             if best_val is None or (maximizing and val > best_val) or (not maximizing and val < best_val):
                 best_val, best_action = val, c.action_id
         return best_val, best_action
 
-    def _critic_root_values(self, states, root_player):
-        """Root-perspective critic value for each state — a single batched
-        forward pass (see module docstring for the negamax sign flip).
+    def _critic_values_raw(self, states):
+        """Batched raw `Critic.value_batch` output — normalised scale, see
+        `_calibrate_value_scale`; not yet corrected, not yet sign-flipped.
         """
-        boards, globals_, privs, movers = [], [], [], []
+        boards, globals_, privs = [], [], []
         for state in states:
             self._sim_env.set_state(state)
             obs = self._sim_env.generate_observation()
             boards.append(obs['board'])
             globals_.append(obs['global'])
             privs.append(self._sim_env.get_privileged_features())
-            movers.append(state.active_player)
         batch = {
             'board': torch.from_numpy(np.stack(boards)).to(self.device),
             'global': torch.from_numpy(np.stack(globals_)).to(self.device),
@@ -281,5 +409,14 @@ class LookaheadCriticBot(LookaheadBot):
             'privileged': torch.from_numpy(np.stack(privs)).to(self.device),
         }
         with torch.inference_mode():
-            values = self._critic.value_batch(batch).cpu().numpy()
+            return self._critic.value_batch(batch).cpu().numpy()
+
+    def _critic_root_values(self, states, root_player):
+        """Root-perspective critic value for each state — a single batched
+        forward pass, rescaled onto real reward units (`_calibrate_value_scale`)
+        then sign-flipped (see module docstring for the negamax convention).
+        """
+        raw = self._critic_values_raw(states)
+        movers = [state.active_player for state in states]
+        values = raw * self._value_scale + self._value_shift
         return [v if m == root_player else -v for v, m in zip(values, movers)]
