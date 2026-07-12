@@ -173,7 +173,7 @@ def main():
     parser.add_argument('--lookahead-critic-max-branching', type=int, default=8,
                         help='Raw legal-action cap per node before critic scoring, '
                              'for LookaheadCriticBot.')
-    parser.add_argument('--lookahead-critic-time-budget', type=float, default=2.5,
+    parser.add_argument('--lookahead-critic-time-budget', type=float, default=0.1,
                         help='Per-move search budget in seconds, for LookaheadCriticBot '
                              '(higher than LookaheadBot\'s default: the critic\'s forward '
                              'pass costs much more per node than a hand-crafted heuristic).')

@@ -252,6 +252,9 @@ class WarChestEnv(gym.Env):
 
         self.state = None
         self.history = [] if save_game_history else None
+        # Semantic event log (draws/reshuffles/actions), gated on the same flag as
+        # `history` — see game_record.py for the schema and (de)serialization.
+        self.event_log = [] if save_game_history else None
         self.exploration_map_dict = None
         self.set_init_state()
 
@@ -294,6 +297,8 @@ class WarChestEnv(gym.Env):
         }
         self.state = GameState(board=board, active_player=owner, action_count=0,
                                initiative_owner=owner, compositions=compositions)
+        # Reset before the draw loop below, since `_draw_hand` appends into it.
+        self.event_log = [] if self.event_log is not None else None
         for pid in (1, 2):
             self.state.bags[pid] = build_bag(compositions[pid])
             self.state.supply[pid] = build_supply(compositions[pid])
@@ -371,6 +376,11 @@ class WarChestEnv(gym.Env):
                     break  # nothing left to draw
             coin = self._draw_one(player)
             self.state.hands[player][coin] += 1
+        if self.event_log is not None:
+            from .game_record import build_draw_event
+            self.event_log.append(build_draw_event(
+                player, self.state.round_number, list(self.state.hands[player].elements())
+            ))
 
     def _reshuffle(self, player: int):
         """Move the whole discard pile back into the bag; face-up info is lost."""
@@ -378,6 +388,9 @@ class WarChestEnv(gym.Env):
         self.state.bags[player] += self.state.discard_facedown[player]
         self.state.discard_faceup[player] = Counter()
         self.state.discard_facedown[player] = Counter()
+        if self.event_log is not None:
+            from .game_record import build_reshuffle_event
+            self.event_log.append(build_reshuffle_event(player, self.state.round_number))
 
     def _draw_one(self, player: int) -> int:
         """Remove and return one coin chosen uniformly from the bag's contents."""
@@ -423,6 +436,7 @@ class WarChestEnv(gym.Env):
         # During a pending sub-turn (a tactic mid-resolution) the same player keeps
         # acting and the action is a continuation click, dispatched separately from
         # the normal verb table; the turn only passes once `pending` clears.
+        _pre_target = None
         if self.state.pending is not None:
             # Capture the acting unit before it might move/die during the continuation,
             # so we can record the correct coin in last_coin for the history display.
@@ -435,6 +449,13 @@ class WarChestEnv(gym.Env):
             _cont_unit = None
             _cont_kind = None
             action_type, action_args = self.get_action_info(action_id)
+            # Attacks can eliminate the defender; capture its identity before resolving
+            # so the event log can still name it (mirrors the continuation capture above).
+            if self.event_log is not None and action_type == ATTACK_ACTION:
+                verb, r, q = action_args
+                dr, dq = self.board.offsets[verb - 6]
+                _t = self.board.get_unit_at(r + dr, q + dq)
+                _pre_target = (_t.id, _t.player_id) if _t is not None else None
             action = self.action_dict[action_type]['act_function'](*action_args)
             action.type = action_type
         action.id = action_id
@@ -453,6 +474,13 @@ class WarChestEnv(gym.Env):
                 self._advance_turn()
             if self.history is not None:
                 self.history.append(deepcopy(self.state))
+            if self.event_log is not None:
+                from .game_record import build_action_event, game_state_to_dict
+                state_dict = game_state_to_dict(self.history[-1]) if self.history is not None else None
+                self.event_log.append(build_action_event(
+                    self, action, cont_kind=_cont_kind, cont_unit=_cont_unit,
+                    pre_target=_pre_target, state_dict=state_dict,
+                ))
             # Safety net: if the newly active player has no valid actions, previous mover wins.
             # Pass is always legal so this path is nearly unreachable; skip in normal training.
             if self.debug_mode and not action.finishes_game and not self.get_possible_actions():

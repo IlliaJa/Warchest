@@ -14,6 +14,12 @@ uv sync
 
 This creates a `.venv/` and installs all dependencies (including a CUDA build of PyTorch). Prefix any command with `uv run` to execute it inside the environment.
 
+The interactive windows (`demo.py`'s replay viewer, `play.py`'s human-vs-model UI) render via matplotlib's TkAgg backend, which needs Tcl/Tk installed at the **system** level — it isn't a pip package, so it can't live in `pyproject.toml`. If `import tkinter` fails, install it for your Python version:
+
+```bash
+sudo apt install python3-tk
+```
+
 Weights & Biases is used for experiment tracking. Log in once before training:
 
 ```bash
@@ -65,6 +71,25 @@ uv run python -m src.app.demo --model-path data/warchest_ppo_20260628-1010.pth -
 - `--hidden-dim` — network width, must match the trained model (default 64)
 
 Use the **Previous / Next** buttons or keyboard shortcuts `←` / `→` (or `A` / `D`) to step through the game turn by turn.
+
+## Play against a trained model
+
+```bash
+uv run python -m src.app.play
+```
+
+Opens an interactive board: you play Player 1 (bottom) against the latest checkpoint (Player 2, auto-playing). Click a highlighted unit or hand coin to select it, then a highlighted cell/menu option to act — the UI walks you through move/attack/deploy/recruit/tactics one click at a time, skipping straight past any step that isn't a real choice (e.g. a forced tactic continuation). A live critic panel shows how the model currently scores the position for you. Every finished game is saved to `data/games/` (see `src/services/environment/game_record.py`) for later replay or analysis.
+
+Options:
+
+```bash
+uv run python -m src.app.play --model-path data/warchest_ppo_20260707-0026.pth --critic-path data/lookahead_critic/lookahead_critic_v2.pth
+```
+
+- `--model-path` — opponent checkpoint (defaults to the latest `data/warchest_ppo_*.pth`)
+- `--critic-path` — critic checkpoint for the eval panel (defaults to `data/lookahead_critic/lookahead_critic_v2.pth`; pass `""` to disable it)
+- `--opp-type` — `random` / `greedy` / `pool` (default), the critic's training-time opponent-identity input; `pool` is the closest proxy for a human opponent
+- `--save-dir` — where finished games are saved (default `data/games`)
 
 ## Further reading
 
