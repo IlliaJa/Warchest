@@ -88,7 +88,7 @@ OWNED_TOTAL = UNITS_PER_PLAYER * MAX_TOTAL + 1  # 21
 #   + pending-context one-hot (PENDING_CTX_DIM)
 PENDING_KINDS = (
     'move_then_attack:move',   # Cavalry: the move stage
-    'move_then_attack:attack',  # Cavalry: the (optional) attack stage
+    'move_then_attack:attack',  # Cavalry: the (mandatory) attack stage
     'ranged_attack',            # Archer/Crossbowman: SELECT a ranged target
     'bonus_move',               # Swordsman: an optional free move after attacking
     'extra_maneuver',           # Berserker: pay a stack coin to maneuver again

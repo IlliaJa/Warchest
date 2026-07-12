@@ -196,3 +196,15 @@ P4 (capacity) and P5 (economy shaping) from the same analysis followed on 2026-0
 | **Critic-only widening (Step 5)** | `critic_hidden_dim` 64 → 128, policy left at `hidden_dim=64`. Applied to the critic alone first — the critic's board encoder is independent of the policy's during PPO rollout — so any capacity gain is attributable to the densifier, not conflated with policy capacity. |
 | **Logging** | `score_material` and `shaping_anneal` added to per-batch logs and W&B. |
 | **Explicitly deferred** | `ATTACK_REWARD` (0.02) was **kept, not subsumed** into material PBRS — both currently fire on the same box-a-coin event, flagged for the next A/B (`docs/rewards.md`, `docs/IDEAS.md`). Widening the *policy* `hidden_dim` (not just the critic) is untested. The controlled A/B against the pre-change baseline is still owed (`docs/IDEAS.md` #3): a run started 2026-07-03 (`ppo_20260703-142941`) was in progress at time of writing. |
+
+---
+
+## Phase-4 tactic rule-correctness fixes (2026-07-12)
+
+*Source: bugs found while play-testing the human-vs-policy game (`src/app/play.py`). Both were rule discrepancies in the tactic/attribute resolution, not learning-loop changes; no `OBS_VERSION` bump (pending kinds unchanged).*
+
+| What was fixed | Detail |
+|---|---|
+| **Cavalry `move_then_attack`: attack is mandatory, not optional** | The tactic is *"move and then attack"* — both halves are required. Previously the attack step was `optional=True`, so the tactic could be started whenever the Cavalry could move and then degrade into a bare move-that-cost-a-coin. Now `_move_then_attack_moves` gates the tactic (and the move-step mask) to only those steps that land adjacent to an attackable enemy, and the follow-up attack step is `optional=False`. A Cavalry with no completable attack simply isn't offered the tactic (it still has a normal move). Earlier history row listed this as "move (mandatory) → attack (optional)" — that was the bug. |
+| **Warrior Priest bonus coin can start a tactic** | `bonus_action_after_attack_or_control` draws a coin and spends it on one action. `_bonus_actions` previously filtered out `TACTIC` verbs (a deliberate simplification to avoid nesting a second pending sub-turn), so e.g. a drawn Cavalry coin could never trigger the Cavalry's tactic — the option was greyed out. Now tactic-initiation is allowed; the tactic's own pending sub-turn replaces the `bonus_action` pending, and `_perform_continuation` only clears `pending` when the bonus action did *not* install a nested one (`self.state.pending is p`). |
+| **Tests** | `test_tactics.py`: attack step now asserted mandatory + new `test_cavalry_tactic_unavailable_without_a_completable_attack`. `test_attributes.py`: new `test_warrior_priest_bonus_coin_can_start_a_tactic`. Full suite: 116 passed. |

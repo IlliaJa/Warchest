@@ -1,6 +1,6 @@
 """Tactics: the pending sub-turn state machine plus each unit's tactic end-to-end.
 
-  Cavalry:  TACTIC@unit  →  move-dir (mandatory)  →  attack-dir (optional)
+  Cavalry:  TACTIC@unit  →  move-dir (mandatory)  →  attack-dir (mandatory)
   Archer:   TACTIC@unit  →  SELECT target (mandatory ranged attack, 2 away)
 
 Covers the reusable mechanism (a multi-step tactic resolves as masked continuation
@@ -53,9 +53,9 @@ def test_cavalry_tactic_full_move_then_attack():
     assert env.active_player == 1
     assert env.state.pending.kind == 'move_then_attack:attack' and env.state.pending.unit_loc == B
 
-    # 3) Attack step: optional (decline offered), and the adjacent enemy is targetable.
+    # 3) Attack step: mandatory (no decline), and the adjacent enemy is targetable.
     cont = env.get_possible_actions()
-    assert DECLINE_ACTION_ID in cont
+    assert DECLINE_ACTION_ID not in cont
     atk = WarChestEnv.encode_action(6 + ATK_DIR_B_TO_C, *B)
     assert atk in cont
     env.step(atk)
@@ -65,15 +65,28 @@ def test_cavalry_tactic_full_move_then_attack():
     assert env.state.pending is None
 
 
-def test_cavalry_attack_step_can_be_declined():
+def test_cavalry_attack_step_is_mandatory():
+    """'Move and then attack' — both halves are mandatory, so the attack cannot be
+    declined once the step lands next to an enemy."""
     env, cav, enemy = cavalry_scenario()
     env.step(WarChestEnv.encode_action(TACTIC_VERB, *A))
     env.step(WarChestEnv.encode_action(MOVE_DIR_A_TO_B, *A))
     assert env.state.pending.kind == 'move_then_attack:attack'
+    assert DECLINE_ACTION_ID not in env.get_possible_actions()
     _, _, _, _, info = env.step(DECLINE_ACTION_ID)
-    assert info['action'].is_valid
-    assert env.state.pending is None
-    assert env.board.get_unit_at(*C) is enemy  # untouched
+    assert not info['action'].is_valid          # cannot skip the mandatory attack
+    assert env.state.pending.kind == 'move_then_attack:attack'  # state unchanged
+    assert env.board.get_unit_at(*C) is enemy
+
+
+def test_cavalry_tactic_unavailable_without_a_completable_attack():
+    """With no move that ends adjacent to an enemy, the tactic cannot start — the
+    Cavalry falls back to a normal move (it never degrades into a bare move-tactic)."""
+    env, cav, enemy = cavalry_scenario()
+    env.board.remove_unit(enemy)                 # nothing left to attack anywhere
+    assert env.board.get_free_adjacent_cells(*A) # the Cavalry can still move normally
+    assert not env._tactic_startable(cav)
+    assert WarChestEnv.encode_action(TACTIC_VERB, *A) not in env.get_possible_actions()
 
 
 def test_cavalry_move_step_is_mandatory():

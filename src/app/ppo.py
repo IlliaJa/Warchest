@@ -159,12 +159,15 @@ class PPOTrainer:
             'p_random': hp['p_random_initial'],
             'p_greedy': hp['p_greedy_initial'],
             'p_pool': hp['p_pool_initial'],
+            'p_lookahead_critic': hp['p_lookahead_critic_initial'],
         }
         self._opp_weights_finetune = {
             'p_random': hp['p_random_finetune'],
             'p_greedy': hp['p_greedy_finetune'],
             'p_pool': hp['p_pool_finetune'],
+            'p_lookahead_critic': hp['p_lookahead_critic_finetune'],
         }
+        self._lookahead_critic_time_budget = hp['lookahead_critic_time_budget']
 
         # training-lifetime state (persists across batches).
         # Snapshotting rarely (vs every batch) makes the fixed-size pool span a wide skill
@@ -178,6 +181,8 @@ class PPOTrainer:
             p_random=hp['p_random_initial'],
             p_greedy=hp['p_greedy_initial'],
             p_pool=hp['p_pool_initial'],
+            p_lookahead_critic=hp['p_lookahead_critic_initial'],
+            lookahead_critic_time_budget=hp['lookahead_critic_time_budget'],
         )
         self._buffer = RolloutBuffer()
         self._greedy_bot = GreedyBot()
@@ -185,6 +190,7 @@ class PPOTrainer:
         self._score_deque = deque(maxlen=self._print_every * self._collect_episodes)
         self._wr_vs_pool = deque(maxlen=100)
         self._wr_vs_greedy = deque(maxlen=100)
+        self._wr_vs_lookahead_critic = deque(maxlen=100)
 
         # pre-computed once; actor-side params are needed for separate gradient clipping
         self._actor_side_params = list(self._policy.parameters())
@@ -324,6 +330,7 @@ class PPOTrainer:
                 policy_hidden_dim=self._policy_hidden_dim,
                 pool_max_size=self._pool_max_size,
                 seed_base=self._rollout_seed,
+                lookahead_critic_time_budget=self._lookahead_critic_time_budget,
             )
 
     def _submit_parallel(self, batch_num: int):
@@ -634,9 +641,13 @@ class PPOTrainer:
                 self._wr_vs_greedy.append(int(ep['outcome'] == 'win'))
             elif ep['opp_type'] == 'pool':
                 self._wr_vs_pool.append(int(ep['outcome'] == 'win'))
+            elif ep['opp_type'] == 'lookahead_critic':
+                self._wr_vs_lookahead_critic.append(int(ep['outcome'] == 'win'))
 
         wr_pool = float(np.mean(self._wr_vs_pool)) if self._wr_vs_pool else 0.0
         wr_greedy = float(np.mean(self._wr_vs_greedy)) if self._wr_vs_greedy else 0.0
+        wr_lookahead = (float(np.mean(self._wr_vs_lookahead_critic))
+                        if self._wr_vs_lookahead_critic else 0.0)
 
         s = update_stats
         avg_turns = float(np.mean([ep['turns'] for ep in self._batch_eps]))
@@ -683,7 +694,7 @@ class PPOTrainer:
         logger.info(
             f'batch={batch_num}/{self._n_batches} '
             f'score={np.mean(self._score_deque):.2f} '
-            f'wr_pool={wr_pool:.3f} wr_greedy={wr_greedy:.3f} '
+            f'wr_pool={wr_pool:.3f} wr_greedy={wr_greedy:.3f} wr_lookahead={wr_lookahead:.3f} '
             f'actor={s["avg_actor"]:.3e} critic={s["avg_critic"]:.4f} '
             f'kl={s["avg_kl"]:.4f} ent={s["avg_entropy"]:.3f} '
             f'ent_max={max_entropy:.3f} ent_frac={entropy_frac:.2f} '
@@ -704,6 +715,7 @@ class PPOTrainer:
                 'score_main': float(np.mean(self._score_deque)),
                 'wr_vs_pool_train': wr_pool,
                 'wr_vs_greedy_train': wr_greedy,
+                'wr_vs_lookahead_critic_train': wr_lookahead,
                 'actor_loss': s['avg_actor'],
                 'critic_loss': s['avg_critic'],
                 'approx_kl': s['avg_kl'],
@@ -784,15 +796,27 @@ if __name__ == '__main__':
         # the value variance), the classic underfit signature — width is the first lever.
         'critic_hidden_dim': 192,
         'print_every': 10,
-        # opponent sampling weights — initial phase (random opponent included)
-        'p_random_initial': 0.40,
-        'p_greedy_initial': 0.20,
-        'p_pool_initial': 0.40,
+        # opponent sampling weights — initial phase (random opponent included).
+        # lookahead_critic takes a fixed 15% slice; the other three keep their prior
+        # relative balance (×0.85). It is a search-based, critic-guided opponent
+        # (eval-scoped by design) so it runs at a small per-move budget in training —
+        # see lookahead_critic_time_budget below and docs/bots.md.
+        'p_random_initial': 0.34,
+        'p_greedy_initial': 0.17,
+        'p_pool_initial': 0.34,
+        'p_lookahead_critic_initial': 0.15,
         # opponent sampling weights — fine-tune phase (random removed from training).
-        # Greedy is a small fixed anchor (0.1); the rest is self-play against the wide-skill pool.
+        # Greedy is a small fixed anchor; the rest is self-play against the wide-skill
+        # pool, with lookahead_critic holding the same 15% slice.
         'p_random_finetune': 0.00,
-        'p_greedy_finetune': 0.10,
-        'p_pool_finetune': 0.90,
+        'p_greedy_finetune': 0.085,
+        'p_pool_finetune': 0.765,
+        'p_lookahead_critic_finetune': 0.15,
+        # per-move search budget for the lookahead_critic training opponent. Small on
+        # purpose: at its own 0.5s eval default a 15%-sampled search opponent would
+        # dominate rollout wall-clock. 0.1s keeps it a distinct, tougher opponent
+        # without wrecking throughput.
+        'lookahead_critic_time_budget': 0.1,
         # win-rate vs random that triggers the phase switch
         'wr_random_finetune_threshold': 0.90,
         # self-play pool cadence: snapshot rarely so the max_size-slot pool spans a wide

@@ -26,6 +26,32 @@ C_MAT = 0.015
 
 OPP_TYPE_IDX = {'random': 0, 'greedy': 1, 'pool': 2}
 
+# Which OPP_TYPE_IDX conditioning slot each opponent label maps to. The critic's
+# opponent one-hot is fixed at OPP_DIM=3 (policy.Critic) and existing checkpoints
+# are pinned to it, so a new training opponent cannot claim its own slot without
+# breaking arch compatibility. `lookahead_critic` therefore shares the `pool` slot
+# — a strong, self-play-derived opponent is its closest existing analogue (and the
+# same reason LookaheadCriticBot itself conditions on opp_type='pool' by default).
+# The label stays distinct everywhere else (sampling weights, win-rate metrics);
+# only the one-hot collapses it onto `pool`.
+OPP_ONEHOT_SLOT = {**OPP_TYPE_IDX, 'lookahead_critic': OPP_TYPE_IDX['pool']}
+
+
+def _opponent_env_action(opp, opp_type, env, obs, acting_pid):
+    """Absolute-frame action from a pool opponent, uniform across bot families.
+
+    Reactive bots (random/greedy/pool) read the ego-centric obs the previous
+    env.step already produced (free — no re-encode) and return an ego action we
+    un-rotate here. Search bots (lookahead_critic) read the live env instead: they
+    clone + forward-simulate the full unrotated state, which the lossy ego obs
+    cannot reconstruct, and already return an absolute action. One call site, the
+    only branch is which projection of the same state each family consumes.
+    """
+    if opp_type == 'lookahead_critic':
+        return opp.act(env)  # already absolute, un-rotated internally
+    action, _, _ = opp.act(obs)
+    return WarChestEnv.remap_action(action) if acting_pid == 2 else action
+
 
 def play_episode(env, policy, opp, main_pid, opp_type, *,
                  gamma, shaping_anneal, holding_reward_rate, max_t):
@@ -64,7 +90,7 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
     n_decisions = 0
 
     opp_onehot = np.zeros(len(OPP_TYPE_IDX), dtype=np.float32)
-    opp_onehot[OPP_TYPE_IDX[opp_type]] = 1.0
+    opp_onehot[OPP_ONEHOT_SLOT[opp_type]] = 1.0
 
     def _fold_terminal_reward(r):
         """Add a terminal/truncation reward onto this episode's last main-actor step."""
@@ -150,9 +176,8 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
         else:
             with torch.no_grad():
                 t0 = _pt()
-                action, _, _ = opp.act(state)
+                env_action = _opponent_env_action(opp, opp_type, env, state, acting_pid)
                 t_model_play += _pt() - t0
-            env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
             t0 = _pt()
             state, _, terminated, truncated, step_info = env.step(env_action)
             t_env += _pt() - t0

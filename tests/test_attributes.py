@@ -181,6 +181,31 @@ def test_warrior_priest_triggers_on_control():
     assert env.state.pending is not None and env.state.pending.kind == 'bonus_action'
 
 
+def test_warrior_priest_bonus_coin_can_start_a_tactic():
+    """A drawn coin whose unit has a tactic may spend the bonus on that tactic; the
+    tactic's own pending sub-turn replaces the bonus-action pending (no clobber)."""
+    env = blank_env(active=1)
+    env.state.compositions = {1: (WARRIOR_PRIEST, CAV), 2: (SWORDSMAN,)}
+    env.state.hands[1] = Counter({WARRIOR_PRIEST: 1})
+    env.state.hands[2] = Counter({SWORDSMAN: 1})       # keep the round alive after the bonus
+    env.state.bags = {1: Counter({CAV: 1}), 2: Counter({SWORDSMAN: 1})}
+    place(env, WARRIOR_PRIEST, 1, (3, 3), stack=1)
+    place(env, SWORDSMAN, 2, (3, 4), stack=1)          # WP's attack target
+    cav = place(env, CAV, 1, (5, 5), stack=1)
+    place(env, SWORDSMAN, 2, (5, 6), stack=1)          # enemy adjacent to the Cavalry's step target
+
+    env.step(WarChestEnv.encode_action(ATK2, 3, 3))    # WP attacks → draws the Cavalry coin
+    assert env.state.pending.kind == 'bonus_action'
+    assert env.state.pending.data['coin'] == CAV
+
+    tactic_id = WarChestEnv.encode_action(TACTIC_VERB, 5, 5)
+    assert tactic_id in env.get_possible_actions()      # tactic-initiate is now a legal bonus
+    env.step(tactic_id)
+    # The bonus pending gave way to the Cavalry's move-then-attack sub-turn.
+    assert env.state.pending is not None and env.state.pending.kind == 'move_then_attack:move'
+    assert env.state.hands[1][CAV] == 0                 # the drawn coin paid for the tactic
+
+
 # --------------------------------------------------------------------------- #
 # Cluster 4 — restrictions / deploy / on-defense attributes
 # --------------------------------------------------------------------------- #

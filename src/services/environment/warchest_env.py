@@ -995,14 +995,16 @@ class WarChestEnv(gym.Env):
 
     def _bonus_actions(self, coin: int):
         """Legal actions for a Warrior-Priest bonus turn: spend exactly the drawn coin
-        on one normal action. Tactic-initiation is excluded so the bonus cannot nest a
-        second pending sub-turn (a documented simplification of 'use it for any action').
+        on one normal action, including initiating a tactic the drawn coin pays for
+        (e.g. a drawn Cavalry coin may start the Cavalry's move-then-attack). A tactic
+        initiated here installs its own nested pending sub-turn, which replaces the
+        bonus-action pending (see `_perform_continuation`).
         """
         active = self.active_player
         saved = self.state.hands[active]
         self.state.hands[active] = Counter({coin: saved[coin]})
         try:
-            ids = [a for a in self._normal_actions() if VERB_OF_ACTION[a] != V_TACTIC]
+            ids = self._normal_actions()
         finally:
             self.state.hands[active] = saved
         return ids
@@ -1053,6 +1055,18 @@ class WarChestEnv(gym.Env):
     # follow-up clicks reuse the move/attack verbs and are masked by `pending`.
     # ------------------------------------------------------------------
 
+    def _move_then_attack_moves(self, unit):
+        """Free adjacent cells the Cavalry may step to from which it can then attack an
+        adjacent enemy. Both halves of move_then_attack are mandatory ('move and then
+        attack'), so a step is legal only if it sets up a completable attack — this also
+        keeps the mandatory attack step from softlocking."""
+        moves = []
+        for dest in self.board.get_free_adjacent_cells(*unit.loc):
+            if any(self._can_attack(unit, self.board.get_unit_at(*adj))
+                   for adj in self.board.get_adjacent_cells(*dest)):
+                moves.append(dest)
+        return moves
+
     def _tactic_startable(self, unit) -> bool:
         """Can this unit begin its tactic right now (pay coin in hand + a legal target)?"""
         info = UNIT_BY_ID[unit.id]
@@ -1062,7 +1076,7 @@ class WarChestEnv(gym.Env):
         params = info.tactic_params or {}
         loc = unit.loc
         if tac == 'move_then_attack':
-            return bool(self.board.get_free_adjacent_cells(*loc))
+            return bool(self._move_then_attack_moves(unit))
         if tac == 'ranged_attack':
             return bool(self._ranged_targets(loc, **params))
         if tac in ('move_to', 'royal_move'):
@@ -1466,8 +1480,10 @@ class WarChestEnv(gym.Env):
         ids = []
 
         if p.kind == 'move_then_attack:move':
+            # Only steps that set up the mandatory follow-up attack are legal.
+            legal_moves = self._move_then_attack_moves(self.board.get_unit_at(r, q))
             for d, (dr, dq) in enumerate(self.board.offsets):
-                if (r + dr, q + dq) in self.board.get_free_adjacent_cells(r, q):
+                if (r + dr, q + dq) in legal_moves:
                     ids.append(self.encode_action(d, r, q))  # reuse move verbs 0-5
         elif p.kind == 'move_then_attack:attack':
             mover = self.board.get_unit_at(r, q)
@@ -1585,7 +1601,10 @@ class WarChestEnv(gym.Env):
             action = self.action_dict[action_type]['act_function'](*action_args)
             action.type = action_type
             action.additional_info = action_args
-            if action.is_valid:
+            if action.is_valid and self.state.pending is p:
+                # A tactic-initiate bonus (perform_tactic_action) installs its own nested
+                # pending sub-turn, replacing `p`; leave that in place. Any other bonus
+                # action fully resolves here, so clear the bonus-action pending.
                 self.state.pending = None
             return action
 
@@ -1606,17 +1625,17 @@ class WarChestEnv(gym.Env):
                               txt_result='Must move first', is_valid=False)
             offset = self.board.offsets[verb]
             end = (r + offset[0], q + offset[1])
-            if end not in self.board.get_free_adjacent_cells(r, q):
-                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
-                              txt_result='Target cell not free', is_valid=False)
             unit = self.board.get_unit_at(r, q)
+            if end not in self._move_then_attack_moves(unit):
+                return Action(reward=INVALID_ACTION_REWARD, finishes_game=False,
+                              txt_result='Step must set up the mandatory attack', is_valid=False)
             unit.move(loc=end)
             self.exploration_map_dict[active][end] += 1
-            # Then attack — optional so a move into a position with no enemy adjacent
-            # is not a softlock (matches "attack, if able").
-            self.state.pending = Pending('move_then_attack:attack', unit_loc=end, optional=True)
+            # Both halves are mandatory: the step was restricted to attack-enabling cells,
+            # so an attackable enemy is guaranteed adjacent and the attack step is required.
+            self.state.pending = Pending('move_then_attack:attack', unit_loc=end, optional=False)
             return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
-                          txt_result='Moved; choose an attack', is_valid=True)
+                          txt_result='Moved; must now attack', is_valid=True)
 
         if p.kind == 'move_then_attack:attack':
             if (r, q) != p.unit_loc:

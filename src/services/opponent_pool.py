@@ -12,7 +12,9 @@ class OpponentPool:
     are renormalised between random and greedy.
     """
 
-    def __init__(self, max_size=20, snapshot_every=1, *, p_random, p_greedy, p_pool):
+    def __init__(self, max_size=20, snapshot_every=1, *, p_random, p_greedy, p_pool,
+                 p_lookahead_critic=0.0, lookahead_critic_time_budget=0.1,
+                 lookahead_critic_device='cpu'):
         self._snapshots = deque(maxlen=max_size)
         self._snapshot_every = snapshot_every
         self._batch_count = 0
@@ -21,23 +23,35 @@ class OpponentPool:
         # (see new_snapshots_since) instead of shipping the whole pool every batch.
         self._append_count = 0
         self._greedy_bot = GreedyBot()
-        self._weights = {'random': p_random, 'greedy': p_greedy, 'pool': p_pool}
+        self._weights = {'random': p_random, 'greedy': p_greedy, 'pool': p_pool,
+                         'lookahead_critic': p_lookahead_critic}
+        # LookaheadCriticBot is a search opponent: it is eval-scoped by design
+        # (docs/bots.md), so as a training opponent it runs at a much smaller
+        # per-move time_budget than its own default to keep rollout throughput
+        # viable. Built lazily on first sample (loads a Critic checkpoint +
+        # calibrates) and reused across episodes like the greedy/pool opponents,
+        # since a pool opponent is only ever active within one sequential episode.
+        self._lookahead_time_budget = lookahead_critic_time_budget
+        self._lookahead_device = lookahead_critic_device
+        self._lookahead_bot = None
         # Reused across sample() calls: a pool opponent is only ever active within a
         # single (sequential) episode, so one instance can be recycled — we swap its
         # weights via load_state_dict instead of reconstructing a net + re-transferring
         # to device every episode (was a per-episode cost during rollout collection).
         self._cached_opp = None
 
-    def set_weights(self, *, p_random, p_greedy, p_pool):
+    def set_weights(self, *, p_random, p_greedy, p_pool, p_lookahead_critic=0.0):
         """Replace sampling weights. Values are normalised automatically."""
-        self._weights = {'random': p_random, 'greedy': p_greedy, 'pool': p_pool}
+        self._weights = {'random': p_random, 'greedy': p_greedy, 'pool': p_pool,
+                         'lookahead_critic': p_lookahead_critic}
 
     @property
     def weights(self):
         """Current sampling weights as set_weights(**) kwargs (p_-prefixed)."""
         return {'p_random': self._weights['random'],
                 'p_greedy': self._weights['greedy'],
-                'p_pool': self._weights['pool']}
+                'p_pool': self._weights['pool'],
+                'p_lookahead_critic': self._weights['lookahead_critic']}
 
     def maybe_snapshot(self, policy):
         """Copy current policy weights into the pool (called after each batch update).
@@ -69,9 +83,28 @@ class OpponentPool:
         n_new = min(n_new, len(self._snapshots))
         return list(self._snapshots)[-n_new:], self._append_count
 
+    def _get_lookahead_bot(self):
+        """Lazily build (once) and return the shared LookaheadCriticBot. Imported
+        here, not at module top, so pools that never sample it (every parallel
+        worker before its weight is set, most eval paths) never pay the torch /
+        Critic-checkpoint import + calibration cost.
+        """
+        if self._lookahead_bot is None:
+            from .bots.lookahead_critic_bot import LookaheadCriticBot
+            self._lookahead_bot = LookaheadCriticBot(
+                time_budget=self._lookahead_time_budget,
+                device=self._lookahead_device,
+                stats_log_every=0,  # silent in the rollout hot path
+            )
+        return self._lookahead_bot
+
     def sample(self, policy_constructor, device):
         """Return (bot, opponent_type_str) sampled according to internal weights."""
-        types = ['random', 'greedy'] if not self._snapshots else ['random', 'greedy', 'pool']
+        types = ['random', 'greedy']
+        if self._snapshots:
+            types.append('pool')
+        if self._weights.get('lookahead_critic', 0.0) > 0.0:
+            types.append('lookahead_critic')
         weights = np.array([self._weights[t] for t in types], dtype=float)
         weights /= weights.sum()
         choice = np.random.choice(types, p=weights)
@@ -80,6 +113,8 @@ class OpponentPool:
             return RandomBot(), 'random'
         if choice == 'greedy':
             return self._greedy_bot, 'greedy'
+        if choice == 'lookahead_critic':
+            return self._get_lookahead_bot(), 'lookahead_critic'
         idx = np.random.randint(len(self._snapshots))
         if self._cached_opp is None:
             self._cached_opp = policy_constructor()

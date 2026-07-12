@@ -58,7 +58,9 @@ def _worker_loop(worker_id, task_q, result_q, counter, cfg):
     policy = policy_constructor()
     policy.eval()
     pool = OpponentPool(max_size=cfg['pool_max_size'], snapshot_every=10 ** 9,
-                        p_random=1.0, p_greedy=0.0, p_pool=0.0)
+                        p_random=1.0, p_greedy=0.0, p_pool=0.0, p_lookahead_critic=0.0,
+                        lookahead_critic_time_budget=cfg['lookahead_critic_time_budget'],
+                        lookahead_critic_device='cpu')
 
     def claim_episode():
         # Atomic decrement of the shared remaining-episode counter (dynamic load balancing:
@@ -142,7 +144,8 @@ class ParallelRolloutCollector:
     even for a fixed seed (documented tradeoff).
     """
 
-    def __init__(self, n_workers, *, policy_hidden_dim, pool_max_size, seed_base):
+    def __init__(self, n_workers, *, policy_hidden_dim, pool_max_size, seed_base,
+                 lookahead_critic_time_budget=0.1):
         self._ctx = mp.get_context('spawn')
         self._n = n_workers
         self._task_qs = [self._ctx.Queue() for _ in range(n_workers)]
@@ -153,6 +156,7 @@ class ParallelRolloutCollector:
             'policy_hidden_dim': policy_hidden_dim,
             'pool_max_size': pool_max_size,
             'seed_base': seed_base,
+            'lookahead_critic_time_budget': lookahead_critic_time_budget,
         }
         for wid in range(n_workers):
             p = self._ctx.Process(
