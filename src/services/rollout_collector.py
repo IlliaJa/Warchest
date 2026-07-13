@@ -85,6 +85,8 @@ def _worker_loop(worker_id, task_q, result_q, counter, cfg):
 
             obs_l, act_l, lp_l, rew_l, opp_l, priv_l = [], [], [], [], [], []
             ends, episode_dicts = [], []
+            collect_dense = cfg.get('collect_dense', False)
+            aux_parts = []  # per-episode dicts of dense aux samples (collect_dense only)
             t_env = t_model = 0.0
 
             while claim_episode():
@@ -96,6 +98,7 @@ def _worker_loop(worker_id, task_q, result_q, counter, cfg):
                     shaping_anneal=task['shaping_anneal'],
                     holding_reward_rate=task['holding_reward_rate'],
                     max_t=task['max_t'],
+                    collect_dense=collect_dense,
                 )
                 obs_l.extend(steps['obs'])
                 act_l.extend(steps['actions'])
@@ -104,6 +107,12 @@ def _worker_loop(worker_id, task_q, result_q, counter, cfg):
                 opp_l.extend(steps['opp_onehots'])
                 priv_l.extend(steps['privileged'])
                 ends.append(len(rew_l))
+                if collect_dense and 'aux_targets' in steps:
+                    aux_parts.append({
+                        'boards': steps['aux_boards'], 'globals': steps['aux_globals'],
+                        'opp_onehots': steps['aux_opp_onehots'],
+                        'privileged': steps['aux_privileged'], 'targets': steps['aux_targets'],
+                    })
                 t_env += ep.pop('t_env')
                 t_model += ep.pop('t_model_play')
                 episode_dicts.append(ep)
@@ -125,6 +134,16 @@ def _worker_loop(worker_id, task_q, result_q, counter, cfg):
                 }
             else:
                 payload = {'episode_ends': [], 'episode_dicts': []}
+            # Concatenate this worker's dense aux samples into one block for the buffer
+            # (None when the flag is off or no opponent nodes were seen — ingest skips it).
+            if aux_parts:
+                payload['aux'] = {
+                    'boards': np.concatenate([p['boards'] for p in aux_parts]),
+                    'globals': np.concatenate([p['globals'] for p in aux_parts]),
+                    'opp_onehots': np.concatenate([p['opp_onehots'] for p in aux_parts]),
+                    'privileged': np.concatenate([p['privileged'] for p in aux_parts]),
+                    'targets': np.concatenate([p['targets'] for p in aux_parts]),
+                }
             payload['t_env'] = t_env
             payload['t_model_play'] = t_model
             payload['t_worker_wall'] = time.perf_counter() - t_start
@@ -145,7 +164,7 @@ class ParallelRolloutCollector:
     """
 
     def __init__(self, n_workers, *, policy_hidden_dim, pool_max_size, seed_base,
-                 lookahead_critic_time_budget=0.1):
+                 lookahead_critic_time_budget=0.1, collect_dense=False):
         self._ctx = mp.get_context('spawn')
         self._n = n_workers
         self._task_qs = [self._ctx.Queue() for _ in range(n_workers)]
@@ -157,6 +176,7 @@ class ParallelRolloutCollector:
             'pool_max_size': pool_max_size,
             'seed_base': seed_base,
             'lookahead_critic_time_budget': lookahead_critic_time_budget,
+            'collect_dense': collect_dense,
         }
         for wid in range(n_workers):
             p = self._ctx.Process(

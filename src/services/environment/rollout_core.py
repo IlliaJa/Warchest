@@ -12,8 +12,10 @@ import time
 import numpy as np
 import torch
 
+from .roster import UNIT_BY_ID
 from .warchest_env import (
-    WarChestEnv, LOSS_REWARD, CLAIM_BASE_ACTION, ATTACK_ACTION,
+    WarChestEnv, LOSS_REWARD, CLAIM_BASE_ACTION, ATTACK_ACTION, BOLSTER_ACTION,
+    VERB_OF_ACTION, V_BOLSTER,
 )
 
 logger = logging.getLogger('warchest')
@@ -54,7 +56,8 @@ def _opponent_env_action(opp, opp_type, env, obs, acting_pid):
 
 
 def play_episode(env, policy, opp, main_pid, opp_type, *,
-                 gamma, shaping_anneal, holding_reward_rate, max_t):
+                 gamma, shaping_anneal, holding_reward_rate, max_t,
+                 collect_dense=False):
     """Run one episode; return (steps, episode_dict).
 
     ``steps`` is a dict of parallel per-decision lists for the main actor's transitions
@@ -68,6 +71,19 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
     ``episode_dict`` carries the score decomposition + metadata, plus ``t_env`` /
     ``t_model_play`` so the caller can accumulate timing (this function owns no trainer
     state). The critic is never called here — V(s) is computed in one batched pass later.
+
+    ``collect_dense`` (docs/next_steps.md — dense critic targets): also emit auxiliary
+    value-regression samples at every *opponent* decision node, so the critic gets
+    supervision on the half of the game tree the main stream never covers. Each such node
+    is scored from its (opponent) mover's perspective, conditioned on the `pool` opponent
+    slot (the passive side there is the learning policy ≈ a self-play snapshot — see
+    docs/bots.md; there is no "self" slot and none is needed). Targets are Monte-Carlo
+    return-to-go over a main-perspective per-ply reward stream, negated for the opponent's
+    perspective (rewards are antisymmetric, docs/rewards.md). The opponent's own small
+    per-move rewards are approximated as 0 (only terminal/truncation outcomes are folded
+    in); the main policy path (`obs_l`/`rew_l`/GAE) is left byte-for-byte unchanged, and
+    all dense work is gated on this flag so it costs nothing when off. The extra samples
+    are returned under ``steps['aux_*']`` and consumed only as an auxiliary critic loss.
     """
     _pt = time.perf_counter
     t_env = 0.0
@@ -82,6 +98,11 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
     outcome = 'truncated'
     invalid_count = 0
     claims = 0
+    bolster_count = 0
+    # Stricter subset of bolster_count: board + supply == the bolstered unit's full
+    # roster coin count (none of that type sits in hand/bag/discard, none boxed) —
+    # a "genuinely available, nothing lost" bolster (docs/IDEAS.md #8 bolster underuse).
+    bolster_fully_available_count = 0
     main_score = 0.0
     turns = 0
     opp_pid = 3 - main_pid  # absolute id of the main actor's opponent
@@ -92,10 +113,25 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
     opp_onehot = np.zeros(len(OPP_TYPE_IDX), dtype=np.float32)
     opp_onehot[OPP_ONEHOT_SLOT[opp_type]] = 1.0
 
+    # Dense-target accumulators (collect_dense only): one main-perspective reward per ply
+    # (main or opponent) for the Monte-Carlo return, plus the opponent-node samples.
+    ply_rewards = []
+    aux_boards, aux_globals, aux_priv, aux_ply_idx = [], [], [], []
+    dense_pool_onehot = None
+    if collect_dense:
+        dense_pool_onehot = np.zeros(len(OPP_TYPE_IDX), dtype=np.float32)
+        dense_pool_onehot[OPP_TYPE_IDX['pool']] = 1.0
+
     def _fold_terminal_reward(r):
         """Add a terminal/truncation reward onto this episode's last main-actor step."""
         if rew_l:
             rew_l[-1] += r
+
+    def _fold_dense_terminal(r):
+        """Mirror of _fold_terminal_reward for the dense per-ply reward stream: the terminal
+        outcome lands on whichever ply actually ended the game, not on the last main step."""
+        if collect_dense and ply_rewards:
+            ply_rewards[-1] += r
 
     for turn in range(max_t):
         acting_pid = env.active_player
@@ -124,6 +160,16 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
             phi_mat_before = C_MAT * (env.boxed_total(opp_pid) - env.boxed_total(main_pid))
             env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
 
+            # Bolster targets the unit already on the cell; decode+look it up before
+            # stepping (the mask guarantees a legal target, so this is only voided
+            # below if the action turns out invalid and gets replaced).
+            bolster_unit_id = None
+            if VERB_OF_ACTION[env_action] == V_BOLSTER:
+                _, br, bq = WarChestEnv.decode_action(env_action)
+                bolster_target = env.board.get_unit_at(br, bq)
+                if bolster_target is not None:
+                    bolster_unit_id = bolster_target.id
+
             t0 = _pt()
             state, reward, terminated, truncated, step_info = env.step(env_action)
             t_env += _pt() - t0
@@ -135,6 +181,16 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
                 state, reward, terminated, truncated, step_info = env.make_random_step()
                 t_env += _pt() - t0
                 log_prob = torch.tensor(0.0)
+
+            if (bolster_unit_id is not None and step_info['action'].is_valid
+                    and step_info['action'].type == BOLSTER_ACTION):
+                bolster_count += 1
+                supply_left = env.state.supply[main_pid].get(bolster_unit_id, 0)
+                board_total = sum(
+                    u.stack for u in env.board.units
+                    if u.player_id == main_pid and u.id == bolster_unit_id)
+                if board_total + supply_left == UNIT_BY_ID[bolster_unit_id].total_coins:
+                    bolster_fully_available_count += 1
 
             # state obs is ego-centric from whoever is now active; flip indices if it flipped to opponent
             if env.active_player == main_pid:
@@ -173,7 +229,18 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
             rew_l.append(shaped_reward)
             opp_l.append(opp_onehot)
             priv_l.append(privileged)
+            if collect_dense:
+                ply_rewards.append(shaped_reward)
         else:
+            if collect_dense:
+                # `state` is the opponent's own ego-centric decision-point obs (produced by
+                # the previous step, when the turn flipped to them); privileged features are
+                # read at this same node. Captured before the opponent moves so the sample is
+                # the value of the position with the opponent to move.
+                aux_boards.append(state['board'])
+                aux_globals.append(state['global'])
+                aux_priv.append(env.get_privileged_features())
+                aux_ply_idx.append(len(ply_rewards))
             with torch.no_grad():
                 t0 = _pt()
                 env_action = _opponent_env_action(opp, opp_type, env, state, acting_pid)
@@ -185,6 +252,10 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
                 t0 = _pt()
                 state, _, terminated, truncated, step_info = env.make_random_step()
                 t_env += _pt() - t0
+            if collect_dense:
+                # Opponent's own move earns the main player no direct reward; the terminal/
+                # truncation outcome is folded onto this ply below if the game ends here.
+                ply_rewards.append(0.0)
 
         if terminated:
             outcome = 'win' if acting_pid == main_pid else 'lose'
@@ -192,6 +263,9 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
                 _fold_terminal_reward(LOSS_REWARD)
                 main_score += LOSS_REWARD
                 r_terminal += LOSS_REWARD
+                # Opponent's winning move ended on an opponent ply; the main-perspective
+                # loss belongs there. (A main win already carries WIN in its own ply reward.)
+                _fold_dense_terminal(LOSS_REWARD)
             break
 
         if truncated:
@@ -211,6 +285,7 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
             _fold_terminal_reward(trunc_reward)
             main_score += trunc_reward
             r_terminal += trunc_reward
+            _fold_dense_terminal(trunc_reward)
             break
 
     steps = {
@@ -221,11 +296,29 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
         'opp_onehots': opp_l,
         'privileged': priv_l,
     }
+    if collect_dense and aux_boards:
+        # Monte-Carlo return-to-go over the main-perspective per-ply reward stream, then
+        # negated per opponent node (that node's mover is the opponent, whose value is the
+        # antisymmetric negative of the main player's return from the same ply).
+        n_ply = len(ply_rewards)
+        returns_to_go = np.empty(n_ply, dtype=np.float32)
+        running = 0.0
+        for t in range(n_ply - 1, -1, -1):
+            running = ply_rewards[t] + gamma * running
+            returns_to_go[t] = running
+        steps['aux_boards'] = np.stack(aux_boards)
+        steps['aux_globals'] = np.stack(aux_globals)
+        steps['aux_privileged'] = np.stack(aux_priv)
+        steps['aux_opp_onehots'] = np.tile(dense_pool_onehot, (len(aux_boards), 1))
+        steps['aux_targets'] = np.array([-returns_to_go[i] for i in aux_ply_idx],
+                                        dtype=np.float32)
     episode_dict = {
         'outcome': outcome,
         'turns': turns,
         'invalid_count': invalid_count,
         'claims': claims,
+        'bolster_count': bolster_count,
+        'bolster_fully_available_count': bolster_fully_available_count,
         'main_score': main_score,
         'main_pid': main_pid,
         'opp_type': opp_type,

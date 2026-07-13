@@ -20,9 +20,12 @@ kinds that happen to be picklable.
 
 import logging
 import multiprocessing as mp
+from logging.handlers import QueueHandler, QueueListener
 
 import numpy as np
-from tqdm import tqdm
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.progress import Progress
 
 from .gauntlet import build_task_list, record_result, _finalize_report
 
@@ -50,7 +53,7 @@ def _prioritize(tasks, agent_specs):
     return sorted(tasks, key=rank)
 
 
-def _worker_loop(worker_id, task_q, result_q, agent_specs):
+def _worker_loop(worker_id, task_q, result_q, log_q, agent_specs):
     """Persistent worker: build the whole agent field once, then play games until told to stop."""
     import os
     import sys
@@ -59,16 +62,26 @@ def _worker_loop(worker_id, task_q, result_q, agent_specs):
         sys.path.insert(0, root)
 
     # A spawned process (`mp.get_context('spawn')`, module docstring) is a fresh
-    # interpreter — it does not inherit gauntlet.py main()'s logging.basicConfig,
-    # so every actual game (and every bot's act()-time logging, e.g.
-    # LookaheadCriticBot's per-move/aggregate search stats) would otherwise log to
-    # nothing. `worker_id` (not just the OS pid) tags each line so interleaved
-    # output from multiple workers stays attributable.
-    logging.basicConfig(
-        level=logging.INFO,
-        format=f'%(asctime)s [%(levelname)s] [worker {worker_id}] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-    )
+    # interpreter — it does not inherit gauntlet.py main()'s logging config, so every
+    # actual game (and every bot's act()-time logging, e.g. LookaheadCriticBot's
+    # per-move/aggregate search stats) would otherwise log to nothing. Records are
+    # shipped over `log_q` to the main process rather than handled locally: N worker
+    # processes writing straight to the terminal race the main process's rich
+    # `Progress` redraw with no coordination, which corrupts the display (interleaved
+    # ANSI cursor moves). Routing every record through one process/Console lets rich
+    # suspend-and-redraw the bar cleanly around each line. `worker_id` is stamped onto
+    # each record (rather than baked into the message) so the main process can format
+    # it consistently for every worker.
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    handler = QueueHandler(log_q)
+
+    def _add_worker_id(record):
+        record.worker_id = worker_id
+        return True
+
+    handler.addFilter(_add_worker_id)
+    root_logger.addHandler(handler)
 
     import torch
     torch.set_num_threads(1)  # CRITICAL: else N workers x intra-op threads oversubscribe cores
@@ -120,13 +133,24 @@ def round_robin_parallel(agent_specs, names, *, k_games=20, seed=0, n_workers):
     ctx = mp.get_context('spawn')
     task_q = ctx.Queue()
     result_q = ctx.Queue()
+    log_q = ctx.Queue()
     for t in tasks:
         task_q.put(t)
     for _ in range(n_workers):
         task_q.put(None)  # one sentinel per worker so every worker exits cleanly
 
+    # One shared Console for both the log lines and the progress bar: rich only
+    # suspends/redraws the live bar cleanly around writes made through the same
+    # Console, so every worker's log record is replayed here rather than each
+    # worker writing to the terminal directly (see `_worker_loop`).
+    console = Console()
+    log_handler = RichHandler(console=console, show_path=False, markup=False)
+    log_handler.setFormatter(logging.Formatter('[worker %(worker_id)s] %(message)s'))
+    log_listener = QueueListener(log_q, log_handler)
+    log_listener.start()
+
     procs = [
-        ctx.Process(target=_worker_loop, args=(wid, task_q, result_q, agent_specs), daemon=True)
+        ctx.Process(target=_worker_loop, args=(wid, task_q, result_q, log_q, agent_specs), daemon=True)
         for wid in range(n_workers)
     ]
     for p in procs:
@@ -140,9 +164,11 @@ def round_robin_parallel(agent_specs, names, *, k_games=20, seed=0, n_workers):
             p.join(timeout=5)
             if p.is_alive():
                 p.terminate()
+        log_listener.stop()
 
     try:
-        with tqdm(total=len(tasks), desc='gauntlet', unit='game') as bar:
+        with Progress(console=console) as progress:
+            task_id = progress.add_task('gauntlet', total=len(tasks))
             for _ in range(len(tasks)):
                 worker_id, status, payload = result_q.get()
                 if status == 'ERROR':
@@ -150,7 +176,7 @@ def round_robin_parallel(agent_specs, names, *, k_games=20, seed=0, n_workers):
                     raise RuntimeError(f'gauntlet worker {worker_id} failed:\n{payload}')
                 i, j, p1_is_i, res = payload
                 record_result(wins, games, i, j, p1_is_i, res)
-                bar.update(1)
+                progress.update(task_id, advance=1)
     except BaseException:
         _shutdown()
         raise

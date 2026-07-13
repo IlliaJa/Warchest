@@ -27,6 +27,17 @@ from src.services.gauntlet import round_robin, build_agent
 from src.services.gauntlet_parallel import round_robin_parallel
 
 CRITIC_GLOB = 'data/lookahead_critic/lookahead_critic_v*.pth'
+POLICY_GLOB = 'data/warchest_ppo_*.pth'
+
+
+def _latest_policy_path():
+    """Newest `data/warchest_ppo_*.pth`, or None if none exist. The timestamped
+    filenames sort chronologically as plain strings, so the lexicographic max is
+    the most recent run (mirrors `_latest_critic_path`; used for policy_critic's
+    move-prior policy when --policy-critic-policy is not given).
+    """
+    candidates = glob.glob(POLICY_GLOB)
+    return max(candidates) if candidates else None
 
 
 def _latest_critic_path():
@@ -85,6 +96,43 @@ def _build_specs(args):
                 'beam_width': args.lookahead_critic_beam_width,
                 'max_branching': args.lookahead_critic_max_branching,
                 'time_budget': args.lookahead_critic_time_budget,
+                'see_opponent_hand': not args.lookahead_critic_blind,
+            }})
+    if 'policy_critic' in args.bots:
+        # Needs BOTH a critic checkpoint (for scoring) and a policy checkpoint (for the
+        # move prior); skip with a warning if either is missing rather than crash.
+        critic_path = _latest_critic_path()
+        policy_path = args.policy_critic_policy or _latest_policy_path()
+        if critic_path is None:
+            print(f'  ! skipping policy_critic: no critic checkpoint matching {CRITIC_GLOB}')
+        elif policy_path is None:
+            print(f'  ! skipping policy_critic: no policy checkpoint matching {POLICY_GLOB}')
+        else:
+            specs.append({'kind': 'policy_critic', 'name': 'policy_critic', 'kwargs': {
+                'critic_path': critic_path,
+                'policy_path': policy_path,
+                'beam_width': args.lookahead_critic_beam_width,
+                'max_branching': args.lookahead_critic_max_branching,
+                'time_budget': args.lookahead_critic_time_budget,
+                'see_opponent_hand': not args.lookahead_critic_blind,
+            }})
+    if 'round_critic' in args.bots:
+        # Same checkpoint requirements as policy_critic (it IS a PolicyCriticBot,
+        # just round-bounded); reuses the shared --lookahead-critic-* search knobs.
+        critic_path = _latest_critic_path()
+        policy_path = args.policy_critic_policy or _latest_policy_path()
+        if critic_path is None:
+            print(f'  ! skipping round_critic: no critic checkpoint matching {CRITIC_GLOB}')
+        elif policy_path is None:
+            print(f'  ! skipping round_critic: no policy checkpoint matching {POLICY_GLOB}')
+        else:
+            specs.append({'kind': 'round_critic', 'name': 'round_critic', 'kwargs': {
+                'critic_path': critic_path,
+                'policy_path': policy_path,
+                'beam_width': args.lookahead_critic_beam_width,
+                'max_branching': args.lookahead_critic_max_branching,
+                # No time_budget: round_critic searches each round to its end
+                # (unbounded by default; max_depth is the only backstop).
                 'see_opponent_hand': not args.lookahead_critic_blind,
             }})
     return specs
@@ -149,13 +197,16 @@ def main():
                          datefmt='%Y-%m-%d %H:%M:%S')
 
     parser = argparse.ArgumentParser(description='Warchest round-robin gauntlet.')
-    parser.add_argument('--bots', nargs='+', default=['policy', 'greedy', 'lookahead', 'lookahead_critic'],
-                        choices=['policy', 'greedy', 'random', 'lookahead', 'lookahead_critic'],
+    parser.add_argument('--bots', nargs='+',
+                        default=['policy', 'greedy', 'lookahead', 'lookahead_critic', 'policy_critic'],
+                        choices=['policy', 'greedy', 'random', 'lookahead', 'lookahead_critic',
+                                 'policy_critic', 'round_critic'],
                         help='Participant kinds to include in the field. Default: '
-                             'policy greedy lookahead lookahead_critic. "policy" loads '
-                             'checkpoints per --checkpoints (or the data/*.pth glob); '
-                             'lookahead_critic is skipped with a warning if its checkpoint '
-                             'is missing.')
+                             'policy greedy lookahead lookahead_critic policy_critic. "policy" '
+                             'loads checkpoints per --checkpoints (or the data/*.pth glob); '
+                             'lookahead_critic, policy_critic and round_critic are skipped with '
+                             'a warning if their required checkpoint is missing. round_critic is '
+                             'available but off by default (add it explicitly to compare).')
     parser.add_argument('--checkpoints', nargs='*', default=None,
                         help='Policy .pth paths (used when "policy" is in --bots). '
                              'Defaults to data/warchest_ppo_*.pth.')
@@ -180,6 +231,11 @@ def main():
     parser.add_argument('--lookahead-critic-blind', action='store_true',
                         help="LookaheadCriticBot doesn't read the opponent's real hand "
                              "(fair mode).")
+    parser.add_argument('--policy-critic-policy', default=None,
+                        help='Policy .pth whose actor supplies policy_critic\'s move prior. '
+                             'Defaults to the newest data/warchest_ppo_*.pth. The beam width, '
+                             'branching cap, time budget and blind flag are shared with the '
+                             '--lookahead-critic-* options (both bots run the same search).')
     parser.add_argument('--n-workers', type=int, default=min(os.cpu_count() or 4, 8),
                         help='Parallel worker processes for game play. Default: '
                              'min(cpu_count, 8). 1 (or --sequential) plays in-process on '

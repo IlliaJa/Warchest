@@ -25,6 +25,8 @@ from .bots.greedy_bot import GreedyBot
 from .bots.random_bot import RandomBot
 from .bots.lookahead_bot import LookaheadBot
 from .bots.lookahead_critic_bot import LookaheadCriticBot
+from .bots.policy_critic_bot import PolicyCriticBot
+from .bots.round_critic_bot import RoundCriticBot
 from .policy.checkpoint import load_policy_checkpoint
 from .policy.policy import Policy
 
@@ -92,6 +94,20 @@ def lookahead_critic_agent(name='lookahead_critic', **kwargs):
     return LookaheadCriticBot(name=name, **kwargs)
 
 
+def policy_critic_agent(name='policy_critic', **kwargs):
+    """PolicyCriticBot (policy-prior candidates + critic scoring), same `act(env)`
+    contract as LookaheadCriticBot — drops in directly.
+    """
+    return PolicyCriticBot(name=name, **kwargs)
+
+
+def round_critic_agent(name='round_critic', **kwargs):
+    """RoundCriticBot (PolicyCriticBot that searches to the end of the current
+    round), same `act(env)` contract — drops in directly.
+    """
+    return RoundCriticBot(name=name, **kwargs)
+
+
 def checkpoint_agent(path, device):
     """Build a PolicyAgent from a checkpoint, or None if it can't be reconstructed.
 
@@ -133,6 +149,10 @@ def build_agent(spec, *, device):
         return lookahead_agent(spec['name'], **spec.get('kwargs', {}))
     if kind == 'lookahead_critic':
         return lookahead_critic_agent(spec['name'], device=device, **spec.get('kwargs', {}))
+    if kind == 'policy_critic':
+        return policy_critic_agent(spec['name'], device=device, **spec.get('kwargs', {}))
+    if kind == 'round_critic':
+        return round_critic_agent(spec['name'], device=device, **spec.get('kwargs', {}))
     if kind == 'policy':
         agent = checkpoint_agent(spec['path'], device)
         if agent is None:

@@ -30,6 +30,17 @@ class RolloutBuffer:
         self._actions_arr = None
         self._lp_old = None
         self._vals_old = None
+        # Auxiliary dense-critic-target stream (opponent-decision nodes; see
+        # rollout_core.play_episode collect_dense). Value-only: no action/log_prob/advantage,
+        # trained by a separate MC-return regression in the critic update. Empty unless the
+        # dense-targets flag is on. `_aux_parts` accumulates per-episode dicts (serial path);
+        # stack()/ingest_chunks() concatenate them into the `_aux_*_arr` arrays.
+        self._aux_parts = []
+        self._aux_boards_arr = None
+        self._aux_globals_arr = None
+        self._aux_opp_arr = None
+        self._aux_priv_arr = None
+        self._aux_targets_arr = None
 
     def add_step(self, obs, action, log_prob, reward, opp_onehot, privileged):
         self._obs.append(obs)
@@ -38,6 +49,25 @@ class RolloutBuffer:
         self._rewards.append(float(reward))
         self._opp_onehots.append(opp_onehot)
         self._privileged.append(privileged)
+
+    def add_aux_steps(self, boards, globals_, opp_onehots, privileged, targets):
+        """Append one episode's dense auxiliary samples (serial path). Arrays are the
+        `steps['aux_*']` numpy blocks produced by play_episode(collect_dense=True)."""
+        self._aux_parts.append({
+            'boards': boards, 'globals': globals_, 'opp_onehots': opp_onehots,
+            'privileged': privileged, 'targets': targets,
+        })
+
+    def _stack_aux(self, parts):
+        """Concatenate accumulated aux parts into the `_aux_*_arr` arrays (or leave None)."""
+        parts = [p for p in parts if p is not None and len(p['targets'])]
+        if not parts:
+            return
+        self._aux_boards_arr = np.concatenate([p['boards'] for p in parts])
+        self._aux_globals_arr = np.concatenate([p['globals'] for p in parts])
+        self._aux_opp_arr = np.concatenate([p['opp_onehots'] for p in parts])
+        self._aux_priv_arr = np.concatenate([p['privileged'] for p in parts])
+        self._aux_targets_arr = np.concatenate([p['targets'] for p in parts]).astype(np.float32)
 
     def stack(self):
         """Stack per-step lists into contiguous arrays for batched forward passes.
@@ -54,6 +84,7 @@ class RolloutBuffer:
         self._privileged_arr = np.stack(self._privileged)
         self._actions_arr = np.array(self._actions, dtype=np.int64)
         self._lp_old = torch.stack(self._log_probs_old)    # cached once; sliced per minibatch
+        self._stack_aux(self._aux_parts)
 
     def value_input_chunks(self, device, chunk_size):
         """Yield critic-input batch dicts over all stored states, in fixed order.
@@ -106,6 +137,8 @@ class RolloutBuffer:
             ends.extend(int(e + offset) for e in c['episode_ends'])
             offset += len(c['rewards'])
         self._episode_ends = ends
+        # Dense aux stream: workers that collected any emit an 'aux' block; concatenate them.
+        self._stack_aux([c.get('aux') for c in chunks])
 
     def end_episode(self):
         self._episode_ends.append(len(self._rewards))
@@ -174,6 +207,32 @@ class RolloutBuffer:
                 'returns':        self.returns[idx],
             }
 
+    def n_aux(self):
+        """Number of stored auxiliary (dense) samples."""
+        return 0 if self._aux_targets_arr is None else len(self._aux_targets_arr)
+
+    def iter_aux_minibatches(self, batch_size, device):
+        """Yield critic-input minibatches for the dense auxiliary value regression.
+
+        Keys match Critic.value_batch (board/global/opp_onehot/privileged) plus `targets`
+        (raw-return-scale MC targets). No advantages/log-probs — these states are value-only.
+        Yields nothing when the dense stream is empty (flag off), so the caller's loop is a
+        no-op in that case.
+        """
+        if self._aux_targets_arr is None:
+            return
+        n = len(self._aux_targets_arr)
+        perm = np.random.permutation(n)
+        for start in range(0, n, batch_size):
+            idx = perm[start:start + batch_size]
+            yield {
+                'board':      torch.from_numpy(self._aux_boards_arr[idx]).to(device),
+                'global':     torch.from_numpy(self._aux_globals_arr[idx]).to(device),
+                'opp_onehot': torch.from_numpy(self._aux_opp_arr[idx]).to(device),
+                'privileged': torch.from_numpy(self._aux_priv_arr[idx]).to(device),
+                'targets':    torch.from_numpy(self._aux_targets_arr[idx]).to(device),
+            }
+
     def iterate(self):
         """Yield (obs, action, log_prob_old, advantage, return_) in random order."""
         lp_old = self._lp_old if self._lp_old is not None else torch.stack(self._log_probs_old)
@@ -205,6 +264,12 @@ class RolloutBuffer:
         self._actions_arr = None
         self._lp_old = None
         self._vals_old = None
+        self._aux_parts = []
+        self._aux_boards_arr = None
+        self._aux_globals_arr = None
+        self._aux_opp_arr = None
+        self._aux_priv_arr = None
+        self._aux_targets_arr = None
 
     def __len__(self):
         # _boards is authoritative once populated (parallel path has no _obs dicts).

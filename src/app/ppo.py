@@ -168,6 +168,12 @@ class PPOTrainer:
             'p_lookahead_critic': hp['p_lookahead_critic_finetune'],
         }
         self._lookahead_critic_time_budget = hp['lookahead_critic_time_budget']
+        # Dense critic targets (docs/next_steps.md): also regress the critic on opponent-
+        # decision nodes via an auxiliary MC-return loss, on top of the unchanged main GAE
+        # targets. Off by default — an opt-in experiment; the aux loss is scaled by
+        # `aux_critic_coeff` so it stays a secondary supervision signal.
+        self._dense_critic = hp.get('dense_critic_targets', False)
+        self._aux_critic_coeff = hp.get('aux_critic_coeff', 0.5)
 
         # training-lifetime state (persists across batches).
         # Snapshotting rarely (vs every batch) makes the fixed-size pool span a wide skill
@@ -331,6 +337,7 @@ class PPOTrainer:
                 pool_max_size=self._pool_max_size,
                 seed_base=self._rollout_seed,
                 lookahead_critic_time_budget=self._lookahead_critic_time_budget,
+                collect_dense=self._dense_critic,
             )
 
     def _submit_parallel(self, batch_num: int):
@@ -397,12 +404,18 @@ class PPOTrainer:
             shaping_anneal=self._shaping_anneal,
             holding_reward_rate=self._holding_reward_rate,
             max_t=self._max_t,
+            collect_dense=self._dense_critic,
         )
         for obs, action, log_prob, reward, opp_onehot, privileged in zip(
             steps['obs'], steps['actions'], steps['log_probs'],
             steps['rewards'], steps['opp_onehots'], steps['privileged'],
         ):
             self._buffer.add_step(obs, action, log_prob, reward, opp_onehot, privileged)
+        if self._dense_critic and 'aux_targets' in steps:
+            self._buffer.add_aux_steps(
+                steps['aux_boards'], steps['aux_globals'], steps['aux_opp_onehots'],
+                steps['aux_privileged'], steps['aux_targets'],
+            )
         self._buffer.end_episode()
 
         self._t_env += ep.pop('t_env')
@@ -540,6 +553,35 @@ class PPOTrainer:
                 critic_std_accum += val_raw.std(correction=0).item()
                 n_critic_updates += 1
 
+        # Auxiliary dense-target regression (dense_critic_targets only): plain MSE against
+        # the opponent-node MC targets (no PPO value clip — these states have no v_old), run
+        # for the same epoch count and scaled by aux_critic_coeff so it stays secondary. A
+        # no-op when the flag is off (iter_aux_minibatches yields nothing).
+        aux_accum = 0.0
+        n_aux_updates = 0
+        if self._dense_critic:
+            for _ in range(self._ppo_epochs):
+                for abatch in self._buffer.iter_aux_minibatches(self._minibatch_size, self._device):
+                    tgt_n = self._ret_normalizer.normalize(abatch['targets'])
+                    aval_n = self._critic.value_batch(abatch)
+                    aux_loss = self._aux_critic_coeff * 0.5 * ((aval_n - tgt_n) ** 2).mean()
+
+                    self._critic_optimizer.zero_grad(set_to_none=True)
+                    aux_loss.backward()
+                    has_nan = any(
+                        torch.isnan(p.grad).any()
+                        for p in self._critic.parameters() if p.grad is not None
+                    )
+                    last_critic_grad = torch.nn.utils.clip_grad_norm_(
+                        self._critic.parameters(), max_norm=1.0
+                    ).item()
+                    if not has_nan:
+                        self._critic_optimizer.step()
+                    else:
+                        logger.error(f'batch={batch_num} aux-critic NaN gradient, skipping step')
+                    aux_accum += aux_loss.item()
+                    n_aux_updates += 1
+
         denom = max(n_critic_updates, 1)
         return {
             'avg_critic': critic_accum / denom,
@@ -548,6 +590,8 @@ class PPOTrainer:
             'avg_critic_std': critic_std_accum / denom,
             'last_critic_grad': last_critic_grad,
             'n_critic_updates': n_critic_updates,
+            'avg_aux_critic': aux_accum / max(n_aux_updates, 1),
+            'n_aux_samples': self._buffer.n_aux(),
         }
 
     # ------------------------------------------------------------------
@@ -652,6 +696,12 @@ class PPOTrainer:
         s = update_stats
         avg_turns = float(np.mean([ep['turns'] for ep in self._batch_eps]))
         total_invalid = sum(ep['invalid_count'] for ep in self._batch_eps)
+        n_eps = len(self._batch_eps)
+        # Bolster usage (docs/IDEAS.md #8 — measured as near-zero pre-Material-PBRS).
+        # Tracked per batch so a training run shows whether/when the rate moves.
+        bolster_per_ep = sum(ep['bolster_count'] for ep in self._batch_eps) / n_eps
+        bolster_fully_available_per_ep = (
+            sum(ep['bolster_fully_available_count'] for ep in self._batch_eps) / n_eps)
 
         # per-episode mean of each score component (sums to score)
         r_attack = float(np.mean([ep['r_attack'] for ep in self._batch_eps]))
@@ -696,7 +746,9 @@ class PPOTrainer:
             f'score={np.mean(self._score_deque):.2f} '
             f'wr_pool={wr_pool:.3f} wr_greedy={wr_greedy:.3f} wr_lookahead={wr_lookahead:.3f} '
             f'actor={s["avg_actor"]:.3e} critic={s["avg_critic"]:.4f} '
-            f'kl={s["avg_kl"]:.4f} ent={s["avg_entropy"]:.3f} '
+            + (f'aux_critic={s["avg_aux_critic"]:.4f} n_aux={s["n_aux_samples"]} '
+               if self._dense_critic else '')
+            + f'kl={s["avg_kl"]:.4f} ent={s["avg_entropy"]:.3f} '
             f'ent_max={max_entropy:.3f} ent_frac={entropy_frac:.2f} '
             f'ent_c={self._entropy_coeff:.4f} lr={self._actor_optimizer.param_groups[0]["lr"]:.2e} '
             f'grad_a={s["last_actor_grad"]:.3f} grad_c={s["last_critic_grad"]:.3f} '
@@ -708,6 +760,10 @@ class PPOTrainer:
             f'attack={r_attack:.3f} shaping={r_shaping:.3f} holding={r_holding:.3f} '
             f'material={r_material:.3f} terminal={r_terminal:.3f} other={r_other:.3f} '
             f'anneal={self._shaping_anneal:.3f}'
+        )
+        logger.info(
+            f'batch={batch_num} bolster_per_ep={bolster_per_ep:.3f} '
+            f'bolster_fully_available_per_ep={bolster_fully_available_per_ep:.3f}'
         )
 
         if use_wandb:
@@ -737,10 +793,27 @@ class PPOTrainer:
                 'score_terminal': r_terminal,
                 'score_other': r_other,
                 'shaping_anneal': self._shaping_anneal,
+                'bolster_per_ep': bolster_per_ep,
+                'bolster_fully_available_per_ep': bolster_fully_available_per_ep,
+                **({'aux_critic_loss': s['avg_aux_critic'], 'n_aux_samples': s['n_aux_samples']}
+                   if self._dense_critic else {}),
             })
 
 
 if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Train the Warchest agent with PPO.')
+    parser.add_argument(
+        '--dense-critic-targets', action='store_true',
+        help='Also regress the critic on opponent-decision nodes via an auxiliary MC-return '
+             'loss (docs/next_steps.md). Off by default; opt-in experiment. Save both this '
+             "run's and a baseline run's critic to compare (see the gauntlet measurement plan).")
+    parser.add_argument(
+        '--aux-critic-coeff', type=float, default=0.5,
+        help='Weight of the dense auxiliary critic loss (only used with --dense-critic-targets).')
+    cli_args = parser.parse_args()
+
     use_wandb = True
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -823,6 +896,11 @@ if __name__ == '__main__':
         # skill range (~pool_max_size * pool_snapshot_every batches) rather than near-copies.
         'pool_max_size': 20,
         'pool_snapshot_every': 15,
+        # Dense critic targets (opt-in via --dense-critic-targets; docs/next_steps.md). Adds
+        # an auxiliary MC-return regression on opponent-decision nodes, leaving the policy
+        # path and main critic targets unchanged.
+        'dense_critic_targets': cli_args.dense_critic_targets,
+        'aux_critic_coeff': cli_args.aux_critic_coeff,
     }
     logger.info(f'hyperparameters={hp}')
 

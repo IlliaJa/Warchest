@@ -13,6 +13,7 @@ Two-phase click model (see play_controller.py's docstring for the full rationale
 The opponent (always P2) auto-plays via a `GauntletAgent`-compatible `act(env)`;
 its moves animate with a short pause between them.
 """
+import copy
 import os
 import time
 
@@ -66,12 +67,23 @@ class PlayRenderer:
         self.save_dir = save_dir
 
         self.opp_onehot = None
+        self._eval_env = None
         if critic is not None:
             onehot = np.zeros(len(OPP_TYPE_IDX), dtype=np.float32)
             onehot[OPP_TYPE_IDX.get(opp_type, OPP_TYPE_IDX['pool'])] = 1.0
             self.opp_onehot = torch.from_numpy(onehot).unsqueeze(0).to(critic.device)
+            # Scratch env for the eval overlay's one-ply lookahead (see _reliable_value):
+            # we clone the live state into it, apply the human's candidate moves, and score
+            # the resulting model-to-move states. Built with the critic's own encoder so its
+            # internal generate_observation (run by step) matches the critic's obs shapes.
+            self._eval_env = WarChestEnv(save_game_history=False, obs_encoder=critic_encoder)
 
         self.eval_history = []
+        # Per-point flag set by _reliable_value: True when the value was obtained in the
+        # critic's well-conditioned model-to-move regime (directly, or via the one-ply
+        # lookahead at the human's node). False only in the rare fallback where even the
+        # lookahead lands on another human-to-move state. Unreliable points are dimmed.
+        self.eval_reliable = []
         self.ui_state = {'stage': 'idle'}
         self.anchors = {}
         self._hand_positions = {}
@@ -236,20 +248,71 @@ class PlayRenderer:
     # Critic eval overlay
     # ------------------------------------------------------------------
 
-    def _update_eval(self):
-        if self.critic is None:
-            return
-        obs = self.critic_encoder.encode(self.env)
-        priv = self.critic_encoder.encode_privileged(self.env)
+    def _score_state(self, env):
+        """Critic value of ``env``'s current state, from the *human's* perspective.
+
+        Returns ``(value, model_to_move)``. The critic scores whoever is about to move
+        (the obs encoder rotates ego-centrically around them), so we negate when the
+        mover isn't the human — the negamax convention the game's antisymmetric rewards
+        make valid (same as LookaheadCriticBot._critic_root_values). ``model_to_move``
+        reports whether this was the critic's well-conditioned regime (opponent = the
+        passive side, i.e. the model is up): the value is trustworthy only then.
+        """
+        obs = self.critic_encoder.encode(env)
+        priv = self.critic_encoder.encode_privileged(env)
         priv_t = torch.from_numpy(priv).unsqueeze(0).to(self.critic.device)
         with torch.no_grad():
             raw = self.critic.value_single(obs, self.opp_onehot, priv_t).item()
         value = raw * self.value_scale + self.value_shift
-        # The critic scores from the *active* player's perspective; flip so the
-        # bar always reads positive-is-good-for-the-human.
-        if self.env.active_player != self.human_player:
+        model_to_move = env.active_player != self.human_player
+        if model_to_move:
             value = -value
+        return value, model_to_move
+
+    def _reliable_value(self):
+        """Human-perspective value evaluated at a *model-to-move* frame at every ply.
+
+        Naively querying the critic at both players' decision nodes and sign-flipping
+        produces a sawtooth: the "player to move" tempo bias flips sign each ply, and
+        the human's node also mis-conditions opp_onehot (there is no "self" opponent
+        label — see docs/bots.md "Known limitation"). Fix: when the model is up, keep
+        the reliable direct query; when the *human* is up, look one ply ahead over the
+        human's legal moves and report the best resulting (model-to-move) value. Every
+        plotted point then references the same "model about to move" regime, so the
+        curve tracks the real game value instead of the tempo flip.
+
+        Returns ``(value, reliable)`` — ``reliable`` is False only in the rare fallback
+        where even the lookahead lands on another human-to-move state (a pending tactic
+        continuation, or the model being out of coins).
+        """
+        env = self._eval_env
+        base = copy.deepcopy(self.env.state)
+        env.set_state(base)
+        if env.active_player != self.human_player:
+            return self._score_state(env)  # model to move: direct, well-conditioned
+
+        best_v, best_reliable = None, False
+        for action_id in env.get_possible_actions():
+            env.set_state(copy.deepcopy(base))
+            _, _, terminated, _, _ = env.step(action_id)
+            if terminated:
+                # The human's move just ended the game in the human's favour.
+                value, reliable = 1.0, True
+            else:
+                value, reliable = self._score_state(env)
+            if best_v is None or value > best_v:
+                best_v, best_reliable = value, reliable
+        if best_v is None:  # no legal human move (shouldn't happen mid-game)
+            env.set_state(base)
+            return self._score_state(env)
+        return best_v, best_reliable
+
+    def _update_eval(self):
+        if self.critic is None:
+            return
+        value, reliable = self._reliable_value()
         self.eval_history.append(value)
+        self.eval_reliable.append(reliable)
 
     # ------------------------------------------------------------------
     # End of game
@@ -463,12 +526,23 @@ class PlayRenderer:
                               fontsize=9, color='lightgray', transform=self.ax_eval.transAxes)
             return
         hist = self.eval_history
+        reliable = self.eval_reliable
         label = 'Critic (your view, calibrated)' if self._calibrated else 'Critic (your view, raw units)'
         title = f'{label}: {hist[-1]:+.3f}' if hist else f'{label}: N/A'
         self.ax_eval.set_title(title, fontsize=9)
         self.ax_eval.axhline(0, color='gray', linewidth=0.8)
         if hist:
-            self.ax_eval.plot(range(len(hist)), hist, color='steelblue', linewidth=1.2)
+            self.ax_eval.plot(range(len(hist)), hist, color='steelblue', linewidth=1.2, alpha=0.5)
+            xs = np.arange(len(hist))
+            reliable_mask = np.array(reliable, dtype=bool)
+            # Reliable points (queried at the model's own decision node) are solid;
+            # unreliable ones (queried at the human's node, mis-conditioned opp_onehot —
+            # see eval_reliable's docstring) are faded so they don't read as equally trustworthy.
+            self.ax_eval.scatter(xs[reliable_mask], np.array(hist)[reliable_mask],
+                                 color='steelblue', s=14, zorder=4)
+            self.ax_eval.scatter(xs[~reliable_mask], np.array(hist)[~reliable_mask],
+                                 facecolors='none', edgecolors='steelblue', s=14,
+                                 alpha=0.5, zorder=4)
             last_color = 'limegreen' if hist[-1] >= 0 else 'tomato'
             self.ax_eval.scatter([len(hist) - 1], [hist[-1]], color=last_color, s=25, zorder=5)
         self.ax_eval.set_xlabel('ply', fontsize=7)

@@ -127,7 +127,7 @@ class _Child:
     enough of the reward path to finish scoring it once `est` is filled in.
     """
 
-    __slots__ = ('action_id', 'partial_value', 'state', 'queues', 'terminal', 'est')
+    __slots__ = ('action_id', 'partial_value', 'state', 'queues', 'terminal', 'est', 'leaf')
 
     def __init__(self, action_id, partial_value, state, queues, terminal):
         self.action_id = action_id
@@ -136,6 +136,11 @@ class _Child:
         self.queues = queues
         self.terminal = terminal
         self.est = partial_value if terminal else None
+        # `leaf`: this child has a real (non-terminal) state and IS critic-scored,
+        # but the search must NOT recurse past it. The depth-bounded base search
+        # never sets it; round-bounded subclasses (RoundCriticBot) set it at the
+        # round boundary so a move that ends the round becomes a scored leaf.
+        self.leaf = False
 
 
 class LookaheadCriticBot(LookaheadBot):
@@ -182,6 +187,14 @@ class LookaheadCriticBot(LookaheadBot):
         device: torch device for the critic's forward passes.
     """
 
+    # When True, `_beam_value` treats a child that crosses into the next round as
+    # a critic-scored leaf (no recursion past it) and flags any depth-cut that
+    # stopped a still-in-round line. Off for this depth-bounded base search; set
+    # True by RoundCriticBot, which searches to the end of the current round
+    # rather than to a fixed ply depth. Every use is gated on this flag so the
+    # base search pays nothing for the hook.
+    _BOUNDS_BY_ROUND = False
+
     def __init__(self, critic_path=None, beam_width=5, max_branching=8,
                  time_budget=0.5, see_opponent_hand=True, max_depth=40, gamma=0.99,
                  opp_type='pool', n_determinizations=1, stats_log_every=20,
@@ -201,6 +214,12 @@ class LookaheadCriticBot(LookaheadBot):
         self.stats_log_every = stats_log_every
         self._reset_agg_stats()
         self.device = device
+        # Round-bounded search state (see `_BOUNDS_BY_ROUND`). Inert while that
+        # flag is False: `_root_round` is the round number at the search root and
+        # `_round_incomplete` records whether the budget cut a line off before the
+        # round ended (used by RoundCriticBot's iterative deepening to stop).
+        self._root_round = None
+        self._round_incomplete = False
 
         meta = load_critic_checkpoint(critic_path, map_location=device)
         encoder = get_encoder(meta['obs_version'])
@@ -364,9 +383,9 @@ class LookaheadCriticBot(LookaheadBot):
         # console that shows INFO — see the `logger` module-docstring comment
         # for how to actually surface it.
         logger.debug(
-            'lookahead_critic act(): depth_reached=%d (per-search=%s) nodes_visited=%d '
+            '%s act(): depth_reached=%d (per-search=%s) nodes_visited=%d '
             'elapsed=%.3fs/%.3fs budget legal_at_root=%d best_value=%.4f',
-            self.last_stats['depth_reached'], self.last_stats['depths'],
+            self.name, self.last_stats['depth_reached'], self.last_stats['depths'],
             self.last_stats['nodes_visited'], self.last_stats['elapsed'], self.time_budget,
             self.last_stats['legal_at_root'], self.last_stats['best_value'],
         )
@@ -402,9 +421,9 @@ class LookaheadCriticBot(LookaheadBot):
         if a['n'] < self.stats_log_every:
             return
         logger.info(
-            'lookahead_critic: last %d move(s) — depth_reached avg=%.2f min=%d max=%d, '
+            '%s: last %d move(s) — depth_reached avg=%.2f min=%d max=%d, '
             'nodes_visited avg=%.1f, elapsed avg=%.3fs/%.3fs budget, legal_at_root avg=%.1f',
-            a['n'], a['depth_sum'] / a['n'], a['depth_min'], a['depth_max'],
+            self.name, a['n'], a['depth_sum'] / a['n'], a['depth_min'], a['depth_max'],
             a['nodes_visited'] / a['n'], a['elapsed_sum'] / a['n'], self.time_budget,
             a['legal_at_root_sum'] / a['n'],
         )
@@ -482,6 +501,24 @@ class LookaheadCriticBot(LookaheadBot):
             return self.max_branching
         return max(3, self.max_branching - 2 * (ply - 1))
 
+    def _prune_candidates(self, state, legal, mover, max_branching):
+        """Cheap pre-move cut of `legal` to the `max_branching` most promising
+        actions, *before* any of the per-action clone/apply/critic-score work.
+
+        Ordering is `LookaheadBot`'s greedy pre-move key (`_ordering_key`) — the
+        same heuristic its own move ordering uses. `PolicyCriticBot` overrides
+        this to rank candidates by a trained policy's move prior instead, which
+        is the one difference between the two bots (everything downstream — the
+        critic scoring, beam, iterative deepening, determinization — is shared).
+        `state` is the node being expanded; the sim env is already set to it by
+        `_legal_from`, but it's passed explicitly so an override can re-encode it
+        without depending on that side effect.
+        """
+        dist_grid = self._dist_grid_to_targets(self._capturable_bases(mover))
+        melee_threat = self._melee_threatened_cells(mover)
+        ordered = sorted(legal, key=lambda a: self._ordering_key(a, dist_grid, melee_threat, mover))
+        return ordered[:max_branching]
+
     def _beam_value(self, state, queues, root_player, depth, deadline, ply, path):
         """Root-perspective value of `state` plus the action that achieves it,
         searching `depth` more levels of beam-limited recursion.
@@ -519,10 +556,7 @@ class LookaheadCriticBot(LookaheadBot):
             max_branching = self._max_branching_at(ply)
 
             if max_branching and len(legal) > max_branching:
-                dist_grid = self._dist_grid_to_targets(self._capturable_bases(mover))
-                melee_threat = self._melee_threatened_cells(mover)
-                legal = sorted(legal, key=lambda a: self._ordering_key(a, dist_grid, melee_threat, mover))
-                legal = legal[:max_branching]
+                legal = self._prune_candidates(state, legal, mover, max_branching)
 
             children = []
             for action_id in legal:
@@ -540,7 +574,12 @@ class LookaheadCriticBot(LookaheadBot):
                     trunc = self._truncation_value(child_state, root_player) * self.gamma ** (ply + 1)
                     children.append(_Child(action_id, partial + trunc, None, None, True))
                 else:
-                    children.append(_Child(action_id, partial, child_state, child_queues, False))
+                    child = _Child(action_id, partial, child_state, child_queues, False)
+                    # Round boundary: this move emptied both hands, so the child is
+                    # the start of the next round. Score it, but don't search past it.
+                    if self._BOUNDS_BY_ROUND and child_state.round_number > self._root_round:
+                        child.leaf = True
+                    children.append(child)
 
             pending = [c for c in children if not c.terminal]
             if pending:
@@ -566,13 +605,21 @@ class LookaheadCriticBot(LookaheadBot):
             self._survivor_cache[path] = (survivors, maximizing)
 
         if depth <= 0:
+            # Round-bounded search: if a survivor is still mid-round (not a scored
+            # leaf, not terminal), the depth limit — not the round's end — stopped
+            # us here, so this pass did not analyse the round to completion.
+            if self._BOUNDS_BY_ROUND and any(not (c.terminal or c.leaf) for c in survivors):
+                self._round_incomplete = True
             best = survivors[0]
             return best.est, best.action_id
 
         best_val, best_action = None, None
         for c in survivors:
-            val = c.est if c.terminal else self._beam_value(
-                c.state, c.queues, root_player, depth - 1, deadline, ply + 1, path + (c.action_id,))[0]
+            if c.terminal or c.leaf:
+                val = c.est
+            else:
+                val = self._beam_value(
+                    c.state, c.queues, root_player, depth - 1, deadline, ply + 1, path + (c.action_id,))[0]
             if best_val is None or (maximizing and val > best_val) or (not maximizing and val < best_val):
                 best_val, best_action = val, c.action_id
         return best_val, best_action

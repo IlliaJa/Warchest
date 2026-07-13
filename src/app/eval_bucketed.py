@@ -20,7 +20,7 @@ from collections import Counter, defaultdict
 
 import numpy as np
 import torch
-from tqdm import tqdm
+from rich.progress import track
 
 from src.services.policy.policy import Policy
 from src.services.environment.warchest_env import (
@@ -50,12 +50,22 @@ def _unit_names(ids):
 def play_one_game(env, policy, bot, main_pid, max_t):
     """Play one policy-vs-GreedyBot game; return a per-game diagnostic record."""
     state, _ = env.reset()
+    opp_pid = 3 - main_pid
     used_tactic = False
+    # docs/IDEAS.md #9: base-lead (my_bases - opp_bases) at the moment each tactic is
+    # initiated, to disambiguate reverse-causation (tactics reached for only when
+    # already behind) from an execution/exploration gap (tactics attempted from a lead
+    # too, just executed poorly).
+    tactic_base_leads = []
     bolster_count = 0
     bolsters = Counter()             # bolstered unit id -> times its stack was grown
     bolsters_with_supply = Counter()  # ... restricted to bolsters made while >=1 coin
                                       # of that unit still sat in the player's supply
     supply_left_sum = Counter()       # sum of coins-left-in-supply over those bolsters
+    bolsters_fully_available = Counter()  # ... further restricted to: board + supply
+                                           # == the unit's total roster coin count, i.e.
+                                           # none of that type is sitting in hand/bag/
+                                           # discard and none has been lost to the box
     chain_offered = 0
     chain_used = 0
     # Initiative can only be claimed by the round's non-owner (the player who is
@@ -99,6 +109,9 @@ def play_one_game(env, policy, bot, main_pid, max_t):
 
         if acting_pid == main_pid and VERB_OF_ACTION[env_action] == V_TACTIC:
             used_tactic = True
+            lead_now = (len(env.board.get_controlled_bases(main_pid))
+                        - len(env.board.get_controlled_bases(opp_pid)))
+            tactic_base_leads.append(lead_now)
         if acting_pid == main_pid and VERB_OF_ACTION[env_action] == V_BOLSTER:
             bolster_count += 1
             # Bolster is a spatial action: the bolstered unit is the one on the target
@@ -115,6 +128,15 @@ def play_one_game(env, policy, bot, main_pid, max_t):
                 if supply_left > 0:
                     bolsters_with_supply[bunit.id] += 1
                     supply_left_sum[bunit.id] += supply_left
+                    # Stricter still: board + supply == the type's full roster count.
+                    # +1 because this check runs pre-step — the hand coin about to
+                    # join bunit.stack isn't reflected in bunit.stack yet, but it is
+                    # the one being committed, so it counts toward "board" here.
+                    board_total = sum(
+                        u.stack for u in env.board.units
+                        if u.player_id == main_pid and u.id == bunit.id)
+                    if board_total + 1 + supply_left == UNIT_BY_ID[bunit.id].total_coins:
+                        bolsters_fully_available[bunit.id] += 1
         round_before = env.state.round_number
         state, _, terminated, truncated, step_info = env.step(env_action)
         action_valid = step_info['action'].is_valid
@@ -132,7 +154,6 @@ def play_one_game(env, policy, bot, main_pid, max_t):
         if terminated or truncated:
             break
 
-    opp_pid = 3 - main_pid
     my_bases = len(env.board.get_controlled_bases(main_pid))
     opp_bases = len(env.board.get_controlled_bases(opp_pid))
     if terminated:
@@ -152,10 +173,12 @@ def play_one_game(env, policy, bot, main_pid, max_t):
         'my_bases': my_bases,
         'opp_bases': opp_bases,
         'used_tactic': used_tactic,
+        'tactic_base_leads': tactic_base_leads,  # base-lead at each tactic initiation
         'bolster_count': bolster_count,
         'bolsters': bolsters,                          # Counter: unit id -> bolsters
         'bolsters_with_supply': bolsters_with_supply,  # ... while supply still had coins
         'supply_left_sum': supply_left_sum,            # sum of supply-left over those
+        'bolsters_fully_available': bolsters_fully_available,  # ... and board+supply==total
         'turns': env.action_count,
         'main_pid': main_pid,
     }
@@ -246,6 +269,35 @@ def _print_initiative_breakdown(records):
               f'{wr_nonprod:.3f} ± {se_nonprod:.3f} (n={len(non_productive_claim_games)})')
 
 
+def _print_tactic_lead_breakdown(records):
+    """docs/IDEAS.md #9: disambiguate whether tactics correlate with losing because
+    they're reached for only when already behind (reverse causation — no fix needed)
+    or attempted from a lead too but executed poorly (an execution/exploration gap —
+    docs/IDEAS.md #8 is on target). Buckets every tactic-initiation instance by
+    base-lead (my_bases - opp_bases) at the moment it was initiated."""
+    leads = [lead for r in records for lead in r['tactic_base_leads']]
+    n = len(leads)
+    print(f'\n=== Tactic-initiation base-lead (docs/IDEAS.md #9) ===')
+    if n == 0:
+        print('  (tactic never initiated — nothing to disambiguate)')
+        return
+    behind = sum(1 for l in leads if l < 0)
+    even = sum(1 for l in leads if l == 0)
+    ahead = sum(1 for l in leads if l > 0)
+    games_with_tactic = sum(1 for r in records if r['tactic_base_leads'])
+    print(f'{n} tactic initiations across {games_with_tactic} games')
+    print(f'  behind (lead<0): {behind}/{n} ({behind / n:.1%})')
+    print(f'  even   (lead=0): {even}/{n} ({even / n:.1%})')
+    print(f'  ahead  (lead>0): {ahead}/{n} ({ahead / n:.1%})')
+    print(f'  mean lead at initiation: {sum(leads) / n:+.2f}')
+    if behind / n > 0.7:
+        print('  -> clusters when already behind: consistent with reverse causation, #8 not needed')
+    elif ahead / n > 0.3:
+        print('  -> spread into lead states too: consistent with an execution/exploration gap, see #8')
+    else:
+        print('  -> mixed; inspect the distribution above before concluding either way')
+
+
 def _print_bolster_breakdown(records):
     """How often the policy bolsters (plays a hand coin onto an on-board unit, growing
     its stack) and — the metric of interest — how often it does so while coins of that
@@ -256,6 +308,7 @@ def _print_bolster_breakdown(records):
     bolster_games = [r for r in records if r['bolster_count'] > 0]
     total_bolsters = sum(r['bolster_count'] for r in records)
     total_with_supply = sum(sum(r['bolsters_with_supply'].values()) for r in records)
+    total_fully_available = sum(sum(r['bolsters_fully_available'].values()) for r in records)
     print(f'\n=== Bolstering (and bolsters made while supply still holds that unit) ===')
     print(f'Bolstered at least once: {len(bolster_games)}/{n} games '
           f'({len(bolster_games) / n:.1%}), {total_bolsters} bolster actions total '
@@ -266,6 +319,9 @@ def _print_bolster_breakdown(records):
     share = total_with_supply / total_bolsters
     print(f'Of those, {total_with_supply}/{total_bolsters} ({share:.1%}) were made while '
           f'>=1 coin of the same unit was still in supply.')
+    share_full = total_fully_available / total_bolsters
+    print(f'  ...and {total_fully_available}/{total_bolsters} ({share_full:.1%}) were made while '
+          f'board + supply == the unit\'s full roster count (none in hand/bag/discard, none boxed).')
 
     wr_b, se_b = _wr_and_se(sum(r['outcome'] == 'win' for r in bolster_games), len(bolster_games))
     no_bolster = [r for r in records if r['bolster_count'] == 0]
@@ -278,17 +334,21 @@ def _print_bolster_breakdown(records):
     per_unit_total = Counter()
     per_unit_supply = Counter()
     per_unit_supply_sum = Counter()
+    per_unit_fully_available = Counter()
     for r in records:
         per_unit_total.update(r['bolsters'])
         per_unit_supply.update(r['bolsters_with_supply'])
         per_unit_supply_sum.update(r['supply_left_sum'])
-    print(f'\n  {"unit":<16} {"bolsters":>9} {"w/ supply left":>15} {"avg supply left":>16}')
+        per_unit_fully_available.update(r['bolsters_fully_available'])
+    print(f'\n  {"unit":<16} {"bolsters":>9} {"w/ supply left":>15} '
+          f'{"avg supply left":>16} {"fully available":>16}')
     for uid, tot in per_unit_total.most_common():
         name = UNIT_BY_ID[uid].name
         with_sup = per_unit_supply[uid]
         avg = per_unit_supply_sum[uid] / with_sup if with_sup else float('nan')
         avg_str = f'{avg:.2f}' if avg == avg else '—'
-        print(f'  {name:<16} {tot:>9} {with_sup:>15} {avg_str:>16}')
+        full_avail = per_unit_fully_available[uid]
+        print(f'  {name:<16} {tot:>9} {with_sup:>15} {avg_str:>16} {full_avail:>16}')
 
 
 def _print_exact_composition_breakdown(records, min_games=3):
@@ -338,7 +398,7 @@ def main():
     env = WarChestEnv(save_game_history=False)
 
     records = []
-    for _ in tqdm(range(args.games), desc='games'):
+    for _ in track(range(args.games), description='games'):
         main_pid = int(np.random.choice([1, 2]))
         records.append(play_one_game(env, policy, bot, main_pid, args.max_t))
 
@@ -361,6 +421,7 @@ def main():
     print(f'  WR when tactic used:     {wr_tactic:.3f} ± {se_tactic:.3f} (n={len(tactic_games)})')
     print(f'  WR when tactic NOT used: {wr_no_tactic:.3f} ± {se_no_tactic:.3f} (n={len(no_tactic_games)})')
 
+    _print_tactic_lead_breakdown(decisive)
     _print_bolster_breakdown(decisive)
     _print_initiative_breakdown(decisive)
 
@@ -407,7 +468,9 @@ def main():
                 row = dict(r)
                 row['my_composition'] = ','.join(row['my_composition'])
                 row['opp_composition'] = ','.join(row['opp_composition'])
-                for col in ('bolsters', 'bolsters_with_supply', 'supply_left_sum'):
+                row['tactic_base_leads'] = ','.join(str(l) for l in row['tactic_base_leads'])
+                for col in ('bolsters', 'bolsters_with_supply', 'supply_left_sum',
+                            'bolsters_fully_available'):
                     row[col] = ','.join(
                         f'{UNIT_BY_ID[uid].name}:{cnt}' for uid, cnt in row[col].items())
                 writer.writerow(row)
