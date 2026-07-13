@@ -882,9 +882,9 @@ if __name__ == '__main__':
         # Greedy is a small fixed anchor; the rest is self-play against the wide-skill
         # pool, with lookahead_critic holding the same 15% slice.
         'p_random_finetune': 0.00,
-        'p_greedy_finetune': 0.085,
-        'p_pool_finetune': 0.765,
-        'p_lookahead_critic_finetune': 0.15,
+        'p_greedy_finetune': 0.00,
+        'p_pool_finetune': 0.75,
+        'p_lookahead_critic_finetune': 0.25,
         # per-move search budget for the lookahead_critic training opponent. Small on
         # purpose: at its own 0.5s eval default a 15%-sampled search opponent would
         # dominate rollout wall-clock. 0.1s keeps it a distinct, tougher opponent
