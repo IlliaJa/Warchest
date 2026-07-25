@@ -47,7 +47,7 @@ import math
 import random
 import time
 import types
-from collections import Counter, deque
+from collections import Counter
 
 import numpy as np
 
@@ -58,11 +58,11 @@ from ..environment.warchest_env import (
 )
 from ..environment.game_state import HAND_SIZE, Pending
 from ..environment.board import Board
-from ..environment.rollout_core import SHAPING_C, C_MAT
 from ..environment.cell_ids import (
-    UNCONTROLLED_BASE_CELL_ID, CONTROLLED_BASE_PLAYER_1_CELL_ID, CONTROLLED_BASE_PLAYER_2_CELL_ID,
+    CONTROLLED_BASE_PLAYER_1_CELL_ID, CONTROLLED_BASE_PLAYER_2_CELL_ID,
 )
 from ..environment.roster import UNIT_BY_ID
+from .evaluation import HeuristicEvaluator, capturable_bases
 
 
 def _fast_counter_copy(counter):
@@ -166,21 +166,14 @@ class LookaheadBot:
         name: label used when this bot is dropped into gauntlet.py's round-robin.
     """
 
-    # Value of being one hex closer than the opponent to the nearest capturable base
-    # (`_nearest_dist`) — comparable to, but smaller than, a single attack (0.02), so
-    # it acts as a directional tie-break rather than overriding a real tactical gain.
-    POS_COEFF = 0.01
-    # Distance returned when a player has no on-board units or no capturable base
-    # exists — larger than any real hex distance on the 7x7 board so it always reads
-    # as "far", without needing math.inf bookkeeping through the BFS.
+    # Distance used by move ordering when a side has no on-board unit or no
+    # capturable base exists — larger than any real hex distance on the 7x7 board
+    # so it always reads "far". (The leaf's own copy lives on HeuristicEvaluator.)
     _FAR_DIST = 12
-    # Weight on material-at-risk (stack coins a unit stands to lose next turn, not
-    # yet actually lost) — half of C_MAT, since it's a *predictive* signal (the
-    # opponent may not follow through) rather than realized material loss.
-    RISK_COEFF = 0.5 * C_MAT
 
     def __init__(self, time_budget=0.1, max_branching=8, see_opponent_hand=True,
-                 max_depth=40, gamma=0.99, shaping_anneal=1.0, name='lookahead'):
+                 max_depth=40, gamma=0.99, shaping_anneal=1.0, rich_eval=False,
+                 name='lookahead'):
         self.time_budget = time_budget
         self.max_branching = max_branching
         self.see_opponent_hand = see_opponent_hand
@@ -188,6 +181,16 @@ class LookaheadBot:
         self.gamma = gamma
         self.shaping_anneal = shaping_anneal
         self.name = name
+        # Static leaf evaluation is delegated to the shared HeuristicEvaluator so
+        # SimGreedyBot's shallow scoring and this search agree on "how good is a
+        # state". `rich_eval` turns on the extra durability/economy/tempo/progress
+        # terms; it defaults OFF because measurement showed them net-harmful (they
+        # reward long-horizon things a search leaf can't cash in — a rich=True
+        # lookahead scored only 20% vs the same bot with rich=False; see
+        # docs/bots.md). Off also reproduces the exact old `_leaf_potential`
+        # formula, which LookaheadCriticBot's value-scale calibration depends on.
+        self._evaluator = HeuristicEvaluator(shaping_anneal=shaping_anneal,
+                                             enable_new_terms=rich_eval)
         # A plain rules-engine instance reused across act() calls purely for forward
         # simulation — never exposed to or stepped by the caller.
         self._sim_env = WarChestEnv(save_game_history=False)
@@ -378,71 +381,21 @@ class LookaheadBot:
         return self.shaping_anneal * self._holding_reward_rate * base_diff
 
     def _leaf_potential(self, state, root_player):
-        """Base + material PBRS potential (docs/rewards.md) plus a positional term —
-        the base+material formula is the same one `rollout_core.py` uses to shape
-        training reward (reused, not re-derived); the positional term has no training
-        analogue (see the module docstring) and exists only to give this search the
-        same directional pull GreedyBot gets from its BFS-to-nearest-base fallback.
+        """Static leaf value — delegated to the shared `HeuristicEvaluator` (see
+        `evaluation.py`). Set the sim env to `state` first, then evaluate against
+        whatever `_sim_env` currently is (LookaheadCriticBot swaps it out for one
+        built against the critic's obs version, so we read the attribute live rather
+        than capturing it in the evaluator).
         """
         self._sim_env.set_state(state)
-        opp = 3 - root_player
-        base_diff = (len(self._sim_env.board.get_controlled_bases(root_player))
-                     - len(self._sim_env.board.get_controlled_bases(opp)))
-        base_term = SHAPING_C * base_diff * self._sim_env.winning_base_count
-        mat_term = (self.shaping_anneal * C_MAT
-                    * (self._sim_env.boxed_total(opp) - self._sim_env.boxed_total(root_player)))
-        pos_term = self.POS_COEFF * (self._nearest_dist(opp) - self._nearest_dist(root_player))
-        risk_term = self.RISK_COEFF * self._material_at_risk(root_player, opp)
-        return base_term + mat_term + pos_term + risk_term
-
-    def _material_at_risk(self, root_player, opp):
-        """opp_at_risk - own_at_risk: the same "material-at-risk" quantity the obs
-        encoder exposes to the trained policy (docs/observation_improvement.md), i.e.
-        general tactical awareness ("is this unit hanging?"), not anything specific to
-        GreedyBot. Computed exactly (we know both hands, real or determinized) rather
-        than the obs encoder's worst-case-availability guess.
-
-        Deliberately NOT calling `_threat_grids`/the obs encoder's `threat_grids`:
-        profiling (docs/lookahead_bot_plan.md) showed it dominating this search's
-        per-node cost, because it builds full 7x7 grids for both sides and every
-        threat kind when all this needs is two scalars — the risk at the handful of
-        cells own/enemy units actually stand on. `unit_threat_footprint` and
-        `attack_enabler_coins` are the same public per-unit primitives that function
-        is built from; using them directly and accumulating into a plain dict (instead
-        of allocating and summing whole numpy arrays) is the same result, much cheaper.
-        """
-        env = self._sim_env
-        own_units = [u for u in env.board.units if u.player_id == root_player]
-        opp_units = [u for u in env.board.units if u.player_id == opp]
-        own_at_risk = self._at_risk(env, opp, opp_units, own_units)
-        opp_at_risk = self._at_risk(env, root_player, own_units, opp_units)
-        return opp_at_risk - own_at_risk
-
-    @staticmethod
-    def _at_risk(env, attacker_side, attackers, targets):
-        """Sum of min(incoming hits, stack) over `targets`, from `attackers`' threats."""
-        if not attackers or not targets:
-            return 0
-        hand = env.state.hands[attacker_side]
-        hits_by_cell = {}
-        for u in attackers:
-            footprint = env.unit_threat_footprint(u)
-            if not footprint or not any(hand[c] >= 1 for c in env.attack_enabler_coins(u)):
-                continue
-            for cell, _kind, hits in footprint:
-                hits_by_cell[cell] = hits_by_cell.get(cell, 0) + hits
-        return sum(min(hits_by_cell.get(u.loc, 0), u.stack) for u in targets)
+        return self._evaluator.evaluate(self._sim_env, root_player)
 
     def _capturable_bases(self, player):
-        """Cells `player` could still usefully capture: uncontrolled, or held by the
-        other player. Shared by `_nearest_dist` (leaf potential) and `_ordering_key`
-        (move ordering) so both use the same notion of "target".
+        """Cells `player` could still usefully capture — delegates to the shared
+        `capturable_bases` (used here for `_ordering_key`; also called by the critic
+        bots). Same notion of "target" the leaf's `_nearest_dist` uses.
         """
-        board = self._sim_env.board
-        targets = set(board.get_controlled_bases(3 - player))
-        rows, cols = np.where(board.board == UNCONTROLLED_BASE_CELL_ID)
-        targets.update(zip(rows.tolist(), cols.tolist()))
-        return targets
+        return capturable_bases(self._sim_env.board, player)
 
     def _dist_grid_to_targets(self, targets):
         """{cell: hex-distance to the nearest cell in `targets`}, for every cell
@@ -531,37 +484,6 @@ class LookaheadBot:
         if verb == BOLSTER_VERB:
             return (5, 0, 0)
         return (6, 0, 0)  # select (only legal mid-tactic)
-
-    def _nearest_dist(self, player):
-        """Hex-distance from `player`'s nearest on-board unit to the nearest base they
-        could still usefully capture (uncontrolled, or held by the other player) —
-        multi-source BFS over `self._sim_env`'s current state, mirroring GreedyBot's
-        own `_bfs`/`_best_move_toward_base`, just on the real Board instead of the
-        ego-centric obs image.
-        """
-        board = self._sim_env.board
-        starts = [u.loc for u in board.units if u.player_id == player]
-        if not starts:
-            return self._FAR_DIST
-        targets = self._capturable_bases(player)
-        if not targets:
-            return self._FAR_DIST
-        if any(s in targets for s in starts):
-            return 0
-        visited = set(starts)
-        frontier = deque(starts)
-        dist = 0
-        while frontier:
-            dist += 1
-            for _ in range(len(frontier)):
-                cell = frontier.popleft()
-                for nb in board.get_adjacent_cells(*cell):
-                    if nb in targets:
-                        return dist
-                    if nb not in visited:
-                        visited.add(nb)
-                        frontier.append(nb)
-        return self._FAR_DIST
 
     def _truncation_value(self, state, root_player):
         """Base-diff-proportional truncation reward (docs/rewards.md, "C17"), for the

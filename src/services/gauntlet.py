@@ -22,6 +22,7 @@ import numpy as np
 from .environment.warchest_env import WarChestEnv
 from .environment.obs_encoders import get_encoder, latest_encoder
 from .bots.greedy_bot import GreedyBot
+from .bots.greedy_sim_bot import SimGreedyBot
 from .bots.random_bot import RandomBot
 from .bots.lookahead_bot import LookaheadBot
 from .bots.lookahead_critic_bot import LookaheadCriticBot
@@ -75,6 +76,19 @@ class HeuristicAgent(GauntletAgent):
 
 
 def greedy_agent(name='greedy', encoder=None):
+    """The 1-ply forward-simulation greedy (`SimGreedyBot`) — the strong greedy
+    yardstick. Speaks `act(env)` + `.name` directly (like LookaheadBot), so it
+    drops in without a HeuristicAgent obs-encoding wrapper. `encoder` is accepted
+    for a uniform factory signature but unused (this bot reads the env, not obs).
+    """
+    return SimGreedyBot(name=name)
+
+
+def greedy_fast_agent(name='greedy_fast', encoder=None):
+    """The legacy obs-only `GreedyBot` — cheap, hand-blind, no simulation. Kept as
+    a separate entrant (and as the training-loop opponent, via opponent_pool) now
+    that `greedy` is the heavier simulation bot.
+    """
     return HeuristicAgent(name, GreedyBot(), encoder)
 
 
@@ -143,6 +157,8 @@ def build_agent(spec, *, device):
     kind = spec['kind']
     if kind == 'greedy':
         return greedy_agent(spec['name'])
+    if kind == 'greedy_fast':
+        return greedy_fast_agent(spec['name'])
     if kind == 'random':
         return random_agent(spec['name'])
     if kind == 'lookahead':

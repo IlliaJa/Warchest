@@ -47,9 +47,10 @@ def test_act_and_batch_log_probs_agree():
     obs = obs_after(11, seed=5)
     torch.manual_seed(0)
     action, lp_act, _ = pol.act(obs)
-    lp_batch, ent = pol.evaluate_actions_batch(batch_from_obs(obs, action, torch.device('cpu')))
+    lp_batch, ent, verb_ent = pol.evaluate_actions_batch(batch_from_obs(obs, action, torch.device('cpu')))
     assert torch.allclose(lp_act, lp_batch.squeeze(0), atol=1e-5)
     assert torch.isfinite(ent).all()  # entropy is finite under masking
+    assert torch.isfinite(verb_ent).all()  # verb-marginal entropy is finite under masking
 
 
 def test_verb_head_receives_gradient():
@@ -70,9 +71,12 @@ def test_entropy_finite_with_single_legal_action():
     only = int(np.where(obs['valid_action_mask'])[0][0])
     mask[only] = 1.0
     obs = {**obs, 'valid_action_mask': mask}
-    _, ent = pol.evaluate_actions_batch(batch_from_obs(obs, only, torch.device('cpu')))
+    _, ent, verb_ent = pol.evaluate_actions_batch(batch_from_obs(obs, only, torch.device('cpu')))
     assert torch.isfinite(ent).all()
     assert float(ent.detach()) < 1e-4  # ~zero entropy when only one action is legal
+    # Only one action legal => only its verb is legal => verb marginal is degenerate too.
+    assert torch.isfinite(verb_ent).all()
+    assert float(verb_ent.detach()) < 1e-4
 
 
 def test_policy_and_critic_forward_on_a_real_observation():

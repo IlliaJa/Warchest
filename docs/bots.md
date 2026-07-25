@@ -7,10 +7,104 @@ for `LookaheadBot`'s original design rationale.
 | Bot | File | Interface | Summary |
 |---|---|---|---|
 | `RandomBot` | `random_bot.py` | `act(obs)` | Uniform random legal action. |
-| `GreedyBot` | `greedy_bot.py` | `act(obs)` | Priority: attack → control → move toward nearest base → deploy → pass. No search. |
-| `LookaheadBot` | `lookahead_bot.py` | `act(env)` | Alpha-beta search, hand-tuned leaf heuristic (`_leaf_potential`), cheap ordering-key pruning (`_ordering_key`). |
+| `GreedyBot` (a.k.a. `greedy_fast`) | `greedy_bot.py` | `act(obs)` | Obs-only, hand-blind priority ladder: attack → control → move toward nearest base → deploy → pass. First action in each bucket, no search. **Cannot** recruit/bolster/claim-initiative/initiate a tactic, so it can't use half the roster (Archer/Lancer only attack via a tactic). Kept as the cheap training-loop opponent (`OPP_TYPE_IDX['greedy']`) and as the `greedy_fast` gauntlet entrant. |
+| `SimGreedyBot` (the gauntlet's `greedy`) | `greedy_sim_bot.py` | `act(env)` | Shallow (2-ply-in-turns) forward-simulation greedy scored by the shared `HeuristicEvaluator`. Uses the whole game (every verb, via simulated consequence), opponent-aware. See below. |
+| `LookaheadBot` | `lookahead_bot.py` | `act(env)` | Alpha-beta search; leaf delegated to the shared `HeuristicEvaluator` (`evaluation.py`), cheap ordering-key pruning (`_ordering_key`). |
 | `LookaheadCriticBot` | `lookahead_critic_bot.py` | `act(env)` | Beam search scored by a trained `Critic` network instead of a hand-tuned heuristic. See below. |
 | trained `Policy` | `policy/policy.py` | `act(obs)` | The PPO-trained actor, no search — wrapped as `PolicyAgent` in `gauntlet.py`. |
+
+Gauntlet name resolution: `greedy` builds `SimGreedyBot`; `greedy_fast` builds the
+obs-only `GreedyBot` wrapped in a `HeuristicAgent`. Training is unchanged — the
+opponent pool still uses the obs-only `GreedyBot`.
+
+---
+
+## Shared evaluation & the SimGreedyBot rebuild (2026-07-24)
+
+### Why: the old GreedyBot and LookaheadBot chose alike and ignored features
+
+`LookaheadBot._ordering_key`'s buckets (attack > control > tactic > move > deploy >
+bolster > face-down) are exactly `GreedyBot`'s obs-only priority ladder, and on the
+many turns with no reward-bearing move in the search horizon the leaf potential is
+nearly flat, so minimax falls back to that ordering — i.e. LookaheadBot often
+degenerated to GreedyBot's pick. Both were also written before the full game
+existed: `GreedyBot` never recruits/bolsters/claims-initiative/initiates a tactic
+(it can't simulate, and it operates on the ego-centric obs), and `LookaheadBot`
+buckets recruit/bolster/initiative below its `max_branching=8` cap so they are
+pruned before evaluation.
+
+### Shared `HeuristicEvaluator` (`evaluation.py`)
+
+Single source of truth for "how good is this state for `root_player`", in
+`rollout_core`'s reward-scale units. `LookaheadBot._leaf_potential`,
+`LookaheadCriticBot` (inherited), and `SimGreedyBot` all delegate to it, so they
+agree on state value. With `enable_new_terms=False` (the default) it reproduces the
+exact old base/material/positional/risk `_leaf_potential` formula byte-for-byte
+(`tests/test_evaluation.py`), which is what keeps `LookaheadCriticBot`'s value-scale
+calibration — moment-matched to that distribution — valid.
+
+### SimGreedyBot: shallow but plays the real game
+
+For each legal root action it plays out the bot's whole turn (the action plus any
+pending tactic continuation, resolved greedily to a quiescent state), then lets the
+opponent play their single best whole turn against it (`reply_branching`-capped),
+and scores the result — root maximizes, the reply minimizes. This:
+
+- covers **every** verb for free (recruit/bolster/claim_initiative/tactic are just
+  legal actions scored on their simulated consequence), so it uses the units the
+  obs `GreedyBot` can't (Archer/Lancer/Cavalry/Ensign/Marshall …);
+- picks the **best** attack/control/deploy (not the first), and gets Pikeman
+  counter-coins, the Knight bolster-gate and recaptures right automatically because
+  it scores the *resulting* state;
+- is opponent-aware, which a pure 1-ply greedy is not — that 2nd ply is what took
+  it from 95% to **100% vs RandomBot** and stopped it walking into free recaptures.
+
+**Terminal dominance:** the base-PBRS leaf term is a *shaping* quantity, not a
+bounded value — with a big base lead it can numerically exceed `WIN_REWARD`, so a
+plain argmax would prefer holding a 5-base position (~1.16) to actually winning
+(1.0). Game-ending outcomes are therefore returned as a dominating ±`_TERMINAL_VALUE`.
+
+### Negative result: the "new" eval terms hurt — kept OFF
+
+Step 0 of the plan added durability/economy/tempo/progress terms to nudge the bots
+toward the ignored features. **Measurement showed them net-harmful and they default
+OFF (`rich_eval=False`) everywhere:**
+
+| Bot / config | Result |
+|---|---|
+| SimGreedyBot rich=False vs obs `GreedyBot` | ~47–48% (stable), healthy profile (move 43%, pass 14%) |
+| SimGreedyBot rich=True vs obs `GreedyBot` | ~40–43%; `economy` made it spam `recruit` (~1/3 of moves) |
+| LookaheadBot rich=False vs obs `GreedyBot` | **79%** |
+| LookaheadBot rich=True vs obs `GreedyBot` | 50% |
+| LookaheadBot rich=True **vs** rich=False | **20%** |
+
+The terms reward long-horizon assets (a deeper deck, initiative, a bolstered stack)
+that a depth-bounded search leaf can't cash in, so the bot trades away tempo for
+them; `economy` was the worst. The features are already used *correctly* without
+these terms, because every consumer scores an already-simulated state (a tactic's
+kill, a bolster that saves a hanging unit via the risk term, etc. all show up in
+`boxed`/stacks/at-risk on their own). The terms are retained (off) as a documented
+negative result and a tunable for a possible trained-value or much deeper context —
+do not enable without re-measuring. Corollary: the planned "unprune
+recruit/bolster/initiative in `LookaheadBot._ordering_key`" change was **dropped** —
+forcing those low-value moves into the search would hurt for the same reason.
+
+### Validation (full-field gauntlet, k=24, seed=7)
+
+Fully transitive, sensible tiers — greedy and lookahead are now clearly distinct:
+
+```
+BT ranking:  lookahead 1318  >  greedy 1124  >  greedy_fast 1084  >  random 474
+WR: lookahead vs greedy 0.79 | greedy vs greedy_fast 0.58 | all bots vs random 1.00
+```
+
+`SimGreedyBot` self-reports a `usage` Counter (verb class committed per move) for the
+"does it use the whole game now?" check. Six self-play games at the default
+`rich_eval=False` exercise claim_initiative (~10%), tactic (~7%), recruit (~3%),
+plus control/deploy/attack — all things the obs `GreedyBot` can never play. `bolster`
+stays ~0%: bolstering is usually a tempo loss a shallow search won't pick (the obs
+`GreedyBot` never bolsters either), and the durability term that would nudge it is
+part of the net-harmful `rich_eval` bundle left off by default.
 
 ---
 

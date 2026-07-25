@@ -56,6 +56,19 @@ def _latest_critic_path():
     return max(candidates, key=version)
 
 
+def _critic_agent_name(path):
+    """Short, column-header-safe display name for a lookahead_critic built from `path`.
+
+    The report truncates matrix column headers to 6 chars, so distinct critics must
+    differ within the first 6. `.../lookahead_critic_v3.pth` -> `lac_v3`; anything without
+    a `_v{N}` suffix falls back to the (truncated) stem so two arbitrary paths still differ.
+    """
+    m = re.search(r'_v(\d+)\.pth$', os.path.basename(path))
+    if m:
+        return f'lac_v{m.group(1)}'
+    return 'lac_' + os.path.splitext(os.path.basename(path))[0][:6]
+
+
 def _build_specs(args):
     """Turn CLI args into agent specs (picklable, order matches the field/report).
 
@@ -76,6 +89,8 @@ def _build_specs(args):
             specs.append({'kind': 'policy', 'path': path})
     if 'greedy' in args.bots:
         specs.append({'kind': 'greedy', 'name': 'greedy'})
+    if 'greedy_fast' in args.bots:
+        specs.append({'kind': 'greedy_fast', 'name': 'greedy_fast'})
     if 'random' in args.bots:
         specs.append({'kind': 'random', 'name': 'random'})
     if 'lookahead' in args.bots:
@@ -85,13 +100,22 @@ def _build_specs(args):
             'see_opponent_hand': not args.lookahead_blind,
         }})
     if 'lookahead_critic' in args.bots:
+        # One lookahead_critic per --lookahead-critic-checkpoints path (each named by its
+        # critic version, e.g. lac_v2 / lac_v3, so several critics can be compared head to
+        # head in one field). Falls back to the single newest critic when none are given.
         # Depends on a critic checkpoint that may not exist in every environment (e.g. a
         # fresh checkout with no training run yet) — skip with a warning rather than crash.
-        critic_path = _latest_critic_path()
-        if critic_path is None:
+        crit_paths = args.lookahead_critic_checkpoints
+        if not crit_paths:
+            latest = _latest_critic_path()
+            crit_paths = [latest] if latest else []
+        if not crit_paths:
             print(f'  ! skipping lookahead_critic: no checkpoint matching {CRITIC_GLOB}')
-        else:
-            specs.append({'kind': 'lookahead_critic', 'name': 'lookahead_critic', 'kwargs': {
+        for critic_path in crit_paths:
+            # A single critic keeps the plain 'lookahead_critic' name (back-compat with the
+            # old single-bot default); multiple get versioned lac_v* names to stay distinct.
+            name = 'lookahead_critic' if len(crit_paths) == 1 else _critic_agent_name(critic_path)
+            specs.append({'kind': 'lookahead_critic', 'name': name, 'kwargs': {
                 'critic_path': critic_path,
                 'beam_width': args.lookahead_critic_beam_width,
                 'max_branching': args.lookahead_critic_max_branching,
@@ -199,8 +223,8 @@ def main():
     parser = argparse.ArgumentParser(description='Warchest round-robin gauntlet.')
     parser.add_argument('--bots', nargs='+',
                         default=['policy', 'greedy', 'lookahead', 'lookahead_critic', 'policy_critic'],
-                        choices=['policy', 'greedy', 'random', 'lookahead', 'lookahead_critic',
-                                 'policy_critic', 'round_critic'],
+                        choices=['policy', 'greedy', 'greedy_fast', 'random', 'lookahead',
+                                 'lookahead_critic', 'policy_critic', 'round_critic'],
                         help='Participant kinds to include in the field. Default: '
                              'policy greedy lookahead lookahead_critic policy_critic. "policy" '
                              'loads checkpoints per --checkpoints (or the data/*.pth glob); '
@@ -231,6 +255,11 @@ def main():
     parser.add_argument('--lookahead-critic-blind', action='store_true',
                         help="LookaheadCriticBot doesn't read the opponent's real hand "
                              "(fair mode).")
+    parser.add_argument('--lookahead-critic-checkpoints', nargs='*', default=None,
+                        help='Critic .pth paths, one lookahead_critic agent each (named by '
+                             'version, e.g. lac_v2 / lac_v3) — used when "lookahead_critic" is '
+                             'in --bots. Defaults to the single newest '
+                             'data/lookahead_critic/lookahead_critic_v*.pth.')
     parser.add_argument('--policy-critic-policy', default=None,
                         help='Policy .pth whose actor supplies policy_critic\'s move prior. '
                              'Defaults to the newest data/warchest_ppo_*.pth. The beam width, '

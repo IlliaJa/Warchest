@@ -206,9 +206,14 @@ class LookaheadCriticBot(LookaheadBot):
                     f'No checkpoint matching {CRITIC_GLOB} — pass critic_path '
                     f'explicitly, or train and save one first.'
                 )
+        # rich_eval=False: this bot's value-scale calibration is moment-matched to
+        # `_leaf_potential`'s exact distribution (see docs/bots.md), so its leaf
+        # must stay the legacy base/material/pos/risk formula. The new
+        # bolster/recruit/tempo terms would shift that distribution and invalidate
+        # the calibration; they belong to the hand-tuned LookaheadBot, not here.
         super().__init__(time_budget=time_budget, max_branching=max_branching,
                           see_opponent_hand=see_opponent_hand, max_depth=max_depth,
-                          gamma=gamma, shaping_anneal=1.0, name=name)
+                          gamma=gamma, shaping_anneal=1.0, rich_eval=False, name=name)
         self.beam_width = beam_width
         self.n_determinizations = n_determinizations
         self.stats_log_every = stats_log_every

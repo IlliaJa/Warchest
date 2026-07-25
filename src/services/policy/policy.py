@@ -209,16 +209,36 @@ class Policy(nn.Module):
         dist = Categorical(logits=self._obs_logits(obs))
         return dist.log_prob(action), dist.entropy()
 
+    def _verb_marginal_entropy(self, verb_logits, mask):
+        """Entropy of the top-level verb marginal P(verb), over legal verbs only. [B].
+
+        Distinct from the flat-joint entropy: the joint distribution is dominated by
+        the many spatial (cell, direction) actions, so a bonus on its entropy barely
+        constrains the 11-way verb marginal and lets low-cardinality verbs (BOLSTER,
+        TACTIC) collapse out of the repertoire before reward can reinforce them. A
+        dedicated bonus on this quantity keeps rare verbs alive (docs/IDEAS.md #8).
+        """
+        NEG = -1e9
+        B = mask.shape[0]
+        g = self._verb_index.unsqueeze(0).expand(B, -1)  # [B, A]
+        legal_per_verb = torch.zeros(B, N_FACTORED_VERBS, dtype=verb_logits.dtype, device=mask.device)
+        legal_per_verb.scatter_add_(1, g, mask.to(verb_logits.dtype))
+        verb_mask = legal_per_verb > 0  # verbs with at least one legal action
+        verb_logp = F.log_softmax(verb_logits.masked_fill(~verb_mask, NEG), dim=1)  # [B, V]
+        return Categorical(logits=verb_logp).entropy()
+
     def evaluate_actions_batch(self, batch):
         """Single forward pass over a full buffer batch.
 
         batch keys (all on device): board (N,C,7,7), global (N,GLOBAL_DIM),
-        mask (N,A) bool, actions (N,) long. Returns log_probs (N,), entropies (N,).
+        mask (N,A) bool, actions (N,) long. Returns log_probs (N,), flat-joint
+        entropies (N,), verb-marginal entropies (N,).
         """
         flat_logits, verb_logits = self._features(batch['board'], batch['global'])
         joint = self._joint_log_probs(flat_logits, verb_logits, batch['mask'])
         dist = Categorical(logits=joint)
-        return dist.log_prob(batch['actions']), dist.entropy()
+        verb_ent = self._verb_marginal_entropy(verb_logits, batch['mask'])
+        return dist.log_prob(batch['actions']), dist.entropy(), verb_ent
 
 
 class Critic(nn.Module):

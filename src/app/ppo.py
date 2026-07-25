@@ -132,6 +132,11 @@ class PPOTrainer:
         self._entropy_coeff_init = hp['entropy_coeff']
         self._entropy_coeff_final = hp.get('entropy_coeff_final', hp['entropy_coeff'])
         self._entropy_coeff = self._entropy_coeff_init
+        # Separate bonus on the verb-marginal entropy, annealed to a non-zero floor so
+        # low-cardinality verbs stay in the repertoire (docs/IDEAS.md #8). 0.0 => disabled.
+        self._verb_entropy_coeff_init = hp.get('verb_entropy_coeff', 0.0)
+        self._verb_entropy_coeff_final = hp.get('verb_entropy_coeff_final', self._verb_entropy_coeff_init)
+        self._verb_entropy_coeff = self._verb_entropy_coeff_init
         # learning rates are linearly decayed init -> init*lr_final_frac (0 => decay to 0)
         self._lr_actor_init = hp['lr_actor']
         self._lr_critic_init = hp['lr_critic']
@@ -231,6 +236,10 @@ class PPOTrainer:
         self._entropy_coeff = (
             self._entropy_coeff_init
             + frac * (self._entropy_coeff_final - self._entropy_coeff_init)
+        )
+        self._verb_entropy_coeff = (
+            self._verb_entropy_coeff_init
+            + frac * (self._verb_entropy_coeff_final - self._verb_entropy_coeff_init)
         )
         lr_scale = 1.0 - frac * (1.0 - self._lr_final_frac)
         for group in self._actor_optimizer.param_groups:
@@ -440,6 +449,7 @@ class PPOTrainer:
         kl_accum = 0.0
         actor_accum = 0.0
         entropy_accum = 0.0
+        verb_entropy_accum = 0.0
         clip_frac_accum = 0.0
         last_actor_grad = 0.0
         n_actor_updates = 0
@@ -447,7 +457,7 @@ class PPOTrainer:
 
         for epoch in range(self._ppo_epochs):
             for batch in self._buffer.iter_minibatches(self._minibatch_size, self._device):
-                lp_new, ent = self._policy.evaluate_actions_batch(batch)
+                lp_new, ent, verb_ent = self._policy.evaluate_actions_batch(batch)
                 lp_old = batch['log_probs_old']
                 ratio = (lp_new - lp_old).exp()
                 approx_kl = ((ratio - 1) - (lp_new - lp_old)).detach().mean().item()
@@ -463,7 +473,11 @@ class PPOTrainer:
                 adv = batch['advantages']
                 clipped_ratio = ratio.clamp(1 - self._ppo_eps, 1 + self._ppo_eps)
                 actor_loss = -torch.min(ratio * adv, clipped_ratio * adv).mean()
-                loss = actor_loss - self._entropy_coeff * ent.mean()
+                loss = (
+                    actor_loss
+                    - self._entropy_coeff * ent.mean()
+                    - self._verb_entropy_coeff * verb_ent.mean()
+                )
 
                 self._actor_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -485,6 +499,7 @@ class PPOTrainer:
                 kl_accum += (lp_old - lp_new).detach().mean().item()
                 actor_accum += actor_loss.item()
                 entropy_accum += ent.detach().mean().item()
+                verb_entropy_accum += verb_ent.detach().mean().item()
                 clip_frac_accum += ((ratio - 1.0).abs() > self._ppo_eps).float().mean().item()
                 n_actor_updates += 1
 
@@ -498,6 +513,7 @@ class PPOTrainer:
             'avg_kl': kl_accum / denom,
             'avg_actor': actor_accum / denom,
             'avg_entropy': entropy_accum / denom,
+            'avg_verb_entropy': verb_entropy_accum / denom,
             'avg_clip_frac': clip_frac_accum / denom,
             'last_actor_grad': last_actor_grad,
             'n_actor_updates': n_actor_updates,
@@ -750,7 +766,9 @@ class PPOTrainer:
                if self._dense_critic else '')
             + f'kl={s["avg_kl"]:.4f} ent={s["avg_entropy"]:.3f} '
             f'ent_max={max_entropy:.3f} ent_frac={entropy_frac:.2f} '
-            f'ent_c={self._entropy_coeff:.4f} lr={self._actor_optimizer.param_groups[0]["lr"]:.2e} '
+            f'verb_ent={s["avg_verb_entropy"]:.3f} '
+            f'ent_c={self._entropy_coeff:.4f} verb_ent_c={self._verb_entropy_coeff:.4f} '
+            f'lr={self._actor_optimizer.param_groups[0]["lr"]:.2e} '
             f'grad_a={s["last_actor_grad"]:.3f} grad_c={s["last_critic_grad"]:.3f} '
             f'pool={len(self._pool)} turns={avg_turns:.0f} invalid={total_invalid} '
             f't={time.time() - self._batch_start:.2f}s'
@@ -776,6 +794,8 @@ class PPOTrainer:
                 'critic_loss': s['avg_critic'],
                 'approx_kl': s['avg_kl'],
                 'entropy': s['avg_entropy'],
+                'verb_entropy': s['avg_verb_entropy'],
+                'verb_entropy_coeff': self._verb_entropy_coeff,
                 'grad_norm_actor': s['last_actor_grad'],
                 'grad_norm_critic': s['last_critic_grad'],
                 'clip_frac': s['avg_clip_frac'],
@@ -844,6 +864,15 @@ if __name__ == '__main__':
         'ppo_eps': 0.2,
         'entropy_coeff': 0.025,
         'entropy_coeff_final': 0.003,  # linearly annealed from entropy_coeff over the run
+        # Dedicated entropy bonus on the top-level verb marginal P(verb) (docs/IDEAS.md #8).
+        # The flat-joint entropy above is dominated by the many spatial actions, so it
+        # barely constrains the 11-way verb head and lets rare verbs (BOLSTER, TACTIC)
+        # collapse out of the repertoire in the first ~80 batches (see the bolster_per_ep
+        # 10.2 -> 0.3 crash in ppo_20260713-144024). Unlike the flat coeff this anneals to a
+        # meaningful floor, not near-zero, so the rare verbs stay sampled long enough for a
+        # stack-punishing opponent / material PBRS to reinforce them. Set to 0.0 to disable.
+        'verb_entropy_coeff': 0.02,
+        'verb_entropy_coeff_final': 0.01,
         'holding_reward_rate': holding_reward_rate,
         'minibatch_size': 64,
         # Parallel rollout collection (docs/parallel_rollouts.md). 1 = in-process; 6 leaves

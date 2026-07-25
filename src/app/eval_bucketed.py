@@ -1,17 +1,20 @@
-"""Bucketed evaluation + loss autopsy vs GreedyBot — docs/future_steps.md Step 0.
+"""Bucketed evaluation + loss autopsy vs LookaheadBot — docs/future_steps.md Step 0.
 
 The training-loop eval (`PPOTrainer._maybe_eval`) reports one aggregate win
 rate over 20 games. That hides the question that actually matters before any
-further reward/capacity work: is the ~75% ceiling driven by a handful of
+further reward/capacity work: is the ceiling driven by a handful of
 unwinnable random drafts, or by a real, fixable skill gap spread evenly
-across compositions? This script runs many games against GreedyBot, breaks
-the result down by which unit types were drafted on each side, and dumps a
-full record of every loss (final base score, both compositions, whether the
-policy ever initiated a tactic) so the two cases can be told apart.
+across compositions? This script runs many games against a LookaheadBot
+opponent (alpha-beta search under a wall-clock budget — a far stronger, more
+positional test than GreedyBot), breaks the result down by which unit types
+were drafted on each side, and dumps a full record of every loss (final base
+score, both compositions, whether the policy ever initiated a tactic) so the
+two cases can be told apart.
 
 Usage:
     python -m src.app.eval_bucketed --games 200
-    python -m src.app.eval_bucketed --model-path data/warchest_ppo_20260702-1442.pth --games 500
+    python -m src.app.eval_bucketed --games 500 --opp-knight-frac 0.5
+    python -m src.app.eval_bucketed --model-path data/warchest_ppo_20260702-1442.pth --lookahead-budget 0.2
 """
 import argparse
 import csv
@@ -23,17 +26,24 @@ import torch
 from rich.progress import track
 
 from src.services.policy.policy import Policy
+from src.services.policy.checkpoint import load_policy_checkpoint
+from src.services.bots.lookahead_bot import LookaheadBot
 from src.services.environment.warchest_env import (
     WarChestEnv, VERB_OF_ACTION, V_TACTIC, V_BOLSTER, V_CLAIM, V_ATTACK, V_CONTROL,
     DECLINE_ACTION_ID,
 )
 from src.services.environment.roster import UNIT_BY_ID
-from src.services.bots.greedy_bot import GreedyBot
 
 # The only unit whose ability triggers via the 'extra_maneuver' pending state
 # (chain maneuvers by paying its own stack) rather than TACTIC_VERB — so
 # `used_tactic` below is structurally blind to it; tracked separately.
 _STACK_CHAIN_UNIT_IDS = {u.id for u in UNIT_BY_ID.values() if u.extra_maneuvers_from_stack}
+
+# Knight can only be damaged by a bolstered attacker (roster: only_attackable_when_bolstered),
+# so a Knight in the OPPONENT's roster is the cleanest natural test of whether the policy
+# has learned bolster at all — docs/IDEAS.md #8/#1. --opp-knight-frac forces it into a
+# controllable share of games so the with/without-Knight WR split has real statistical power.
+KNIGHT_ID = next(u.id for u in UNIT_BY_ID.values() if u.name == 'Knight')
 
 
 def _find_latest_model() -> str:
@@ -47,9 +57,9 @@ def _unit_names(ids):
     return tuple(sorted(UNIT_BY_ID[i].name for i in ids))
 
 
-def play_one_game(env, policy, bot, main_pid, max_t):
-    """Play one policy-vs-GreedyBot game; return a per-game diagnostic record."""
-    state, _ = env.reset()
+def play_one_game(env, policy, bot, main_pid, max_t, reset_options=None):
+    """Play one policy-vs-LookaheadBot game; return a per-game diagnostic record."""
+    state, _ = env.reset(options=reset_options)
     opp_pid = 3 - main_pid
     used_tactic = False
     # docs/IDEAS.md #9: base-lead (my_bases - opp_bases) at the moment each tactic is
@@ -90,15 +100,19 @@ def play_one_game(env, policy, bot, main_pid, max_t):
             acting_pid == main_pid and pending is not None
             and pending.kind == 'extra_maneuver'
         )
-        with torch.no_grad():
-            if acting_pid == main_pid:
+        if acting_pid == main_pid:
+            with torch.no_grad():
                 action, _, _ = policy.act(state)
-            else:
-                action, _, _ = bot.act(state)
-        if is_chain_offer:
-            chain_offered += 1
-            chain_used += int(action != DECLINE_ACTION_ID)
-        env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
+            if is_chain_offer:
+                chain_offered += 1
+                chain_used += int(action != DECLINE_ACTION_ID)
+            # Policy reads an ego-centric obs, so its action needs remapping to the
+            # absolute env frame when it plays as player 2.
+            env_action = WarChestEnv.remap_action(action) if acting_pid == 2 else action
+        else:
+            # LookaheadBot reads the live env and returns an absolute-frame action id
+            # directly (no ego-centric obs, no remap) — same contract as the gauntlet.
+            env_action = bot.act(env)
 
         if expect_double_turn_check:
             if acting_pid == main_pid:
@@ -351,6 +365,36 @@ def _print_bolster_breakdown(records):
         print(f'  {name:<16} {tot:>9} {with_sup:>15} {avg_str:>16} {full_avail:>16}')
 
 
+def _print_knight_matchup_breakdown(records):
+    """docs/IDEAS.md #8/#1: the Knight is only attackable by a bolstered attacker, so a
+    Knight in the OPPONENT's roster is a state where bolster is *mechanically required*
+    to remove it. This is the discriminator between the two 'tried-then-dropped' causes:
+      - if WR collapses when the opponent has a Knight AND the policy rarely bolsters in
+        those games -> bolster was valuable and got wrongly pruned (exploration gap);
+      - if WR holds up (or bolstering doesn't move WR) -> bolster genuinely wasn't worth
+        it under current play (credit gap) and IDEAS #8's intrinsic-bonus fix is on target.
+    Run with --opp-knight-frac 0.5 for enough games in the with-Knight bucket."""
+    with_knight = [r for r in records if 'Knight' in r['opp_composition']]
+    without_knight = [r for r in records if 'Knight' not in r['opp_composition']]
+    print(f'\n=== Opponent-Knight matchup (bolster is required to kill a Knight) ===')
+    wr_w, se_w = _wr_and_se(sum(r['outcome'] == 'win' for r in with_knight), len(with_knight))
+    wr_wo, se_wo = _wr_and_se(sum(r['outcome'] == 'win' for r in without_knight), len(without_knight))
+    print(f'  WR | opponent HAS a Knight:  {wr_w:.3f} ± {se_w:.3f} (n={len(with_knight)})')
+    print(f'  WR | opponent has NO Knight: {wr_wo:.3f} ± {se_wo:.3f} (n={len(without_knight)})')
+    if not with_knight:
+        print('  (no games with a Knight in the opponent roster — pass --opp-knight-frac)')
+        return
+    bolstered = [r for r in with_knight if r['bolster_count'] > 0]
+    print(f'  Bolstered >=1 when facing a Knight: {len(bolstered)}/{len(with_knight)} '
+          f'({len(bolstered) / len(with_knight):.1%})')
+    not_bolstered = [r for r in with_knight if r['bolster_count'] == 0]
+    if bolstered and not_bolstered:
+        wr_b, se_b = _wr_and_se(sum(r['outcome'] == 'win' for r in bolstered), len(bolstered))
+        wr_nb, se_nb = _wr_and_se(sum(r['outcome'] == 'win' for r in not_bolstered), len(not_bolstered))
+        print(f'    WR | faced Knight, bolstered:     {wr_b:.3f} ± {se_b:.3f} (n={len(bolstered)})')
+        print(f'    WR | faced Knight, never bolstered:{wr_nb:.3f} ± {se_nb:.3f} (n={len(not_bolstered)})')
+
+
 def _print_exact_composition_breakdown(records, min_games=3):
     counts = defaultdict(lambda: [0, 0])  # composition -> [wins, games (excl. truncated)]
     for r in records:
@@ -373,13 +417,20 @@ def _print_exact_composition_breakdown(records, min_games=3):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Bucketed evaluation + loss autopsy vs GreedyBot (future_steps.md Step 0).')
+        description='Bucketed evaluation + loss autopsy vs LookaheadBot (future_steps.md Step 0).')
     parser.add_argument('--model-path', type=str, default=None,
                          help='Path to .pth file. Defaults to the latest data/warchest_ppo_*.pth.')
     parser.add_argument('--games', type=int, default=200)
     parser.add_argument('--hidden-dim', type=int, default=64)
     parser.add_argument('--max-t', type=int, default=1000)
     parser.add_argument('--seed', type=int, default=None)
+    parser.add_argument('--lookahead-budget', type=float, default=0.1,
+                         help='Per-move wall-clock search budget in seconds for the '
+                              'LookaheadBot opponent (iterative deepening stops here).')
+    parser.add_argument('--opp-knight-frac', type=float, default=0.0,
+                         help='Fraction of games in which a Knight is forced into the '
+                              'opponent roster (0..1). Bolster is required to kill a '
+                              'Knight, so this stress-tests bolster usage (docs/IDEAS.md #8).')
     parser.add_argument('--out-csv', type=str, default=None,
                          help='Optional path to dump every game record as CSV.')
     args = parser.parse_args()
@@ -390,17 +441,24 @@ def main():
     model_path = args.model_path or _find_latest_model()
     print(f'Loading model: {model_path}')
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    policy = Policy(device=device, hidden_dim=args.hidden_dim).to(device)
-    policy.load_state_dict(torch.load(model_path, map_location=device))
+    # Accept both the metadata-envelope and legacy bare-state_dict checkpoint formats,
+    # and honour the checkpoint's own hidden_dim over the CLI default.
+    ckpt = load_policy_checkpoint(model_path, map_location=device, default_hidden_dim=args.hidden_dim)
+    policy = Policy(device=device, hidden_dim=ckpt['hidden_dim']).to(device)
+    policy.load_state_dict(ckpt['state_dict'])
     policy.eval()
 
-    bot = GreedyBot()
+    bot = LookaheadBot(name='lookahead', time_budget=args.lookahead_budget)
+    print(f'Opponent: LookaheadBot (time_budget={args.lookahead_budget}s)')
     env = WarChestEnv(save_game_history=False)
 
     records = []
     for _ in track(range(args.games), description='games'):
         main_pid = int(np.random.choice([1, 2]))
-        records.append(play_one_game(env, policy, bot, main_pid, args.max_t))
+        reset_options = None
+        if args.opp_knight_frac > 0 and np.random.random() < args.opp_knight_frac:
+            reset_options = {'force_units': {3 - main_pid: [KNIGHT_ID]}}
+        records.append(play_one_game(env, policy, bot, main_pid, args.max_t, reset_options))
 
     decisive = [r for r in records if r['outcome'] != 'truncated']
     wins = sum(r['outcome'] == 'win' for r in decisive)
@@ -409,7 +467,7 @@ def main():
 
     print(f'\n=== Overall ===')
     print(f'games={len(records)}  decisive={len(decisive)}  truncated={truncated_n}')
-    print(f'WR vs greedy = {wr:.3f} ± {se:.3f} (95% CI ≈ ±{1.96 * se:.3f})')
+    print(f'WR vs lookahead = {wr:.3f} ± {se:.3f} (95% CI ≈ ±{1.96 * se:.3f})')
 
     tactic_games = [r for r in decisive if r['used_tactic']]
     no_tactic_games = [r for r in decisive if not r['used_tactic']]
@@ -423,6 +481,7 @@ def main():
 
     _print_tactic_lead_breakdown(decisive)
     _print_bolster_breakdown(decisive)
+    _print_knight_matchup_breakdown(decisive)
     _print_initiative_breakdown(decisive)
 
     # Stack-chain units (Berserker: extra_maneuvers_from_stack) never touch V_TACTIC —

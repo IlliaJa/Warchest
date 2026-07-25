@@ -276,10 +276,14 @@ class WarChestEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.set_init_state()
+        # options={'force_units': {pid: [unit_id, ...]}} pins those unit types into a
+        # player's drafted composition (used by eval to force controlled matchups, e.g.
+        # a Knight always in the opponent's roster — docs/IDEAS.md #8/#1 diagnostic).
+        force_units = (options or {}).get('force_units')
+        self.set_init_state(force_units=force_units)
         return self.generate_observation(), {}
 
-    def set_init_state(self):
+    def set_init_state(self, force_units=None):
         # Board starts with control markers on the starting locations but NO units;
         # units are deployed from hand during play. Initiative (and thus who acts
         # first) is assigned randomly, mirroring the setup Initiative Marker flip.
@@ -290,11 +294,25 @@ class WarChestEnv(gym.Env):
 
         # Draft: sample 8 distinct unit types, assign 4 to each player so the two
         # compositions never share a unit (mirrors a drafted War Chest setup).
-        drafted = np.random.choice(UNIT_COINS, size=2 * UNITS_PER_PLAYER, replace=False)
-        compositions = {
-            1: tuple(int(t) for t in drafted[:UNITS_PER_PLAYER]),
-            2: tuple(int(t) for t in drafted[UNITS_PER_PLAYER:]),
-        }
+        # `force_units` pins specific types into a player's share; the rest of each
+        # player's 4 is filled from a random draft over the remaining types.
+        force_units = force_units or {}
+        forced = {pid: tuple(force_units.get(pid, ())) for pid in (1, 2)}
+        forced_all = forced[1] + forced[2]
+        if len(set(forced_all)) != len(forced_all):
+            raise ValueError(f'force_units assigns a shared unit to both players: {forced}')
+        for pid in (1, 2):
+            if len(forced[pid]) > UNITS_PER_PLAYER:
+                raise ValueError(f'force_units[{pid}] exceeds {UNITS_PER_PLAYER} units')
+        remaining = np.array([u for u in UNIT_COINS if u not in forced_all])
+        n_fill = 2 * UNITS_PER_PLAYER - len(forced_all)
+        fill = iter(int(t) for t in np.random.choice(remaining, size=n_fill, replace=False))
+        compositions = {}
+        for pid in (1, 2):
+            units = list(forced[pid])
+            while len(units) < UNITS_PER_PLAYER:
+                units.append(next(fill))
+            compositions[pid] = tuple(units)
         self.state = GameState(board=board, active_player=owner, action_count=0,
                                initiative_owner=owner, compositions=compositions)
         # Reset before the draw loop below, since `_draw_hand` appends into it.
