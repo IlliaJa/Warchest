@@ -904,7 +904,14 @@ if __name__ == '__main__':
         # zero): the last ~25% of training then did no learning and the elo plateau in
         # those batches was purely the vanishing LR. 0.1 keeps a small floor so late
         # self-play refinement still moves the weights.
-        'hidden_dim': 64,
+        # IDEAS.md #5: widen the policy the same way the critic was widened, one clean
+        # step (64 -> 128) so a policy-capacity gain stays attributable — no added conv
+        # depth (the 3-layer trunk's radius-3 receptive field is deliberate, policy.py),
+        # no jump straight to 192. The policy/critic board encoders are independent during
+        # PPO rollout, so this does not touch the critic. Arch change: start a fresh run
+        # (old OBS_VERSION=9 pool snapshots + PuctBot prior checkpoint are incompatible),
+        # and A/B against the 64-wide baseline per the standing rule (IDEAS.md header).
+        'hidden_dim': 128,
         # Step 5 (docs/rewards_improvements.md): strengthen the *densifier*. The critic
         # is what turns the terminal reward into a per-step signal, so widen it alone
         # (policy left at hidden_dim) to keep the capacity A/B attributable. Safe because
