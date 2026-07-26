@@ -14,7 +14,8 @@ class OpponentPool:
 
     def __init__(self, max_size=20, snapshot_every=1, *, p_random, p_greedy, p_pool,
                  p_lookahead_critic=0.0, lookahead_critic_time_budget=0.1,
-                 lookahead_critic_device='cpu'):
+                 lookahead_critic_device='cpu', p_puct=0.0, puct_time_budget=0.1,
+                 puct_device='cpu'):
         self._snapshots = deque(maxlen=max_size)
         self._snapshot_every = snapshot_every
         self._batch_count = 0
@@ -24,7 +25,7 @@ class OpponentPool:
         self._append_count = 0
         self._greedy_bot = GreedyBot()
         self._weights = {'random': p_random, 'greedy': p_greedy, 'pool': p_pool,
-                         'lookahead_critic': p_lookahead_critic}
+                         'lookahead_critic': p_lookahead_critic, 'puct': p_puct}
         # LookaheadCriticBot is a search opponent: it is eval-scoped by design
         # (docs/bots.md), so as a training opponent it runs at a much smaller
         # per-move time_budget than its own default to keep rollout throughput
@@ -34,16 +35,25 @@ class OpponentPool:
         self._lookahead_time_budget = lookahead_critic_time_budget
         self._lookahead_device = lookahead_critic_device
         self._lookahead_bot = None
+        # PuctBot: full PUCT/MCTS search opponent. Like lookahead_critic it is
+        # search-scoped and runs at a small per-move budget in the rollout hot path;
+        # unlike it, it also needs a *policy* checkpoint (for priors) on top of the
+        # critic, so it can only be sampled once at least one `data/warchest_ppo_*.pth`
+        # exists (a fresh run with no snapshot yet must keep p_puct=0). Built lazily
+        # and reused the same way.
+        self._puct_time_budget = puct_time_budget
+        self._puct_device = puct_device
+        self._puct_bot = None
         # Reused across sample() calls: a pool opponent is only ever active within a
         # single (sequential) episode, so one instance can be recycled — we swap its
         # weights via load_state_dict instead of reconstructing a net + re-transferring
         # to device every episode (was a per-episode cost during rollout collection).
         self._cached_opp = None
 
-    def set_weights(self, *, p_random, p_greedy, p_pool, p_lookahead_critic=0.0):
+    def set_weights(self, *, p_random, p_greedy, p_pool, p_lookahead_critic=0.0, p_puct=0.0):
         """Replace sampling weights. Values are normalised automatically."""
         self._weights = {'random': p_random, 'greedy': p_greedy, 'pool': p_pool,
-                         'lookahead_critic': p_lookahead_critic}
+                         'lookahead_critic': p_lookahead_critic, 'puct': p_puct}
 
     @property
     def weights(self):
@@ -51,7 +61,8 @@ class OpponentPool:
         return {'p_random': self._weights['random'],
                 'p_greedy': self._weights['greedy'],
                 'p_pool': self._weights['pool'],
-                'p_lookahead_critic': self._weights['lookahead_critic']}
+                'p_lookahead_critic': self._weights['lookahead_critic'],
+                'p_puct': self._weights['puct']}
 
     def maybe_snapshot(self, policy):
         """Copy current policy weights into the pool (called after each batch update).
@@ -98,6 +109,21 @@ class OpponentPool:
             )
         return self._lookahead_bot
 
+    def _get_puct_bot(self):
+        """Lazily build (once) and return the shared PuctBot. Imported here, not at
+        module top, for the same reason as `_get_lookahead_bot`: pools that never
+        sample it pay none of the torch / policy+critic-checkpoint import cost.
+        Loads the newest policy + critic checkpoints (raises if either is missing).
+        """
+        if self._puct_bot is None:
+            from .bots.puct_bot import PuctBot
+            self._puct_bot = PuctBot(
+                time_budget=self._puct_time_budget,
+                device=self._puct_device,
+                stats_log_every=0,  # silent in the rollout hot path
+            )
+        return self._puct_bot
+
     def sample(self, policy_constructor, device):
         """Return (bot, opponent_type_str) sampled according to internal weights."""
         types = ['random', 'greedy']
@@ -105,6 +131,8 @@ class OpponentPool:
             types.append('pool')
         if self._weights.get('lookahead_critic', 0.0) > 0.0:
             types.append('lookahead_critic')
+        if self._weights.get('puct', 0.0) > 0.0:
+            types.append('puct')
         weights = np.array([self._weights[t] for t in types], dtype=float)
         weights /= weights.sum()
         choice = np.random.choice(types, p=weights)
@@ -115,6 +143,8 @@ class OpponentPool:
             return self._greedy_bot, 'greedy'
         if choice == 'lookahead_critic':
             return self._get_lookahead_bot(), 'lookahead_critic'
+        if choice == 'puct':
+            return self._get_puct_bot(), 'puct'
         idx = np.random.randint(len(self._snapshots))
         if self._cached_opp is None:
             self._cached_opp = policy_constructor()

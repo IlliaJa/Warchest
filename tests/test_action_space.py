@@ -17,6 +17,7 @@ from src.services.environment.warchest_env import (
 from src.services.environment.obs_encoders.v10 import (
     GLOBAL_DIM, BOARD_CHANNELS, PRIV_DIM, OBS_VERSION, PENDING_CTX_DIM,
 )
+from src.services.environment.obs_encoders import get_encoder
 from src.services.environment import roster
 
 
@@ -122,7 +123,8 @@ def test_select_is_spatial_and_remaps_like_a_cell():
 # --------------------------------------------------------------------------- #
 
 def test_observation_shapes():
-    env = WarChestEnv()
+    # Pinned to v10: the shape constants above are imported from the v10 encoder.
+    env = WarChestEnv(obs_encoder=get_encoder(10))
     obs, _ = env.reset()
     assert obs['board'].shape == (BOARD_CHANNELS, BOARD_DIM, BOARD_DIM)
     assert obs['global'].shape == (GLOBAL_DIM,)

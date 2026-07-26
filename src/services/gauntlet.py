@@ -28,6 +28,7 @@ from .bots.lookahead_bot import LookaheadBot
 from .bots.lookahead_critic_bot import LookaheadCriticBot
 from .bots.policy_critic_bot import PolicyCriticBot
 from .bots.round_critic_bot import RoundCriticBot
+from .bots.puct_bot import PuctBot
 from .policy.checkpoint import load_policy_checkpoint
 from .policy.policy import Policy
 
@@ -75,7 +76,7 @@ class HeuristicAgent(GauntletAgent):
         return WarChestEnv.remap_action(action) if env.active_player == 2 else action
 
 
-def greedy_agent(name='greedy', encoder=None):
+def greedy_sim_agent(name='greedy_sim', encoder=None):
     """The 1-ply forward-simulation greedy (`SimGreedyBot`) — the strong greedy
     yardstick. Speaks `act(env)` + `.name` directly (like LookaheadBot), so it
     drops in without a HeuristicAgent obs-encoding wrapper. `encoder` is accepted
@@ -87,7 +88,7 @@ def greedy_agent(name='greedy', encoder=None):
 def greedy_fast_agent(name='greedy_fast', encoder=None):
     """The legacy obs-only `GreedyBot` — cheap, hand-blind, no simulation. Kept as
     a separate entrant (and as the training-loop opponent, via opponent_pool) now
-    that `greedy` is the heavier simulation bot.
+    that `greedy_sim` is the heavier simulation bot.
     """
     return HeuristicAgent(name, GreedyBot(), encoder)
 
@@ -120,6 +121,13 @@ def round_critic_agent(name='round_critic', **kwargs):
     round), same `act(env)` contract — drops in directly.
     """
     return RoundCriticBot(name=name, **kwargs)
+
+
+def puct_agent(name='puct', **kwargs):
+    """PuctBot (full PUCT/MCTS: policy priors + critic value over a visit-counted
+    tree), same `act(env)` contract as the other search bots — drops in directly.
+    """
+    return PuctBot(name=name, **kwargs)
 
 
 def checkpoint_agent(path, device):
@@ -155,8 +163,8 @@ def build_agent(spec, *, device):
     across all agent kinds (see `gauntlet_parallel.py`).
     """
     kind = spec['kind']
-    if kind == 'greedy':
-        return greedy_agent(spec['name'])
+    if kind == 'greedy_sim':
+        return greedy_sim_agent(spec['name'])
     if kind == 'greedy_fast':
         return greedy_fast_agent(spec['name'])
     if kind == 'random':
@@ -169,6 +177,8 @@ def build_agent(spec, *, device):
         return policy_critic_agent(spec['name'], device=device, **spec.get('kwargs', {}))
     if kind == 'round_critic':
         return round_critic_agent(spec['name'], device=device, **spec.get('kwargs', {}))
+    if kind == 'puct':
+        return puct_agent(spec['name'], device=device, **spec.get('kwargs', {}))
     if kind == 'policy':
         agent = checkpoint_agent(spec['path'], device)
         if agent is None:

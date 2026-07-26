@@ -165,14 +165,17 @@ class PPOTrainer:
             'p_greedy': hp['p_greedy_initial'],
             'p_pool': hp['p_pool_initial'],
             'p_lookahead_critic': hp['p_lookahead_critic_initial'],
+            'p_puct': hp.get('p_puct_initial', 0.0),
         }
         self._opp_weights_finetune = {
             'p_random': hp['p_random_finetune'],
             'p_greedy': hp['p_greedy_finetune'],
             'p_pool': hp['p_pool_finetune'],
             'p_lookahead_critic': hp['p_lookahead_critic_finetune'],
+            'p_puct': hp.get('p_puct_finetune', 0.0),
         }
         self._lookahead_critic_time_budget = hp['lookahead_critic_time_budget']
+        self._puct_time_budget = hp.get('puct_time_budget', 0.1)
         # Dense critic targets (docs/next_steps.md): also regress the critic on opponent-
         # decision nodes via an auxiliary MC-return loss, on top of the unchanged main GAE
         # targets. Off by default — an opt-in experiment; the aux loss is scaled by
@@ -194,6 +197,8 @@ class PPOTrainer:
             p_pool=hp['p_pool_initial'],
             p_lookahead_critic=hp['p_lookahead_critic_initial'],
             lookahead_critic_time_budget=hp['lookahead_critic_time_budget'],
+            p_puct=hp.get('p_puct_initial', 0.0),
+            puct_time_budget=hp.get('puct_time_budget', 0.1),
         )
         self._buffer = RolloutBuffer()
         self._greedy_bot = GreedyBot()
@@ -202,6 +207,7 @@ class PPOTrainer:
         self._wr_vs_pool = deque(maxlen=100)
         self._wr_vs_greedy = deque(maxlen=100)
         self._wr_vs_lookahead_critic = deque(maxlen=100)
+        self._wr_vs_puct = deque(maxlen=100)
 
         # pre-computed once; actor-side params are needed for separate gradient clipping
         self._actor_side_params = list(self._policy.parameters())
@@ -346,6 +352,7 @@ class PPOTrainer:
                 pool_max_size=self._pool_max_size,
                 seed_base=self._rollout_seed,
                 lookahead_critic_time_budget=self._lookahead_critic_time_budget,
+                puct_time_budget=self._puct_time_budget,
                 collect_dense=self._dense_critic,
             )
 
@@ -703,11 +710,14 @@ class PPOTrainer:
                 self._wr_vs_pool.append(int(ep['outcome'] == 'win'))
             elif ep['opp_type'] == 'lookahead_critic':
                 self._wr_vs_lookahead_critic.append(int(ep['outcome'] == 'win'))
+            elif ep['opp_type'] == 'puct':
+                self._wr_vs_puct.append(int(ep['outcome'] == 'win'))
 
         wr_pool = float(np.mean(self._wr_vs_pool)) if self._wr_vs_pool else 0.0
         wr_greedy = float(np.mean(self._wr_vs_greedy)) if self._wr_vs_greedy else 0.0
         wr_lookahead = (float(np.mean(self._wr_vs_lookahead_critic))
                         if self._wr_vs_lookahead_critic else 0.0)
+        wr_puct = float(np.mean(self._wr_vs_puct)) if self._wr_vs_puct else 0.0
 
         s = update_stats
         avg_turns = float(np.mean([ep['turns'] for ep in self._batch_eps]))
@@ -790,6 +800,7 @@ class PPOTrainer:
                 'wr_vs_pool_train': wr_pool,
                 'wr_vs_greedy_train': wr_greedy,
                 'wr_vs_lookahead_critic_train': wr_lookahead,
+                'wr_vs_puct_train': wr_puct,
                 'actor_loss': s['avg_actor'],
                 'critic_loss': s['avg_critic'],
                 'approx_kl': s['avg_kl'],
@@ -859,7 +870,11 @@ if __name__ == '__main__':
         'collect_episodes': 64,
         'max_t': 1000,
         'gamma': 0.99,
-        'lam': 0.95,
+        # GAE-lambda raised 0.95 -> 0.97 (docs/IDEAS.md #7): propagates the terminal
+        # win/loss signal further back with less bias, densifying credit for
+        # delayed-payoff actions (bolster -> durable stack -> later trade/base) without
+        # touching the reward. Reward-neutral, so A/B against 0.95 in isolation.
+        'lam': 0.97,
         'ppo_epochs': 4,
         'ppo_eps': 0.2,
         'entropy_coeff': 0.025,
@@ -919,6 +934,15 @@ if __name__ == '__main__':
         # dominate rollout wall-clock. 0.1s keeps it a distinct, tougher opponent
         # without wrecking throughput.
         'lookahead_critic_time_budget': 0.1,
+        # PuctBot (full PUCT/MCTS) training opponent — OFF by default. Unlike
+        # lookahead_critic it also needs a *policy* checkpoint (data/warchest_ppo_*.pth)
+        # for its priors, which it loads (frozen) from disk on first sample; a fresh
+        # run with no checkpoint yet must therefore keep this at 0. Give it a slice
+        # (e.g. 0.15, trimming the others) to train against it, and note each of its
+        # moves runs a real 0.1s search — heavier than lookahead_critic per move.
+        'p_puct_initial': 0.00,
+        'p_puct_finetune': 0.00,
+        'puct_time_budget': 0.1,
         # win-rate vs random that triggers the phase switch
         'wr_random_finetune_threshold': 0.90,
         # self-play pool cadence: snapshot rarely so the max_size-slot pool spans a wide

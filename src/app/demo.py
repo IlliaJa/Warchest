@@ -7,9 +7,9 @@ from src.services.policy.policy import Policy
 from src.services.policy.checkpoint import load_policy_checkpoint
 from src.services.environment.warchest_env import WarChestEnv
 from src.services.environment.obs_encoders import get_encoder
-from src.services.gauntlet import PolicyAgent, greedy_agent, random_agent, lookahead_agent
+from src.services.gauntlet import PolicyAgent, greedy_sim_agent, random_agent, lookahead_agent
 
-AGENT_KINDS = ('policy', 'greedy', 'random', 'lookahead')
+AGENT_KINDS = ('policy', 'greedy_sim', 'random', 'lookahead')
 
 
 def build_agent(kind, name, *, policy=None, encoder=None, lookahead_kwargs=None):
@@ -18,8 +18,8 @@ def build_agent(kind, name, *, policy=None, encoder=None, lookahead_kwargs=None)
         if policy is None:
             raise ValueError(f'{name}: a loaded policy is required (--model-path)')
         return PolicyAgent(name, policy, encoder)
-    if kind == 'greedy':
-        return greedy_agent(name, encoder)
+    if kind == 'greedy_sim':
+        return greedy_sim_agent(name, encoder)
     if kind == 'random':
         return random_agent(name, encoder)
     if kind == 'lookahead':
@@ -65,8 +65,8 @@ if __name__ == '__main__':
                         help='Fallback hidden dim for legacy checkpoints without arch metadata.')
     parser.add_argument('--p1', type=str, default='policy', choices=AGENT_KINDS,
                         help='Player 1 agent (default: policy).')
-    parser.add_argument('--p2', type=str, default='greedy', choices=AGENT_KINDS,
-                        help='Player 2 agent (default: greedy).')
+    parser.add_argument('--p2', type=str, default='greedy_sim', choices=AGENT_KINDS,
+                        help='Player 2 agent (default: greedy_sim).')
     parser.add_argument('--lookahead-time-budget', type=float, default=0.5,
                         help='Per-move search budget in seconds, for lookahead agents.')
     parser.add_argument('--lookahead-max-branching', type=int, default=8,

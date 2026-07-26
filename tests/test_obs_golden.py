@@ -21,19 +21,23 @@ import numpy as np
 import pytest
 
 from src.services.environment.warchest_env import WarChestEnv
+from src.services.environment.obs_encoders import get_encoder
 
-_FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'golden_obs_v10.npz')
 _SEED = 12345
 _STEPS = 300
 
 
-def _deterministic_rollout(steps=_STEPS, seed=_SEED):
+def _fixture(version):
+    return os.path.join(os.path.dirname(__file__), 'fixtures', f'golden_obs_v{version}.npz')
+
+
+def _deterministic_rollout(version, steps=_STEPS, seed=_SEED):
     """Collect encoded observations over a fixed random-but-seeded rollout.
 
     Returns stacked arrays keyed like the obs dict, plus privileged and the
     acting player id, one row per step (resetting on terminal/truncation).
     """
-    env = WarChestEnv()
+    env = WarChestEnv(obs_encoder=get_encoder(version))
     np.random.seed(seed)
     env.reset()
 
@@ -60,15 +64,17 @@ def _deterministic_rollout(steps=_STEPS, seed=_SEED):
     }
 
 
-def test_obs_encoding_matches_golden():
-    data = _deterministic_rollout()
+@pytest.mark.parametrize('version', [10, 11])
+def test_obs_encoding_matches_golden(version):
+    data = _deterministic_rollout(version)
+    fixture = _fixture(version)
 
-    if os.environ.get('WARCHEST_REGEN_GOLDEN') or not os.path.exists(_FIXTURE):
-        os.makedirs(os.path.dirname(_FIXTURE), exist_ok=True)
-        np.savez_compressed(_FIXTURE, **data)
-        pytest.skip(f'golden baseline (re)generated at {_FIXTURE}; rerun to compare')
+    if os.environ.get('WARCHEST_REGEN_GOLDEN') or not os.path.exists(fixture):
+        os.makedirs(os.path.dirname(fixture), exist_ok=True)
+        np.savez_compressed(fixture, **data)
+        pytest.skip(f'golden baseline (re)generated at {fixture}; rerun to compare')
 
-    gold = np.load(_FIXTURE)
+    gold = np.load(fixture)
     # Exact equality: the encoder is deterministic, so a refactor that preserves
     # behavior must reproduce identical arrays (float op order included).
     np.testing.assert_array_equal(data['active'], gold['active'])

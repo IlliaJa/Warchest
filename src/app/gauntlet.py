@@ -8,8 +8,8 @@ all-pairs with balanced colors, then prints the win-rate matrix, a Bradley-Terry
 Examples:
     python src/app/gauntlet.py                         # all data/*.pth + baselines
     python src/app/gauntlet.py --checkpoints a.pth b.pth --k-games 40
-    python src/app/gauntlet.py --bots lookahead lookahead_critic policy greedy
-    python src/app/gauntlet.py --bots policy greedy    # drop the lookahead baselines
+    python src/app/gauntlet.py --bots lookahead lookahead_critic policy greedy_sim
+    python src/app/gauntlet.py --bots policy greedy_sim    # drop the lookahead baselines
 """
 import argparse
 import glob
@@ -87,8 +87,8 @@ def _build_specs(args):
             paths = sorted(glob.glob('data/warchest_ppo_*.pth'))
         for path in paths:
             specs.append({'kind': 'policy', 'path': path})
-    if 'greedy' in args.bots:
-        specs.append({'kind': 'greedy', 'name': 'greedy'})
+    if 'greedy_sim' in args.bots:
+        specs.append({'kind': 'greedy_sim', 'name': 'greedy_sim'})
     if 'greedy_fast' in args.bots:
         specs.append({'kind': 'greedy_fast', 'name': 'greedy_fast'})
     if 'random' in args.bots:
@@ -159,6 +159,24 @@ def _build_specs(args):
                 # (unbounded by default; max_depth is the only backstop).
                 'see_opponent_hand': not args.lookahead_critic_blind,
             }})
+    if 'puct' in args.bots:
+        # Full PUCT/MCTS bot. Like policy_critic it needs BOTH a critic (leaf
+        # values) and a policy (priors); skip with a warning if either is missing.
+        critic_path = _latest_critic_path()
+        policy_path = args.policy_critic_policy or _latest_policy_path()
+        if critic_path is None:
+            print(f'  ! skipping puct: no critic checkpoint matching {CRITIC_GLOB}')
+        elif policy_path is None:
+            print(f'  ! skipping puct: no policy checkpoint matching {POLICY_GLOB}')
+        else:
+            specs.append({'kind': 'puct', 'name': 'puct', 'kwargs': {
+                'critic_path': critic_path,
+                'policy_path': policy_path,
+                'c_puct': args.puct_c,
+                'max_branching': args.puct_max_branching,
+                'time_budget': args.puct_time_budget,
+                'see_opponent_hand': not args.lookahead_critic_blind,
+            }})
     return specs
 
 
@@ -222,11 +240,11 @@ def main():
 
     parser = argparse.ArgumentParser(description='Warchest round-robin gauntlet.')
     parser.add_argument('--bots', nargs='+',
-                        default=['policy', 'greedy', 'lookahead', 'lookahead_critic', 'policy_critic'],
-                        choices=['policy', 'greedy', 'greedy_fast', 'random', 'lookahead',
-                                 'lookahead_critic', 'policy_critic', 'round_critic'],
+                        default=['policy', 'greedy_sim', 'lookahead', 'lookahead_critic', 'policy_critic'],
+                        choices=['policy', 'greedy_sim', 'greedy_fast', 'random', 'lookahead',
+                                 'lookahead_critic', 'policy_critic', 'round_critic', 'puct'],
                         help='Participant kinds to include in the field. Default: '
-                             'policy greedy lookahead lookahead_critic policy_critic. "policy" '
+                             'policy greedy_sim lookahead lookahead_critic policy_critic. "policy" '
                              'loads checkpoints per --checkpoints (or the data/*.pth glob); '
                              'lookahead_critic, policy_critic and round_critic are skipped with '
                              'a warning if their required checkpoint is missing. round_critic is '
@@ -245,7 +263,7 @@ def main():
                         help="LookaheadBot doesn't read the opponent's real hand (fair mode).")
     parser.add_argument('--lookahead-critic-beam-width', type=int, default=5,
                         help='Children kept per node, for LookaheadCriticBot.')
-    parser.add_argument('--lookahead-critic-max-branching', type=int, default=8,
+    parser.add_argument('--lookahead-critic-max-branching', type=int, default=5,
                         help='Raw legal-action cap per node before critic scoring, '
                              'for LookaheadCriticBot.')
     parser.add_argument('--lookahead-critic-time-budget', type=float, default=0.1,
@@ -264,7 +282,16 @@ def main():
                         help='Policy .pth whose actor supplies policy_critic\'s move prior. '
                              'Defaults to the newest data/warchest_ppo_*.pth. The beam width, '
                              'branching cap, time budget and blind flag are shared with the '
-                             '--lookahead-critic-* options (both bots run the same search).')
+                             '--lookahead-critic-* options (both bots run the same search). '
+                             'Also supplies puct\'s prior policy.')
+    parser.add_argument('--puct-c', type=float, default=1.5,
+                        help='PUCT exploration constant, for PuctBot (higher = trust the '
+                             'policy prior / explore breadth longer). Default 1.5.')
+    parser.add_argument('--puct-max-branching', type=int, default=8,
+                        help='Highest-prior moves kept as children per node, for PuctBot '
+                             '(0 = all legal). Default 8.')
+    parser.add_argument('--puct-time-budget', type=float, default=0.1,
+                        help='Per-move search budget in seconds, for PuctBot. Default 0.1.')
     parser.add_argument('--n-workers', type=int, default=min(os.cpu_count() or 4, 8),
                         help='Parallel worker processes for game play. Default: '
                              'min(cpu_count, 8). 1 (or --sequential) plays in-process on '

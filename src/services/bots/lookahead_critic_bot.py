@@ -195,7 +195,7 @@ class LookaheadCriticBot(LookaheadBot):
     # base search pays nothing for the hook.
     _BOUNDS_BY_ROUND = False
 
-    def __init__(self, critic_path=None, beam_width=5, max_branching=8,
+    def __init__(self, critic_path=None, beam_width=5, max_branching=5,
                  time_budget=0.5, see_opponent_hand=True, max_depth=40, gamma=0.99,
                  opp_type='pool', n_determinizations=1, stats_log_every=20,
                  device='cpu', name='lookahead_critic'):

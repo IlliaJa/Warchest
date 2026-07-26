@@ -240,6 +240,20 @@ class Policy(nn.Module):
         verb_ent = self._verb_marginal_entropy(verb_logits, batch['mask'])
         return dist.log_prob(batch['actions']), dist.entropy(), verb_ent
 
+    def joint_log_probs_batch(self, batch):
+        """Full [N, A] masked joint log-prob matrix for a batch (board, global, mask).
+
+        Same forward as `evaluate_actions_batch` but returns the whole per-action
+        distribution instead of gathering one action's log-prob — for a distillation
+        cross-entropy against a target distribution over the action space:
+        `loss = -(target * joint).sum(dim=1).mean()`. Illegal ids sit at NEG (-1e9)
+        in `joint`, but are annihilated by `target[a] = 0` (a visit-count target only
+        puts mass on legal moves), so they never contribute to the loss or its grad.
+        Kept differentiable (no inference_mode) for training use.
+        """
+        flat_logits, verb_logits = self._features(batch['board'], batch['global'])
+        return self._joint_log_probs(flat_logits, verb_logits, batch['mask'])  # [N, A]
+
 
 class Critic(nn.Module):
     """Separate value network with its own spatial encoder.

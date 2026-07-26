@@ -8,14 +8,19 @@ for `LookaheadBot`'s original design rationale.
 |---|---|---|---|
 | `RandomBot` | `random_bot.py` | `act(obs)` | Uniform random legal action. |
 | `GreedyBot` (a.k.a. `greedy_fast`) | `greedy_bot.py` | `act(obs)` | Obs-only, hand-blind priority ladder: attack → control → move toward nearest base → deploy → pass. First action in each bucket, no search. **Cannot** recruit/bolster/claim-initiative/initiate a tactic, so it can't use half the roster (Archer/Lancer only attack via a tactic). Kept as the cheap training-loop opponent (`OPP_TYPE_IDX['greedy']`) and as the `greedy_fast` gauntlet entrant. |
-| `SimGreedyBot` (the gauntlet's `greedy`) | `greedy_sim_bot.py` | `act(env)` | Shallow (2-ply-in-turns) forward-simulation greedy scored by the shared `HeuristicEvaluator`. Uses the whole game (every verb, via simulated consequence), opponent-aware. See below. |
+| `SimGreedyBot` (the gauntlet's `greedy_sim`) | `greedy_sim_bot.py` | `act(env)` | Shallow (2-ply-in-turns) forward-simulation greedy scored by the shared `HeuristicEvaluator`. Uses the whole game (every verb, via simulated consequence), opponent-aware. See below. |
 | `LookaheadBot` | `lookahead_bot.py` | `act(env)` | Alpha-beta search; leaf delegated to the shared `HeuristicEvaluator` (`evaluation.py`), cheap ordering-key pruning (`_ordering_key`). |
 | `LookaheadCriticBot` | `lookahead_critic_bot.py` | `act(env)` | Beam search scored by a trained `Critic` network instead of a hand-tuned heuristic. See below. |
+| `PolicyCriticBot` | `policy_critic_bot.py` | `act(env)` | `LookaheadCriticBot` whose `max_branching` candidate cut is a trained policy's move prior instead of the heuristic ordering key. The prior is used *once* (to prune), then discarded — the beam still ranks by the critic. |
+| `RoundCriticBot` | `round_critic_bot.py` | `act(env)` | `PolicyCriticBot` that searches to the end of the current round rather than a fixed ply depth. |
+| `PuctBot` | `puct_bot.py` | `act(env)` | Full PUCT/MCTS: policy priors + critic value over a visit-counted tree, so the prior steers the *whole* search (not just a one-shot prune). See below. |
 | trained `Policy` | `policy/policy.py` | `act(obs)` | The PPO-trained actor, no search — wrapped as `PolicyAgent` in `gauntlet.py`. |
 
-Gauntlet name resolution: `greedy` builds `SimGreedyBot`; `greedy_fast` builds the
+Gauntlet name resolution: `greedy_sim` builds `SimGreedyBot`; `greedy_fast` builds the
 obs-only `GreedyBot` wrapped in a `HeuristicAgent`. Training is unchanged — the
-opponent pool still uses the obs-only `GreedyBot`.
+opponent pool still uses the obs-only `GreedyBot` (as `'greedy'` in `opponent_pool.py`
+and `OPP_TYPE_IDX` — a separate naming scheme from the gauntlet CLI's `--bots`, not
+renamed here since it never referred to `SimGreedyBot` in the first place).
 
 ---
 
@@ -249,6 +254,53 @@ the reliable read.
 | `n_determinizations=1` (reverted/confirmed) | 78% (k=40, seed=7) | Same code path, weight `[1.0]` — matches (exceeds, this run) the pre-experiment baseline; **shipped default** |
 | **Final (all fixes + 0.7/0.3 blend, `n_determinizations=1`), large samples** | **68-78%** (k=40 seed=7 × 2 runs, k=60 seed=99) | 60-75% on individual k=20 runs (seed-dependent noise) |
 
+### `max_branching`: root breadth vs. depth, default changed 8 → 5 (2026-07-26)
+
+Hypothesis going in: narrowing `max_branching` should buy more search depth for
+the same time budget, and more depth should mean stronger play. The first half
+is true; the second isn't — quality is **not monotonic** in depth.
+
+`--bots lookahead lookahead_critic [greedy_fast]`, `beam_width=5` and
+`time_budget=0.1s` fixed throughout, only `max_branching` varied:
+
+| `max_branching` | avg depth reached | avg nodes visited | WR vs `lookahead` (k=20) | WR vs `lookahead` (k=40 confirm) |
+|---|---|---|---|---|
+| 1 | ~5.9 | ~110 | 15% | — |
+| 2 | ~3.8 | ~90 | 55% | — |
+| 3 | ~3.0 | ~85 | 65% | — |
+| 4 | — | — | — | 60% |
+| **5** | ~2.0-2.15 | ~55-72 | **95%** | **88%** |
+| 6 | — | — | — | 68% |
+| 8 (old default) | ~1.3-1.7 | ~37-45 | 80% | 66% |
+
+`max_branching=1` reaches the *deepest* search of the sweep (~6 plies) and gives
+the *worst* result. The reason is structural: root and the opponent's immediate
+reply (ply 0/1) always keep the full configured `max_branching`/`beam_width`
+(see "Structural improvements" above). When `max_branching < beam_width`, the
+beam-keep step is a no-op — there's no real shortlist for the critic to choose
+from at the decision that matters most, so the bot just commits to the cheap
+ordering-key's top pick and searches deep *along that one already-decided
+line*. Depth without root breadth doesn't compare alternatives, it just
+double-checks one. Above `beam_width` (mb=6, 8), root breadth is real but the
+extra critic-forward cost per node collapses depth back to ~1.3-1.7 plies —
+too shallow to sanity-check the root pick against a real reply. The optimum
+sits at `max_branching == beam_width`, confirmed at k=40 (88% vs. 60-68% for
+the neighbors) — not simply "as narrow as possible."
+
+**Shipped:** `LookaheadCriticBot`'s own default (`lookahead_critic_bot.py`) and
+the gauntlet CLI's `--lookahead-critic-max-branching` default both changed
+8 → 5. This also changes `opponent_pool.py`'s training-time `LookaheadCriticBot`
+(built via `_get_lookahead_bot()`, which never overrides `max_branching`) — not
+just gauntlet eval. It happens to now match `PolicyCriticBot`'s own
+already-5 default (untested here, but same `beam_width=5`, so plausibly the
+same optimum). It does *not* touch `RoundCriticBot`'s own default of
+`max_branching=3` — its search is round-bounded rather than
+budget-iterative-deepened, so the same trade-off doesn't obviously transfer,
+and it hasn't been swept. Note the CLI flag is shared across
+`lookahead_critic`/`policy_critic`/`round_critic`, so running any of the
+latter two from the gauntlet CLI now defaults to 5 regardless of their own
+class defaults — pre-existing coupling, unchanged by this investigation.
+
 **Why the determinization vote didn't help:** at this bot's fixed 0.5s budget it's already depth-starved relative to `LookaheadBot`'s alpha-beta (see "structural improvements" above) — every split tested, even a lopsided 80/20 two-way one, took real depth away from the primary search, and the resulting hedge against a single unlucky future-draw sample never recovered what that lost depth cost. This is the classic Perfect-Information-Monte-Carlo determinization-averaging technique, and it's a legitimate lever *in general* — it just isn't a net win at a budget this tight. `LookaheadCriticBot.n_determinizations` is left in the code (default `1`, i.e. off) rather than removed, in case a future eval run uses a meaningfully larger `--lookahead-critic-time-budget`, where the primary search would stop being the bottleneck and a hedge could pay for itself.
 
 ### Known limitation, not fixed
@@ -339,3 +391,114 @@ training run to produce, not a code change here — or a meaningfully larger
 engineering effort (e.g. batching critic evaluation across whole tree levels
 rather than per-node, or a smarter search shape than beam + iterative
 deepening).
+
+---
+
+## PuctBot — full PUCT/MCTS (2026-07-26)
+
+`PolicyCriticBot`/`LookaheadCriticBot` are not MCTS: they run an alpha-beta-shaped
+*beam*, and the policy prior there only cuts each node's raw legal moves down to
+`max_branching` candidates before the beam ranks the survivors purely by the
+critic. The prior is used once and thrown away; it never enters a selection
+formula. `PuctBot` (`puct_bot.py`) is the real AlphaZero decomposition — "policy
+proposes, value evaluates" over an actual visit-counted tree:
+
+    argmax_a  [ ±Q(s,a) + c_puct · P(s,a) · sqrt(ΣN) / (1 + N(s,a)) ]
+
+so the prior keeps steering exploration for the *whole* search.
+
+### Design
+
+- **Subclass of `PolicyCriticBot`.** That class already loads both nets this
+  search needs (policy for priors, critic for leaf values), the encoders, the
+  value-scale calibration, the single-determinization forward-sim harness, the
+  real reward plumbing, and the `act()` wrapper that votes across
+  `n_determinizations`. All inherited verbatim; only `_act_once` is overridden —
+  it builds and runs a PUCT tree instead of a beam.
+- **Root-perspective min/max, not textbook negamax.** Turns don't strictly
+  alternate (tactic continuations, empty-hand skips) and this repo's reward
+  accounting is written in *root_player* perspective, so Q/W/rewards are stored
+  in root perspective and the perspective split lives only in *selection*: `+Q`
+  at root_player's nodes (maximize), `-Q` at the opponent's (minimize). The
+  exploration bonus is added the same way at both — it's about visit counts, not
+  sides. This reuses `LookaheadCriticBot`'s reward decomposition unchanged.
+- **One net eval per *node*, not per *child*.** `LookaheadCriticBot` critic-
+  scores every child at every node; PUCT expansion evaluates a node once (one
+  policy forward for all its priors, one critic forward for its leaf value), and
+  revisiting an expanded node costs nothing. This is what lets a real tree fit a
+  0.1s budget where the per-child beam is depth-starved. Measured: ~45–55
+  simulations/expansions per move at 0.1s, reaching avg tree depth ~8–11 (max
+  ~21), vs. the beam's typical depth 2–3.
+- **Leaf value = 0.7·critic + 0.3·`_leaf_potential`** (`critic_weight`), the same
+  blend and rationale as the beam bots: the critic is only moment-matched-
+  calibrated, so the reward-scale-correct heuristic hedges its directional noise.
+- **Final move by visit count** (AlphaZero's choice; more stable than argmax-Q at
+  low sim counts). The root visit distribution is exactly the policy target
+  expert iteration would later use (docs/next_steps.md — "search moves become new
+  training targets"); optional root Dirichlet noise (`dirichlet_alpha`, off by
+  default) is provided for that self-play use.
+
+### Interfaces & wiring
+
+Speaks the gauntlet `act(env)` contract (`--bots puct`, knobs `--puct-c`,
+`--puct-max-branching`, `--puct-time-budget`; needs both a critic *and* a policy
+checkpoint, like `policy_critic`). Also wired as a training opponent: it shares
+the `pool` opponent-onehot slot (`rollout_core.OPP_ONEHOT_SLOT`, like
+`lookahead_critic` — the critic's one-hot has no free slot), is routed through
+`act(env)` by `_opponent_env_action` (`_SEARCH_OPP_TYPES`), and is sampled by
+`OpponentPool` via `p_puct` / `puct_time_budget`. **Off by default**
+(`p_puct_initial = p_puct_finetune = 0.0`): unlike `lookahead_critic` it also
+needs a policy checkpoint on disk for its priors, which it loads frozen on first
+sample — so a fresh run with no `data/warchest_ppo_*.pth` yet must keep it at 0.
+Train-time win rate is logged as `wr_vs_puct_train`.
+
+### First result (parallel gauntlet, k=2, seed 0)
+
+A quick, small-sample sanity field had `puct` beating both `policy_critic` (2/0)
+and `greedy_sim` (2/0), topping the Bradley-Terry ranking (~1199 vs. 1000 for
+`policy_critic`) — i.e. the full tree search is stronger than the beam that reuses
+the same policy+critic, the effect the AlphaZero direction predicts. A later k≥8
+field confirmed it: `puct` first at ~1117 Elo over `lookahead_critic` (~1017),
+`policy_critic` (~982), `lookahead` (~882), fully transitive.
+
+### Expert iteration (ExIt / AlphaZero loop)
+
+Because `puct` is the strongest agent, its *own* search output is a better teacher
+than the raw policy that seeds it. `src/services/expert_iteration.py` +
+`src/app/expert_iteration.py` close that loop (docs/next_steps.md — "search moves
+become new training targets"):
+
+1. **gen** — `puct` self-plays (root Dirichlet noise, temperature-sampled moves);
+   per move it records the ego-frame obs, the ego-frame **root visit distribution**
+   (policy target), the critic's privileged inputs, and — after each game — the
+   outcome `z ∈ {+1,0,-1}` from the mover's perspective (critic target).
+2. **distill** — warm-starts from the current nets and minimises `CE(policy, visits)`
+   + `MSE(critic_raw, z)` in two independent Adam passes (mirroring PPO's separate
+   actor/critic optimisers). New nets save via the existing
+   `save_policy_checkpoint`/`save_critic_checkpoint`.
+3. **loop** — gen → distil → re-seed `puct` → repeat.
+
+Two design points that make it correct:
+- **`PuctBot(value_mode='outcome')`.** The distilled critic predicts the outcome `z`
+  (scale `[-1,1]`), not the shaped PPO return, so the search must not blend it with
+  `_leaf_potential` (shaped scale) or accumulate shaped edge rewards. `value_mode`
+  gates exactly that: `'outcome'` = leaf is critic-only + no intermediate shaped
+  rewards (terminals are already ±1); `'shaped'` (default) is the unchanged gauntlet
+  bot. The z-critic saves with `return_mean=0`/`return_std=1` so `PuctBot`'s
+  denormalisation is identity.
+- **ExIt artifacts live under `data/exit/`, never `data/lookahead_critic/`.** A z-scale
+  critic must never become the "latest" critic the *shaped* bots (`lookahead_critic`,
+  `policy_critic`, default `puct`) resolve to — that would be a scale mismatch. The
+  loop pairs the z-critic only with outcome-mode search, passing paths explicitly.
+  Round 0 bootstraps from the standing shaped checkpoints with `value_mode='shaped'`
+  (the proven strong teacher); every later round uses the z-critic in `'outcome'` mode.
+
+Frame note: visit counts are absolute-frame, the policy/mask are ego-frame — targets
+are remapped absolute→ego at record time (`WarChestEnv.remap_action`) so they line up
+index-for-index with the masked policy logits (verified: zero target mass on illegal
+ids). Policy and critic must share one `obs_version` (they do when saved from one PPO
+run); asserted by the CLI. Verified end-to-end on a small run: dataset shapes/frame
+correct, distillation drives held-out `CE` and critic `MSE` down, and outcome-mode
+`puct` loads and plays with the distilled nets. First real measurement owed: a
+multi-round loop read against the gauntlet (distilled policy vs base; `puct(distilled)`
+vs `puct(base)`).

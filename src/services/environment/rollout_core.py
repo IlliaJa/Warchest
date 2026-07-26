@@ -31,12 +31,18 @@ OPP_TYPE_IDX = {'random': 0, 'greedy': 1, 'pool': 2}
 # Which OPP_TYPE_IDX conditioning slot each opponent label maps to. The critic's
 # opponent one-hot is fixed at OPP_DIM=3 (policy.Critic) and existing checkpoints
 # are pinned to it, so a new training opponent cannot claim its own slot without
-# breaking arch compatibility. `lookahead_critic` therefore shares the `pool` slot
-# — a strong, self-play-derived opponent is its closest existing analogue (and the
-# same reason LookaheadCriticBot itself conditions on opp_type='pool' by default).
+# breaking arch compatibility. `lookahead_critic` (and `puct`) therefore share the
+# `pool` slot — a strong, self-play-derived opponent is their closest existing
+# analogue (and the same reason those bots condition on opp_type='pool' by default).
 # The label stays distinct everywhere else (sampling weights, win-rate metrics);
 # only the one-hot collapses it onto `pool`.
-OPP_ONEHOT_SLOT = {**OPP_TYPE_IDX, 'lookahead_critic': OPP_TYPE_IDX['pool']}
+OPP_ONEHOT_SLOT = {**OPP_TYPE_IDX, 'lookahead_critic': OPP_TYPE_IDX['pool'],
+                   'puct': OPP_TYPE_IDX['pool']}
+
+# Opponent families that forward-simulate the full game state and therefore read
+# the live env (`act(env)`, absolute frame) instead of the ego-centric obs the
+# reactive bots consume — see `_opponent_env_action`.
+_SEARCH_OPP_TYPES = frozenset({'lookahead_critic', 'puct'})
 
 
 def _opponent_env_action(opp, opp_type, env, obs, acting_pid):
@@ -44,12 +50,12 @@ def _opponent_env_action(opp, opp_type, env, obs, acting_pid):
 
     Reactive bots (random/greedy/pool) read the ego-centric obs the previous
     env.step already produced (free — no re-encode) and return an ego action we
-    un-rotate here. Search bots (lookahead_critic) read the live env instead: they
-    clone + forward-simulate the full unrotated state, which the lossy ego obs
+    un-rotate here. Search bots (lookahead_critic, puct) read the live env instead:
+    they clone + forward-simulate the full unrotated state, which the lossy ego obs
     cannot reconstruct, and already return an absolute action. One call site, the
     only branch is which projection of the same state each family consumes.
     """
-    if opp_type == 'lookahead_critic':
+    if opp_type in _SEARCH_OPP_TYPES:
         return opp.act(env)  # already absolute, un-rotated internally
     action, _, _ = opp.act(obs)
     return WarChestEnv.remap_action(action) if acting_pid == 2 else action

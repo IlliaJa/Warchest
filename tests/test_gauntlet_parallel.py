@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from src.services.gauntlet import (
-    round_robin, build_agent, greedy_agent, random_agent,
+    round_robin, build_agent, greedy_sim_agent, random_agent,
 )
 from src.services.gauntlet_parallel import round_robin_parallel
 from src.services.bots.lookahead_bot import LookaheadBot
@@ -19,11 +19,11 @@ from src.services.environment.obs_encoders import latest_encoder, LATEST_VERSION
 # Correctness: parallel dispatch must reproduce the sequential result matrix
 # --------------------------------------------------------------------------- #
 def test_round_robin_parallel_matches_sequential():
-    specs = [{'kind': 'random', 'name': 'random'}, {'kind': 'greedy', 'name': 'greedy'}]
-    agents = [random_agent('random'), greedy_agent('greedy')]
+    specs = [{'kind': 'random', 'name': 'random'}, {'kind': 'greedy_sim', 'name': 'greedy_sim'}]
+    agents = [random_agent('random'), greedy_sim_agent('greedy_sim')]
 
     sequential = round_robin(agents, k_games=6, seed=0)
-    parallel = round_robin_parallel(specs, ['random', 'greedy'], k_games=6, seed=0, n_workers=2)
+    parallel = round_robin_parallel(specs, ['random', 'greedy_sim'], k_games=6, seed=0, n_workers=2)
 
     assert np.array_equal(sequential['wins'], parallel['wins'])
     assert np.array_equal(sequential['games'], parallel['games'])
@@ -33,8 +33,8 @@ def test_round_robin_parallel_matches_sequential():
 
 def test_round_robin_parallel_more_workers_than_tasks():
     # n_workers larger than the task count: extra workers must idle and shut down cleanly.
-    specs = [{'kind': 'random', 'name': 'random'}, {'kind': 'greedy', 'name': 'greedy'}]
-    out = round_robin_parallel(specs, ['random', 'greedy'], k_games=2, seed=0, n_workers=8)
+    specs = [{'kind': 'random', 'name': 'random'}, {'kind': 'greedy_sim', 'name': 'greedy_sim'}]
+    out = round_robin_parallel(specs, ['random', 'greedy_sim'], k_games=2, seed=0, n_workers=8)
     assert out['games'][0, 1] == 2 and out['games'][1, 0] == 2
 
 
@@ -42,9 +42,9 @@ def test_round_robin_parallel_more_workers_than_tasks():
 # build_agent: every spec kind reconstructs a working agent
 # --------------------------------------------------------------------------- #
 def test_build_agent_greedy_and_random():
-    g = build_agent({'kind': 'greedy', 'name': 'greedy'}, device='cpu')
+    g = build_agent({'kind': 'greedy_sim', 'name': 'greedy_sim'}, device='cpu')
     r = build_agent({'kind': 'random', 'name': 'random'}, device='cpu')
-    assert g.name == 'greedy' and r.name == 'random'
+    assert g.name == 'greedy_sim' and r.name == 'random'
 
 
 def test_build_agent_lookahead():

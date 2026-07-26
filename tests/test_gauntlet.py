@@ -3,7 +3,7 @@ import numpy as np
 import torch
 
 from src.services.gauntlet import (
-    play_game, round_robin, greedy_agent, random_agent,
+    play_game, round_robin, greedy_sim_agent, random_agent,
     PolicyAgent, _bradley_terry_elo, _intransitive_fraction,
 )
 from src.services.policy.policy import Policy
@@ -48,7 +48,7 @@ def test_intransitive_fraction_zero_when_transitive():
 # End-to-end play
 # --------------------------------------------------------------------------- #
 def test_play_game_returns_valid_outcome():
-    res = play_game(random_agent(), greedy_agent(), seed=0)
+    res = play_game(random_agent(), greedy_sim_agent(), seed=0)
     assert res in (0, 1, 2)
 
 
@@ -63,12 +63,12 @@ def test_policy_agent_plays_a_full_game():
 
 
 def test_round_robin_matrix_and_greedy_beats_random():
-    agents = [random_agent('random'), greedy_agent('greedy')]
+    agents = [random_agent('random'), greedy_sim_agent('greedy_sim')]
     out = round_robin(agents, k_games=6, seed=0)
     assert out['wins'].shape == (2, 2)
     assert out['games'].shape == (2, 2)
     # Balanced colors: each pair plays exactly k_games total.
     assert out['games'][0, 1] == 6 and out['games'][1, 0] == 6
-    # GreedyBot dominates RandomBot, so it should rate strictly higher.
-    assert out['ratings']['greedy'] > out['ratings']['random']
+    # SimGreedyBot dominates RandomBot, so it should rate strictly higher.
+    assert out['ratings']['greedy_sim'] > out['ratings']['random']
     assert 0.0 <= out['intransitive_fraction'] <= 1.0

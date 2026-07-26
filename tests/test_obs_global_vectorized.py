@@ -17,6 +17,7 @@ from src.services.environment.obs_encoders.v10 import (
     _UNIT_COIN_TO_IDX, _TOTAL_COINS_UNIT_VEC, _SUPPLY_CAP_VEC, _UNIT_IN_DECK,
     _counter_to_deck_vec, _counter_to_unit_vec,
 )
+from src.services.environment.obs_encoders import get_encoder
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +177,7 @@ def test_unit_in_deck_positions():
 def test_obs_global_equivalence_random_game():
     """Run a full random game; compare vectorised obs['global'] with reference at every step."""
     np.random.seed(42)
-    env = WarChestEnv()
+    env = WarChestEnv(obs_encoder=get_encoder(10))  # v10-pinned: reference loop matches v10 layout
     obs, _ = env.reset()
     max_steps = 300
     mismatches = []
@@ -207,7 +208,7 @@ def test_obs_global_equivalence_random_game():
 def test_obs_global_shape_and_range():
     """Sanity: global obs has the right shape and plausible value range."""
     np.random.seed(7)
-    env = WarChestEnv()
+    env = WarChestEnv(obs_encoder=get_encoder(10))  # v10-pinned: reference loop matches v10 layout
     obs, _ = env.reset()
     for _ in range(50):
         assert obs['global'].shape == (GLOBAL_DIM,)
@@ -226,7 +227,7 @@ def test_obs_global_shape_and_range():
 def test_obs_global_p1_and_p2():
     """Explicitly verify both players' observations are handled correctly."""
     np.random.seed(99)
-    env = WarChestEnv()
+    env = WarChestEnv(obs_encoder=get_encoder(10))  # v10-pinned: reference loop matches v10 layout
     obs, _ = env.reset()
     p1_checked = p2_checked = False
     for _ in range(100):

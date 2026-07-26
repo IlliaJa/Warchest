@@ -11,10 +11,12 @@ To add a version: create `v<N>.py` with an `ObsEncoder<N>` class (exposing
 `encode(view)`, `encode_privileged(view)`), then register it below.
 """
 from .v10 import ObsEncoderV10
+from .v11 import ObsEncoderV11
 
 # version int -> encoder class
 ENCODERS = {
     10: ObsEncoderV10,
+    11: ObsEncoderV11,
 }
 
 LATEST_VERSION = max(ENCODERS)
