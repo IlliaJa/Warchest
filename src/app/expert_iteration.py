@@ -53,6 +53,29 @@ EXIT_DIR = 'data/exit'
 logger = logging.getLogger('warchest')
 
 
+def setup_run_logger(run_id):
+    """File + console logging on the shared 'warchest' logger (mirrors ppo.py).
+
+    Everything `gen`/`distill`/`loop` and the services core log goes to
+    `logs/exit_{run_id}.log` at DEBUG and to the console at INFO — so a long
+    background run leaves a full on-disk record without needing a shell redirect.
+    Returns the log-file path.
+    """
+    os.makedirs('logs', exist_ok=True)
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    path = f'logs/exit_{run_id}.log'
+    fh = logging.FileHandler(path)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return path
+
+
 def _latest_policy_path():
     c = glob.glob(POLICY_GLOB)
     return max(c) if c else None
@@ -247,7 +270,9 @@ def main():
     lp.set_defaults(func=cmd_loop)
 
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+    run_id = time.strftime('%Y%m%d-%H%M%S')
+    log_path = setup_run_logger(run_id)
+    logger.info('expert iteration: cmd=%s, logging to %s', args.cmd, log_path)
     args.func(args)
 
 
