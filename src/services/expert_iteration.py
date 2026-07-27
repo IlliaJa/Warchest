@@ -36,6 +36,7 @@ import logging
 import numpy as np
 import torch
 import torch.nn.functional as F
+from rich.progress import track
 
 from .environment.warchest_env import WarChestEnv, ACTION_SPACE_SIZE
 from .environment.rollout_core import OPP_TYPE_IDX
@@ -284,8 +285,10 @@ def summarize_game_stats(game_stats):
 
 
 def generate_selfplay(bot, n_games, *, encoder, temperature=1.0, temp_moves=12,
-                      max_turns=2000, seed=None, log_every=10):
-    """Self-play `bot` for `n_games`, sequentially in-process.
+                      max_turns=2000, seed=None, desc='self-play'):
+    """Self-play `bot` for `n_games`, sequentially in-process (a live `rich` progress
+    bar shows games completed — see `services/selfplay_collector.py` for the
+    multi-process equivalent's own live bar).
 
     Returns `(dataset, game_stats)` — the labelled `SelfPlayDataset` and the list of
     per-game stats dicts (`summarize_game_stats` turns these into one summary). `bot`
@@ -293,20 +296,17 @@ def generate_selfplay(bot, n_games, *, encoder, temperature=1.0, temp_moves=12,
     distilled — the recording env is built with it so `generate_observation()`/
     `get_privileged_features()` match what the nets consume. For the first
     `temp_moves` plies of each game the move is temperature-sampled from the visit
-    counts (exploration); after that it is greedy. See `services/selfplay_collector.py`
-    for the multi-process equivalent (same per-game logic via `play_selfplay_game`).
+    counts (exploration); after that it is greedy.
     """
     dataset = SelfPlayDataset()
     env = WarChestEnv(save_game_history=False, obs_encoder=encoder)
     if seed is not None:
         np.random.seed(seed)
     game_stats = []
-    for g in range(n_games):
+    for _ in track(range(n_games), description=desc):
         stats = play_selfplay_game(bot, env, dataset, temperature=temperature,
                                    temp_moves=temp_moves, max_turns=max_turns)
         game_stats.append(stats)
-        if log_every and (g + 1) % log_every == 0:
-            logger.info('selfplay: %d/%d games, %d samples', g + 1, n_games, len(dataset))
     return dataset.stack(), game_stats
 
 

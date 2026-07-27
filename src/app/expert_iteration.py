@@ -127,7 +127,7 @@ def _build_bot(policy_path, critic_path, args, *, value_mode):
     )
 
 
-def _run_gen(policy_path, critic_path, args, *, value_mode, out_path, collector=None):
+def _run_gen(policy_path, critic_path, args, *, value_mode, out_path, collector=None, desc='self-play'):
     """Self-play `args.games` games and save a dataset. Returns the dataset.
 
     Parallel (`args.n_workers > 1`, the default) uses `ParallelSelfPlayCollector` — a
@@ -160,7 +160,7 @@ def _run_gen(policy_path, critic_path, args, *, value_mode, out_path, collector=
                 n_games=args.games, c_puct=args.c_puct, max_branching=args.max_branching,
                 time_budget=args.time_budget, dirichlet_alpha=args.dirichlet_alpha,
                 dirichlet_frac=args.dirichlet_frac, temperature=args.temperature,
-                temp_moves=args.temp_moves, max_turns=2000,
+                temp_moves=args.temp_moves, max_turns=2000, desc=desc,
             )
         finally:
             if own_collector:
@@ -171,7 +171,7 @@ def _run_gen(policy_path, critic_path, args, *, value_mode, out_path, collector=
         encoder = get_encoder(pmeta['obs_version'])
         bot = _build_bot(policy_path, critic_path, args, value_mode=value_mode)
         ds, game_stats = generate_selfplay(bot, args.games, encoder=encoder, temperature=args.temperature,
-                                           temp_moves=args.temp_moves, seed=args.seed)
+                                           temp_moves=args.temp_moves, seed=args.seed, desc=desc)
 
     s = summarize_game_stats(game_stats)
     logger.info(
@@ -326,7 +326,7 @@ def cmd_loop(args):
             logger.info('=== ExIt round %d/%d (mode=%s) ===', r + 1, args.rounds, cur_mode)
             ds_path = os.path.join(EXIT_DIR, f'round{r}.npz')
             ds = _run_gen(cur_policy, cur_critic, args, value_mode=cur_mode, out_path=ds_path,
-                         collector=collector)
+                         collector=collector, desc=f'round {r + 1}/{args.rounds} self-play')
             out_policy = os.path.join(EXIT_DIR, f'round{r}_policy.pth')
             out_critic = os.path.join(EXIT_DIR, f'round{r}_critic.pth')
             before, after = _run_distill(ds, cur_policy, cur_critic, args,
@@ -369,7 +369,18 @@ def _add_common(p):
     p.add_argument('--max-branching', type=int, default=8)
     p.add_argument('--dirichlet-alpha', type=float, default=0.3,
                    help='Root Dirichlet noise for self-play exploration (0 = off).')
-    p.add_argument('--dirichlet-frac', type=float, default=0.25)
+    p.add_argument('--dirichlet-frac', type=float, default=0.03,
+                   help="Root noise mixing fraction. 0.25 (AlphaZero's own default, this "
+                        "CLI's old default) measured mean_visit_entropy=0.87 nats at this "
+                        "search's ~100-300 sims/move — nearly double the pre-distill "
+                        "policy's own entropy (~0.6), so distillation flattened the policy "
+                        "every round instead of sharpening it (see evaluate_distillation's "
+                        "docstring / docs/bots.md's ExIt section). AlphaZero's ~800 sims/move "
+                        "lets Q signal outcompete a 25%-noisy prior; at our budget it can't. "
+                        "0.03 measured 0.586 nats (essentially matching frac=0, which measured "
+                        "0.508) — keeps a little self-play move diversity without recreating "
+                        "the collapse. Lower only if you still see the visit_entropy-above-"
+                        "policy_entropy warning after a round.")
     p.add_argument('--temperature', type=float, default=1.0, help='Visit-count sampling temperature.')
     p.add_argument('--temp-moves', type=int, default=12, help='Opening plies sampled before going greedy.')
     p.add_argument('--seed', type=int, default=None)

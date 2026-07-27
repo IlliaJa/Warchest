@@ -14,10 +14,19 @@ Like `ParallelRolloutCollector`, the worker pool is spawned once and reused acro
 collector before its round loop and reuses it every round, rebuilding each worker's
 `PuctBot` only when the checkpoint/config actually changed (a new round's freshly
 distilled nets), not on every task.
+
+`gather()` shows a live `rich` progress bar (mirrors `gauntlet_parallel.py`'s use of
+`rich.progress.Progress`): each worker increments a shared "games completed" counter
+after every game it finishes (not just once at the very end), so the bar advances
+continuously — self-play games are ~seconds each and a round is many minutes, the
+one thing a user watching the console actually wants to see move.
 """
 import logging
 import multiprocessing as mp
 import time
+from queue import Empty
+
+from rich.progress import Progress
 
 logger = logging.getLogger('warchest')
 
@@ -28,7 +37,7 @@ _BOT_KEYS = ('policy_path', 'critic_path', 'value_mode', 'c_puct', 'max_branchin
             'time_budget', 'dirichlet_alpha', 'dirichlet_frac')
 
 
-def _worker_loop(worker_id, task_q, result_q, counter, seed_base):
+def _worker_loop(worker_id, task_q, result_q, counter, completed, seed_base):
     """Persistent worker: (re)build a PuctBot on demand, claim games from the shared
     counter, play them, and return a stacked SelfPlayDataset + per-game stats.
     """
@@ -93,6 +102,8 @@ def _worker_loop(worker_id, task_q, result_q, counter, seed_base):
                     temp_moves=task['temp_moves'], max_turns=task['max_turns'],
                 )
                 game_stats.append(stats)
+                with completed.get_lock():
+                    completed.value += 1
 
             n_samples = len(dataset)
             payload = {
@@ -119,12 +130,15 @@ class ParallelSelfPlayCollector:
         self._n = n_workers
         self._task_qs = [self._ctx.Queue() for _ in range(n_workers)]
         self._result_q = self._ctx.Queue()
-        self._counter = self._ctx.Value('i', 0)  # remaining games this round
+        self._counter = self._ctx.Value('i', 0)  # remaining games this round (claim)
+        self._completed = self._ctx.Value('i', 0)  # games finished this round (progress bar)
+        self._n_games = 0
+        self._desc = 'self-play'
         self._procs = []
         for wid in range(n_workers):
             p = self._ctx.Process(
                 target=_worker_loop,
-                args=(wid, self._task_qs[wid], self._result_q, self._counter, seed_base),
+                args=(wid, self._task_qs[wid], self._result_q, self._counter, self._completed, seed_base),
                 daemon=True,
             )
             p.start()
@@ -132,9 +146,14 @@ class ParallelSelfPlayCollector:
         logger.info('ParallelSelfPlayCollector: spawned %d self-play workers', n_workers)
 
     def submit(self, *, policy_path, critic_path, value_mode, n_games, c_puct, max_branching,
-               time_budget, dirichlet_alpha, dirichlet_frac, temperature, temp_moves, max_turns):
+               time_budget, dirichlet_alpha, dirichlet_frac, temperature, temp_moves, max_turns,
+               desc='self-play'):
         with self._counter.get_lock():
             self._counter.value = n_games
+        with self._completed.get_lock():
+            self._completed.value = 0
+        self._n_games = n_games
+        self._desc = desc
         task = {
             'policy_path': policy_path, 'critic_path': critic_path, 'value_mode': value_mode,
             'c_puct': c_puct, 'max_branching': max_branching, 'time_budget': time_budget,
@@ -145,7 +164,8 @@ class ParallelSelfPlayCollector:
             self._task_qs[wid].put(task)
 
     def gather(self):
-        """Block for all worker payloads; return `(dataset, game_stats, timing)`.
+        """Block for all worker payloads (showing a live per-game progress bar
+        meanwhile); return `(dataset, game_stats, timing)`.
 
         `timing['rollout']` is the critical-path worker wall (max over workers);
         `timing['ipc']` is gather wall not explained by the slowest worker
@@ -159,12 +179,24 @@ class ParallelSelfPlayCollector:
 
         t0 = time.perf_counter()
         results = {}
-        for _ in range(self._n):
-            wid, status, payload = self._result_q.get()
-            if status == 'ERROR':
-                self.shutdown()
-                raise RuntimeError(f'self-play worker {wid} failed:\n{payload}')
-            results[wid] = payload
+        # Poll for final per-worker payloads with a short timeout instead of a plain
+        # blocking get(), so the wait can be interleaved with reading the shared
+        # `_completed` counter to advance the progress bar in real time — workers bump
+        # it after every game, well before their final (all-games-done) payload lands.
+        with Progress() as progress:
+            task_id = progress.add_task(self._desc, total=self._n_games)
+            while len(results) < self._n:
+                try:
+                    wid, status, payload = self._result_q.get(timeout=0.2)
+                except Empty:
+                    pass
+                else:
+                    if status == 'ERROR':
+                        self.shutdown()
+                        raise RuntimeError(f'self-play worker {wid} failed:\n{payload}')
+                    results[wid] = payload
+                progress.update(task_id, completed=self._completed.value)
+            progress.update(task_id, completed=self._n_games)
         gather_wall = time.perf_counter() - t0
 
         parts = [results[w]['dataset'] for w in range(self._n) if results[w]['n_samples'] > 0]

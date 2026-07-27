@@ -499,6 +499,45 @@ index-for-index with the masked policy logits (verified: zero target mass on ill
 ids). Policy and critic must share one `obs_version` (they do when saved from one PPO
 run); asserted by the CLI. Verified end-to-end on a small run: dataset shapes/frame
 correct, distillation drives held-out `CE` and critic `MSE` down, and outcome-mode
-`puct` loads and plays with the distilled nets. First real measurement owed: a
-multi-round loop read against the gauntlet (distilled policy vs base; `puct(distilled)`
-vs `puct(base)`).
+`puct` loads and plays with the distilled nets.
+
+### First multi-round loop: monotonic degeneration, root-caused to Dirichlet noise (2026-07-27)
+
+A 3-round `loop --games 200 --time-budget 0.5` (v11 checkpoints) came back **worse every
+round**, not better — Bradley-Terry vs. the base policy: base 1217 → round0 1025 →
+round1 900 → round2 859, fully transitive (base beats every round cleanly). Raising
+`--time-budget` 5× (0.1→0.5s) between the diagnosis below and this run did not fix it
+and if anything made `mean_visit_entropy` slightly higher (0.91 vs. ~0.79 at 0.1s) —
+disproving the "just needs more simulations" read from the first PuctBot-strength
+write-up above.
+
+**Root cause, confirmed by a direct A/B** (`_act_once` on real self-play trajectories,
+same checkpoints, only `dirichlet_frac` varied):
+
+| `dirichlet_frac` | mean visit entropy | top-move share |
+|---|---|---|
+| 0.25 (old CLI default) | 0.87–0.99 | 65–68% |
+| 0.10 | 0.64 | 81% |
+| 0.03 | 0.59 | 79% |
+| 0.0 (off) | 0.51–0.52 | 80–81% |
+
+`PuctBot._add_dirichlet_noise` mixes 25% pure random noise into the root prior *once,
+before any simulations*, and it never decays. AlphaZero affords this because ~800
+sims/move let the Q signal out-vote a 25%-noisy prior; at this search's ~100–300
+sims/move it can't — the noise stays a dominant fraction of the exploration term for the
+whole search, so visits never concentrate. Measured mean visit entropy (0.87–0.99) sat
+*above* the pre-distill policy's own entropy (~0.6), so every round's distillation
+**flattened** the policy instead of sharpening it — and since each round's flatter
+policy becomes the next round's prior, it compounds: `mean_visit_entropy` climbed
+monotonically round over round (0.91 → 1.13 → 1.21) in the 3-round run above, the
+smoking gun for the feedback loop.
+
+**Fix:** `--dirichlet-frac` default lowered `0.25` → **`0.03`** (measured entropy 0.586,
+statistically indistinguishable from fully off) — keeps a little self-play move
+diversity without recreating the collapse. A quick 1-round/20-game validation at
+`frac=0.03` (v10 checkpoints) came back with `mean_visit_entropy=0.604` (down from 0.913
+at the old default, now roughly matching the pre-distill policy's own 0.596) and
+round0 losing only 40/60 to base (vs. 15/85 in the flawed run) — same direction, much
+smaller sample, not yet a real measurement. **First real measurement still owed:** a
+proper multi-round `loop` at `frac=0.03` (or lower, if a round's `visit_entropy >
+policy_entropy` warning still fires) read against the gauntlet.
