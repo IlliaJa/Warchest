@@ -161,7 +161,8 @@ class PuctBot(PolicyCriticBot):
     def __init__(self, policy_path=None, *, critic_path=None, c_puct=1.5,
                  critic_weight=0.7, max_branching=8, time_budget=0.1,
                  max_simulations=None, dirichlet_alpha=0.0, dirichlet_frac=0.25,
-                 value_mode='shaped', see_opponent_hand=True, max_depth=40, gamma=0.99,
+                 value_mode='shaped', outcome_heuristic_frac=0.2, see_opponent_hand=True,
+                 max_depth=40, gamma=0.99,
                  opp_type='pool', n_determinizations=1, stats_log_every=20,
                  device='cpu', name='puct'):
         # beam_width is inherited but unused by MCTS (no per-node beam); pass 1.
@@ -184,9 +185,25 @@ class PuctBot(PolicyCriticBot):
         # critic distilled to predict the game outcome z (expert iteration). See the
         # value_mode gates in `_expand`/`_create_child`.
         self.value_mode = value_mode
-        # Per-search root visit distributions collected during one act() call (reset
-        # there), combined into last_stats['visit_counts'] for expert-iteration data-gen.
+        # In outcome mode the leaf is mostly the z-outcome critic, hedged with a small
+        # clipped heuristic slice (`outcome_heuristic_frac`): a freshly distilled z-critic
+        # is trained on very little data, so its directional noise shouldn't fully drive
+        # early-round self-play. `_leaf_potential` is O(1) (base_term alone ~0.3/base), so
+        # it's roughly commensurate with z ∈ [-1,1]; it's clipped to [-1,1] before the
+        # blend to stay on scale. 0.0 recovers the pure-critic AlphaZero leaf.
+        self.outcome_heuristic_frac = outcome_heuristic_frac
+        # z is an *undiscounted* game outcome, so the backup must be undiscounted too:
+        # with gamma<1 a win d plies deep backs up as gamma**d instead of 1, which the
+        # critic's undiscounted z target never sees. AlphaZero uses gamma=1 for exactly
+        # this. Shaped mode keeps the passed gamma (its returns are PBRS-scale).
+        if value_mode == 'outcome':
+            self.gamma = 1.0
+        # Per-search root visit distributions and raw (pre-noise) policy priors collected
+        # during one act() call (reset there): visits -> last_stats['visit_counts'] (the
+        # expert-iteration policy target), priors -> last_stats['policy_argmax'] (for the
+        # self-play policy/search agreement stat).
         self._search_visits = []
+        self._search_priors = []
 
     def act(self, env) -> int:
         """As `LookaheadCriticBot.act` (iterative determinization voting), plus it
@@ -199,8 +216,14 @@ class PuctBot(PolicyCriticBot):
         (absolute frame) for expert-iteration data-gen to read.
         """
         self._search_visits = []
+        self._search_priors = []
         action = super().act(env)
         self.last_stats['visit_counts'] = self._combine_visit_counts(self._search_visits)
+        # The policy's own top move (argmax of the raw, pre-noise priors) — self-play
+        # data-gen compares it to the most-visited action to log move-level agreement,
+        # the direct read on whether the search actually diverges from its prior.
+        priors = self._combine_visit_counts(self._search_priors)
+        self.last_stats['policy_argmax'] = max(priors, key=priors.get) if priors else None
         return action
 
     @staticmethod
@@ -247,6 +270,9 @@ class PuctBot(PolicyCriticBot):
         self._n_expansions = 0
         self._max_depth_reached = 0
         self._expand(root, root_player)
+        # Snapshot the raw policy priors before any root noise is mixed in — folded into
+        # last_stats['policy_argmax'] by act() for the self-play agreement stat.
+        root_priors = {a: e.prior for a, e in root.children.items()}
         if self.dirichlet_alpha > 0.0 and len(root.children) > 1:
             self._add_dirichlet_noise(root)
 
@@ -268,6 +294,7 @@ class PuctBot(PolicyCriticBot):
         best_val = (best_edge.W / best_edge.N) if best_edge.N > 0 else None
         visit_counts = {a: e.N for a, e in root.children.items()}  # absolute frame
         self._search_visits.append((sims, visit_counts))
+        self._search_priors.append((sims, root_priors))
         stats = {
             'depth_reached': self._max_depth_reached,
             'nodes_visited': self._n_expansions,
@@ -372,9 +399,16 @@ class PuctBot(PolicyCriticBot):
 
         v = self._critic_root_values([node.state], root_player)[0]
         if self.value_mode == 'outcome':
-            # Pure critic (a z-outcome predictor); no heuristic blend — `_leaf_potential`
-            # is on the shaped-reward scale and would be incommensurate with a z-critic.
-            node.leaf_value = v
+            # Mostly the z-outcome critic, hedged with a small clipped heuristic slice
+            # (`outcome_heuristic_frac`) so a cold-start z-critic's directional noise
+            # doesn't fully drive early-round self-play. `_leaf_potential` is clipped to
+            # [-1,1] to stay commensurate with the z scale; frac=0 => pure-critic leaf.
+            f = self.outcome_heuristic_frac
+            if f > 0.0:
+                heur = float(np.clip(self._leaf_potential(node.state, root_player), -1.0, 1.0))
+                node.leaf_value = (1.0 - f) * v + f * heur
+            else:
+                node.leaf_value = v
         else:
             heur = self._leaf_potential(node.state, root_player)
             node.leaf_value = self.critic_weight * v + (1.0 - self.critic_weight) * heur
@@ -420,14 +454,23 @@ class PuctBot(PolicyCriticBot):
 
         if self.value_mode == 'outcome':
             # No intermediate shaped rewards: the z-critic leaf carries the whole future
-            # outcome; only terminals (±1) and the truncation value (∈ [-1,0], already
-            # outcome-scale) contribute directly.
+            # outcome; only terminals (±1) and the truncation value (-1, set below)
+            # contribute directly.
             edge.reward = 0.0
         else:
             holding = self._holding_reward(node.state, root_player) if mover == root_player else 0.0
             edge.reward = (self._own_action_reward(result) if own_action else 0.0) + holding
         if child_state.round_number >= self._sim_env.max_rounds:
-            trunc = self._truncation_value(child_state, root_player)
+            if self.value_mode == 'outcome':
+                # Truncation = neither side forced a win before the round limit (the bots
+                # circled). Score it -1 for root, matching the z=-1 label self-play now
+                # gives truncated games (SelfPlayDataset.label_last). Caveat: in one
+                # root-perspective tree this lets the opponent (a root-value minimiser)
+                # steer *toward* truncation — a deliberate conservative bias that pushes
+                # root to actually close the game out rather than stall.
+                trunc = -1.0
+            else:
+                trunc = self._truncation_value(child_state, root_player)
             edge.child = _Node(None, None, None, terminal=True, value=trunc)
         else:
             edge.child = _Node(child_state, child_queues, child_state.active_player)

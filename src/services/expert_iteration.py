@@ -8,8 +8,9 @@ better teacher than the raw policy that seeds it. This module closes that loop
      root Dirichlet noise on) plays itself; per move it records the *ego-frame*
      observation, the *ego-frame* root visit distribution (the policy target), the
      critic's privileged inputs, and the mover. After each game every sample is
-     labelled with the game outcome z ∈ {+1,0,-1} from its mover's perspective (the
-     critic target). `play_selfplay_game` (one game) is the shared unit both the serial
+     labelled with the game outcome z ∈ {+1,-1} from its mover's perspective (win = +1,
+     loss or truncation/circling = -1; the critic target). `play_selfplay_game` (one game)
+     is the shared unit both the serial
      path here and `services/selfplay_collector.py`'s parallel workers call, so
      sequential and multiprocess generation run byte-identical game logic.
   2. `distill` — warm-starts from the current policy+critic and minimises
@@ -82,17 +83,15 @@ class SelfPlayDataset:
     def label_last(self, n, winner):
         """Set z for the last `n` freshly-added, still-unlabelled samples (one game).
 
-        z is from each sample's *mover* perspective: +1 if that mover won, -1 if the
-        opponent won, 0 on a draw/truncation.
+        z is from each sample's *mover* perspective: +1 if that mover won, else -1.
+        Truncation (winner == 0 — nobody reached a win before the round limit) is scored
+        -1 for BOTH movers, not 0: a truncated game means the bots circled without closing
+        it out, a failure for both sides rather than a neutral draw. PuctBot's outcome-mode
+        search uses the same -1 truncation value so target and search agree.
         """
         movers = self._movers[len(self._z):len(self._z) + n]
         for mover in movers:
-            if winner == 0:
-                self._z.append(0.0)
-            elif winner == mover:
-                self._z.append(1.0)
-            else:
-                self._z.append(-1.0)
+            self._z.append(1.0 if winner == mover else -1.0)
 
     def stack(self):
         self.boards = np.stack(self._boards).astype(np.float32)
@@ -208,7 +207,7 @@ def play_selfplay_game(bot, env, dataset, *, temperature, temp_moves, max_turns)
     logic — only how many games run concurrently differs.
 
     Returns a per-game stats dict with *sums*, not means (`visit_entropy_sum`,
-    `legal_sum`), so a caller aggregating many games — possibly across several
+    `legal_sum`, `agree_sum`), so a caller aggregating many games — possibly across several
     workers — only has to add them up and divide once at the end
     (`summarize_game_stats`).
     """
@@ -217,6 +216,7 @@ def play_selfplay_game(bot, env, dataset, *, temperature, temp_moves, max_turns)
     winner = 0
     visit_entropy_sum = 0.0
     legal_sum = 0
+    agree_sum = 0
     ply = 0
     for ply in range(max_turns):
         mover = env.active_player
@@ -232,6 +232,13 @@ def play_selfplay_game(bot, env, dataset, *, temperature, temp_moves, max_turns)
             probs = np.fromiter(visit_counts.values(), dtype=np.float64)
             visit_entropy_sum += float(-(probs * np.log(np.clip(probs, 1e-12, None))).sum())
             legal_sum += int(obs['valid_action_mask'].sum())
+            # Move-level policy/search agreement: did the raw policy's top move match the
+            # search's most-visited one? The direct policy-improvement signal — if these
+            # agree almost always, the search isn't finding anything the prior didn't.
+            policy_argmax = bot.last_stats.get('policy_argmax')
+            move_agree = int(policy_argmax is not None
+                             and policy_argmax == max(visit_counts, key=visit_counts.get))
+            agree_sum += move_agree
             dataset.add(
                 board=obs['board'], global_feats=obs['global'],
                 mask=obs['valid_action_mask'],
@@ -244,6 +251,7 @@ def play_selfplay_game(bot, env, dataset, *, temperature, temp_moves, max_turns)
             if not info['action'].is_valid:
                 # puct only returns legal moves, so this is a belt-and-braces guard;
                 # drop the just-added (untaken-move) sample and continue randomly.
+                agree_sum -= move_agree
                 for lst in (dataset._boards, dataset._globals, dataset._masks,
                             dataset._visits, dataset._opp, dataset._priv, dataset._movers):
                     lst.pop()
@@ -259,6 +267,7 @@ def play_selfplay_game(bot, env, dataset, *, temperature, temp_moves, max_turns)
     return {
         'turns': ply + 1, 'winner': winner, 'n_samples': n_samples,
         'visit_entropy_sum': visit_entropy_sum, 'legal_sum': legal_sum,
+        'agree_sum': agree_sum,
     }
 
 
@@ -272,6 +281,7 @@ def summarize_game_stats(game_stats):
     decisive = sum(1 for s in game_stats if s['winner'] != 0)
     entropy_sum = sum(s['visit_entropy_sum'] for s in game_stats)
     legal_sum = sum(s['legal_sum'] for s in game_stats)
+    agree_sum = sum(s['agree_sum'] for s in game_stats)
     return {
         'n_games': n_games,
         'n_samples': n_samples,
@@ -281,6 +291,7 @@ def summarize_game_stats(game_stats):
         'decisive_frac': decisive / n_games if n_games else 0.0,
         'mean_visit_entropy': entropy_sum / n_samples if n_samples else 0.0,
         'mean_legal_actions': legal_sum / n_samples if n_samples else 0.0,
+        'mean_agreement': agree_sum / n_samples if n_samples else 0.0,
     }
 
 

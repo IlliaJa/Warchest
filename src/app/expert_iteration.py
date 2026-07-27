@@ -176,10 +176,12 @@ def _run_gen(policy_path, critic_path, args, *, value_mode, out_path, collector=
     s = summarize_game_stats(game_stats)
     logger.info(
         'gen: %d games, %d samples, wall=%.1fs — turns/game avg=%.1f (min=%d max=%d), '
-        'decisive=%.0f%%, mean_legal_actions=%.1f, mean_visit_entropy=%.3f nats',
+        'decisive=%.0f%%, mean_legal_actions=%.1f, mean_visit_entropy=%.3f nats, '
+        'policy/search agreement=%.3f',
         s['n_games'], s['n_samples'], time.perf_counter() - t0,
         s['turns_mean'], s['turns_min'], s['turns_max'],
         100 * s['decisive_frac'], s['mean_legal_actions'], s['mean_visit_entropy'],
+        s['mean_agreement'],
     )
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     ds.save(out_path)
