@@ -7,3 +7,4 @@ __pycache__/
 *.pyc
 /logs/
 /config/web_agent.toml
+connect_to_server

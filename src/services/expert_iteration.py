@@ -4,11 +4,14 @@
 better teacher than the raw policy that seeds it. This module closes that loop
 (docs/next_steps.md — "search moves become new training targets"):
 
-  1. `generate_selfplay` — `PuctBot` (in `value_mode='outcome'`, root Dirichlet noise
-     on) plays itself; per move it records the *ego-frame* observation, the *ego-frame*
-     root visit distribution (the policy target), the critic's privileged inputs, and
-     the mover. After each game every sample is labelled with the game outcome z ∈
-     {+1,0,-1} from its mover's perspective (the critic target).
+  1. `play_selfplay_game` / `generate_selfplay` — `PuctBot` (in `value_mode='outcome'`,
+     root Dirichlet noise on) plays itself; per move it records the *ego-frame*
+     observation, the *ego-frame* root visit distribution (the policy target), the
+     critic's privileged inputs, and the mover. After each game every sample is
+     labelled with the game outcome z ∈ {+1,0,-1} from its mover's perspective (the
+     critic target). `play_selfplay_game` (one game) is the shared unit both the serial
+     path here and `services/selfplay_collector.py`'s parallel workers call, so
+     sequential and multiprocess generation run byte-identical game logic.
   2. `distill` — warm-starts from the current policy+critic and minimises
      `CE(policy, visits)` and `MSE(critic_raw, z)` in two independent Adam passes
      (mirroring PPO's separate actor/critic optimisers).
@@ -17,7 +20,9 @@ The new nets are saved via the existing `save_policy_checkpoint`/`save_critic_ch
 (the critic with `return_mean=0`/`return_std=1`, since it now predicts z on the [-1,1]
 outcome scale directly), so both the gauntlet and `PuctBot` load them unchanged — and
 the next round's `PuctBot(value_mode='outcome')` picks them up as its new prior + leaf
-value. The driver in `app/expert_iteration.py` alternates gen → distill → repeat.
+value. The driver in `app/expert_iteration.py` alternates gen → distill → repeat, with
+`services/selfplay_collector.py` doing the same job `rollout_collector.py` does for PPO:
+a persistent pool of CPU worker processes that plays games in parallel.
 
 Frame note: the policy/critic and their obs mask are ego-centric (board rotated 180°
 when the mover is player 2), while `PuctBot`'s visit counts are in the absolute action
@@ -97,10 +102,29 @@ class SelfPlayDataset:
         self.privileged = np.stack(self._priv).astype(np.float32)
         self.z = np.asarray(self._z, dtype=np.float32)
         assert len(self.z) == len(self.boards), 'unlabelled samples remain (call label_last per game)'
+        # Free the per-sample lists: after stacking they're pure duplication of the
+        # arrays above, and a parallel worker ships this whole object back to the main
+        # process (services/selfplay_collector.py), so trimming keeps that IPC payload
+        # to just the compact arrays instead of shipping both copies.
+        self._boards = self._globals = self._masks = []
+        self._visits = self._opp = self._priv = []
         return self
 
     def __len__(self):
         return len(self._z) if self.z is None else len(self.z)
+
+    @classmethod
+    def concat(cls, parts):
+        """Merge already-`stack()`ed datasets (one per parallel worker) into one."""
+        ds = cls()
+        ds.boards = np.concatenate([p.boards for p in parts])
+        ds.globals = np.concatenate([p.globals for p in parts])
+        ds.masks = np.concatenate([p.masks for p in parts])
+        ds.visit_targets = np.concatenate([p.visit_targets for p in parts])
+        ds.opp_onehots = np.concatenate([p.opp_onehots for p in parts])
+        ds.privileged = np.concatenate([p.privileged for p in parts])
+        ds.z = np.concatenate([p.z for p in parts])
+        return ds
 
     def save(self, path):
         if self.boards is None:
@@ -175,61 +199,115 @@ def _sample_move(visit_counts, temperature):
     return int(actions[int(np.argmax(probs))])
 
 
+def play_selfplay_game(bot, env, dataset, *, temperature, temp_moves, max_turns):
+    """Play one self-play game with `bot` on `env` (already built with a matching
+    encoder), appending recorded samples into `dataset` and labelling them with the
+    outcome. Shared by `generate_selfplay` (serial) and every worker in
+    `services/selfplay_collector.py` (parallel), so both paths run identical game
+    logic — only how many games run concurrently differs.
+
+    Returns a per-game stats dict with *sums*, not means (`visit_entropy_sum`,
+    `legal_sum`), so a caller aggregating many games — possibly across several
+    workers — only has to add them up and divide once at the end
+    (`summarize_game_stats`).
+    """
+    env.reset()
+    n_before = len(dataset._movers)
+    winner = 0
+    visit_entropy_sum = 0.0
+    legal_sum = 0
+    ply = 0
+    for ply in range(max_turns):
+        mover = env.active_player
+        bot.act(env)  # runs the search; sets last_stats['visit_counts']
+        visit_counts = bot.last_stats.get('visit_counts') or {}
+        if not visit_counts:
+            # No search result (e.g. a single forced legal action) — play it,
+            # but don't record a target-less sample.
+            legal = env.get_possible_actions()
+            _, _, term, trunc, info = env.step(legal[0])
+        else:
+            obs = env.generate_observation()
+            probs = np.fromiter(visit_counts.values(), dtype=np.float64)
+            visit_entropy_sum += float(-(probs * np.log(np.clip(probs, 1e-12, None))).sum())
+            legal_sum += int(obs['valid_action_mask'].sum())
+            dataset.add(
+                board=obs['board'], global_feats=obs['global'],
+                mask=obs['valid_action_mask'],
+                visit_target=_ego_visit_target(visit_counts, mover),
+                opp_onehot=_pool_onehot(), privileged=env.get_privileged_features(),
+                mover=mover,
+            )
+            action = _sample_move(visit_counts, temperature if ply < temp_moves else 0.0)
+            _, _, term, trunc, info = env.step(action)
+            if not info['action'].is_valid:
+                # puct only returns legal moves, so this is a belt-and-braces guard;
+                # drop the just-added (untaken-move) sample and continue randomly.
+                for lst in (dataset._boards, dataset._globals, dataset._masks,
+                            dataset._visits, dataset._opp, dataset._priv, dataset._movers):
+                    lst.pop()
+                _, _, term, trunc, info = env.make_random_step()
+        if term:
+            winner = mover if info['action'].is_valid else env.active_player
+            break
+        if trunc:
+            winner = 0
+            break
+    n_samples = len(dataset._movers) - n_before
+    dataset.label_last(n_samples, winner)
+    return {
+        'turns': ply + 1, 'winner': winner, 'n_samples': n_samples,
+        'visit_entropy_sum': visit_entropy_sum, 'legal_sum': legal_sum,
+    }
+
+
+def summarize_game_stats(game_stats):
+    """Aggregate a list of `play_selfplay_game` stats dicts into one summary — the
+    numbers `app/expert_iteration.py` logs after every generation round.
+    """
+    n_games = len(game_stats)
+    n_samples = sum(s['n_samples'] for s in game_stats)
+    turns = np.array([s['turns'] for s in game_stats], dtype=np.float64)
+    decisive = sum(1 for s in game_stats if s['winner'] != 0)
+    entropy_sum = sum(s['visit_entropy_sum'] for s in game_stats)
+    legal_sum = sum(s['legal_sum'] for s in game_stats)
+    return {
+        'n_games': n_games,
+        'n_samples': n_samples,
+        'turns_mean': float(turns.mean()) if n_games else 0.0,
+        'turns_min': int(turns.min()) if n_games else 0,
+        'turns_max': int(turns.max()) if n_games else 0,
+        'decisive_frac': decisive / n_games if n_games else 0.0,
+        'mean_visit_entropy': entropy_sum / n_samples if n_samples else 0.0,
+        'mean_legal_actions': legal_sum / n_samples if n_samples else 0.0,
+    }
+
+
 def generate_selfplay(bot, n_games, *, encoder, temperature=1.0, temp_moves=12,
                       max_turns=2000, seed=None, log_every=10):
-    """Self-play `bot` for `n_games` and return a labelled `SelfPlayDataset`.
+    """Self-play `bot` for `n_games`, sequentially in-process.
 
-    `bot` should be a `PuctBot(value_mode='outcome', dirichlet_alpha>0)`. `encoder` is
-    the (shared) obs encoder for the nets being distilled — the recording env is built
-    with it so `generate_observation()`/`get_privileged_features()` match what the nets
-    consume. For the first `temp_moves` plies of each game the move is temperature-
-    sampled from the visit counts (exploration); after that it is greedy.
+    Returns `(dataset, game_stats)` — the labelled `SelfPlayDataset` and the list of
+    per-game stats dicts (`summarize_game_stats` turns these into one summary). `bot`
+    should be a `PuctBot`; `encoder` is the (shared) obs encoder for the nets being
+    distilled — the recording env is built with it so `generate_observation()`/
+    `get_privileged_features()` match what the nets consume. For the first
+    `temp_moves` plies of each game the move is temperature-sampled from the visit
+    counts (exploration); after that it is greedy. See `services/selfplay_collector.py`
+    for the multi-process equivalent (same per-game logic via `play_selfplay_game`).
     """
     dataset = SelfPlayDataset()
+    env = WarChestEnv(save_game_history=False, obs_encoder=encoder)
     if seed is not None:
         np.random.seed(seed)
+    game_stats = []
     for g in range(n_games):
-        env = WarChestEnv(save_game_history=False, obs_encoder=encoder)
-        env.reset()
-        n_before = len(dataset._movers)
-        winner = 0
-        for ply in range(max_turns):
-            mover = env.active_player
-            bot.act(env)  # runs the search; sets last_stats['visit_counts']
-            visit_counts = bot.last_stats.get('visit_counts') or {}
-            if not visit_counts:
-                # No search result (e.g. a single forced legal action) — play it,
-                # but don't record a target-less sample.
-                legal = env.get_possible_actions()
-                _, _, term, trunc, info = env.step(legal[0])
-            else:
-                obs = env.generate_observation()
-                dataset.add(
-                    board=obs['board'], global_feats=obs['global'],
-                    mask=obs['valid_action_mask'],
-                    visit_target=_ego_visit_target(visit_counts, mover),
-                    opp_onehot=_pool_onehot(), privileged=env.get_privileged_features(),
-                    mover=mover,
-                )
-                action = _sample_move(visit_counts, temperature if ply < temp_moves else 0.0)
-                _, _, term, trunc, info = env.step(action)
-                if not info['action'].is_valid:
-                    # puct only returns legal moves, so this is a belt-and-braces guard;
-                    # drop the just-added (untaken-move) sample and continue randomly.
-                    for lst in (dataset._boards, dataset._globals, dataset._masks,
-                                dataset._visits, dataset._opp, dataset._priv, dataset._movers):
-                        lst.pop()
-                    _, _, term, trunc, info = env.make_random_step()
-            if term:
-                winner = mover if info['action'].is_valid else env.active_player
-                break
-            if trunc:
-                winner = 0
-                break
-        dataset.label_last(len(dataset._movers) - n_before, winner)
+        stats = play_selfplay_game(bot, env, dataset, temperature=temperature,
+                                   temp_moves=temp_moves, max_turns=max_turns)
+        game_stats.append(stats)
         if log_every and (g + 1) % log_every == 0:
-            logger.info('selfplay: %d/%d games, %d samples', g + 1, n_games, len(dataset._movers))
-    return dataset.stack()
+            logger.info('selfplay: %d/%d games, %d samples', g + 1, n_games, len(dataset))
+    return dataset.stack(), game_stats
 
 
 def _pool_onehot():
@@ -293,12 +371,22 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
 
 
 def evaluate_distillation(dataset, policy, critic, *, device='cpu', indices=None, minibatch_size=512):
-    """Held-out `(ce, mse, agreement)` — CE to visits, critic MSE to z, and the
-    fraction where the policy's argmax legal action matches the search's argmax visit.
+    """Held-out `(ce, mse, agreement, policy_entropy, visit_entropy)`:
+    - `ce`/`mse`: CE to visits, critic MSE to z (the actual training objectives).
+    - `agreement`: fraction where the policy's argmax legal action matches the
+      search's argmax visit.
+    - `policy_entropy` / `visit_entropy`: mean entropy (nats) of the policy's own
+      distribution vs. the visit-count target it's being distilled toward. If
+      `visit_entropy` sits *above* `policy_entropy`, the search target is less
+      decisive than the policy already is — distilling toward it will flatten (not
+      sharpen) the policy, the opposite of the intended AlphaZero effect (usually a
+      sign the search ran too few simulations/move for its branching). Logged before
+      and after every distill call precisely so this is visible each round rather
+      than a silent regression.
     """
     policy.to(device).eval()
     critic.to(device).eval()
-    ce_sum = mse_sum = 0.0
+    ce_sum = mse_sum = pol_ent_sum = visit_ent_sum = 0.0
     n_seen = agree = 0
     with torch.inference_mode():
         for batch in dataset.iter_minibatches(minibatch_size, device, shuffle=False, indices=indices):
@@ -308,6 +396,12 @@ def evaluate_distillation(dataset, policy, critic, *, device='cpu', indices=None
             val = critic.value_batch(batch).reshape(-1)
             mse_sum += float(((val - batch['z']) ** 2).sum().item())
             agree += int((joint.argmax(dim=1) == tgt.argmax(dim=1)).sum().item())
+            probs = joint.exp()
+            pol_ent_sum += float((-(probs * joint)).sum(dim=1).sum().item())
+            visit_ent_sum += float((-(tgt * torch.log(tgt.clamp_min(1e-12)))).sum(dim=1).sum().item())
             n_seen += joint.shape[0]
     n_seen = max(1, n_seen)
-    return {'ce': ce_sum / n_seen, 'mse': mse_sum / n_seen, 'agreement': agree / n_seen}
+    return {
+        'ce': ce_sum / n_seen, 'mse': mse_sum / n_seen, 'agreement': agree / n_seen,
+        'policy_entropy': pol_ent_sum / n_seen, 'visit_entropy': visit_ent_sum / n_seen,
+    }
