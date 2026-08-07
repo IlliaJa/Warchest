@@ -434,7 +434,7 @@ so the prior keeps steering exploration for the *whole* search.
   calibrated, so the reward-scale-correct heuristic hedges its directional noise.
 - **Final move by visit count** (AlphaZero's choice; more stable than argmax-Q at
   low sim counts). The root visit distribution is exactly the policy target
-  expert iteration would later use (docs/next_steps.md — "search moves become new
+  expert iteration would later use (docs/history.md — "search moves become new
   training targets"); optional root Dirichlet noise (`dirichlet_alpha`, off by
   default) is provided for that self-play use.
 
@@ -465,7 +465,7 @@ field confirmed it: `puct` first at ~1117 Elo over `lookahead_critic` (~1017),
 
 Because `puct` is the strongest agent, its *own* search output is a better teacher
 than the raw policy that seeds it. `src/services/expert_iteration.py` +
-`src/app/expert_iteration.py` close that loop (docs/next_steps.md — "search moves
+`src/app/expert_iteration.py` close that loop (docs/history.md — "search moves
 become new training targets"):
 
 1. **gen** — `puct` self-plays (root Dirichlet noise, temperature-sampled moves);

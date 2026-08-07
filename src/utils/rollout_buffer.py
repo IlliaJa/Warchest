@@ -207,6 +207,31 @@ class RolloutBuffer:
                 'returns':        self.returns[idx],
             }
 
+    def critic_target_arrays(self):
+        """The critic's exact training pair as numpy, for dumping to disk.
+
+        -> dict with keys `boards`, `globals`, `opp_onehots`, `privileged`, `z`.
+
+        `z` holds the **shaped GAE returns** — deliberately under the key name the ExIt
+        datasets use for the game outcome, so `eval_board_value.py fit --data` reads a dump
+        of this with no code change and the two targets can be A/B'd on identical machinery
+        (docs/next_iteration.md §2 step 2, §3.3b: a board-blind critic trained on these
+        outranks a board-reading net trained on the outcome `z` by ~2x). Raw return scale,
+        NOT normalised — the normaliser is a training-time detail whose EMA state is not
+        reproducible offline.
+
+        Call after `compute_gae`; returns None before that (nothing to dump).
+        """
+        if self.returns is None or self._boards is None:
+            return None
+        return {
+            'boards': self._boards,
+            'globals': self._globals,
+            'opp_onehots': self._opp_onehots_arr,
+            'privileged': self._privileged_arr,
+            'z': self.returns.detach().cpu().numpy().astype(np.float32),
+        }
+
     def n_aux(self):
         """Number of stored auxiliary (dense) samples."""
         return 0 if self._aux_targets_arr is None else len(self._aux_targets_arr)

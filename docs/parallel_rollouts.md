@@ -99,7 +99,7 @@ tensors (`.cpu()` at snapshot time) so broadcast is cheap and never drags CUDA i
 ### Load balancing
 
 Episodes vary 60-200 turns.
-- **Implemented (P11a, IDEAS #11):** dynamic balancing via a shared atomic counter
+- **Implemented (P11a, IDEAS #3):** dynamic balancing via a shared atomic counter
   (`mp.Value('i')` = remaining episodes). Every worker loops "atomically decrement the counter
   → play one episode" until it reads ≤0, so a worker that draws short episodes claims more and
   the slowest-episode tail is removed — no fixed per-worker share.
@@ -171,12 +171,12 @@ All five are implemented; listed here as the delivery order.
    it. *Zero-risk groundwork.*
 2. **Collector + workers:** `ParallelRolloutCollector` owning the spawn pool, broadcast, gather.
 3. **Scale to N=6:** timing / balance; error handling + clean shutdown.
-4. **(P11a, IDEAS #11) Dynamic balancing:** shared atomic counter instead of a static split.
-5. **(P11b, IDEAS #11) Overlap:** collect batch N+1 with the GPU update of batch N (policy is
+4. **(P11a, IDEAS #3) Dynamic balancing:** shared atomic counter instead of a static split.
+5. **(P11b, IDEAS #3) Overlap:** collect batch N+1 with the GPU update of batch N (policy is
    frozen during collection anyway). Adds 1-step off-policy staleness + a second in-flight
    buffer; gated by `overlap_collection`.
 
-Remaining work is validation/tuning, not implementation — see IDEAS #11 (P11c real-config
+Remaining work is validation/tuning, not implementation — see IDEAS #3 (P11c real-config
 speed + learning-quality A/B; P11d shared-memory IPC only if profiling demands it).
 
 ## Expected gain (Amdahl)

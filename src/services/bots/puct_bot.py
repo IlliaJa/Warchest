@@ -63,7 +63,7 @@ Design decisions specific to Warchest:
     action, tie-broken by mean value in root's favour. More stable than argmax-Q
     at the low simulation counts a 0.1s budget allows, and it directly yields the
     visit distribution that expert-iteration would later use as a policy target
-    (docs/next_steps.md — "search moves become new training targets"). Optional
+    (docs/history.md — "search moves become new training targets"). Optional
     root Dirichlet noise (`dirichlet_alpha`, off by default) is provided for that
     self-play-target use; it only hurts as a deterministic eval/opponent, so it is
     disabled unless asked for.

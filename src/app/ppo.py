@@ -11,7 +11,9 @@ import time
 import wandb
 
 from src.services.policy.policy import Policy, Critic
-from src.services.policy.checkpoint import save_policy_checkpoint, save_critic_checkpoint
+from src.services.policy.checkpoint import (
+    save_policy_checkpoint, save_critic_checkpoint, CRITIC_ARCHS, CURRENT_CRITIC_ARCH,
+)
 from src.services.environment.warchest_env import (
     WarChestEnv, WIN_REWARD,
 )
@@ -133,7 +135,7 @@ class PPOTrainer:
         self._entropy_coeff_final = hp.get('entropy_coeff_final', hp['entropy_coeff'])
         self._entropy_coeff = self._entropy_coeff_init
         # Separate bonus on the verb-marginal entropy, annealed to a non-zero floor so
-        # low-cardinality verbs stay in the repertoire (docs/IDEAS.md #8). 0.0 => disabled.
+        # low-cardinality verbs stay in the repertoire (docs/IDEAS.md #R8). 0.0 => disabled.
         self._verb_entropy_coeff_init = hp.get('verb_entropy_coeff', 0.0)
         self._verb_entropy_coeff_final = hp.get('verb_entropy_coeff_final', self._verb_entropy_coeff_init)
         self._verb_entropy_coeff = self._verb_entropy_coeff_init
@@ -176,12 +178,32 @@ class PPOTrainer:
         }
         self._lookahead_critic_time_budget = hp['lookahead_critic_time_budget']
         self._puct_time_budget = hp.get('puct_time_budget', 0.1)
-        # Dense critic targets (docs/next_steps.md): also regress the critic on opponent-
+        # Dense critic targets (docs/IDEAS.md #12): also regress the critic on opponent-
         # decision nodes via an auxiliary MC-return loss, on top of the unchanged main GAE
         # targets. Off by default — an opt-in experiment; the aux loss is scaled by
         # `aux_critic_coeff` so it stays a secondary supervision signal.
         self._dense_critic = hp.get('dense_critic_targets', False)
         self._aux_critic_coeff = hp.get('aux_critic_coeff', 0.5)
+
+        # Board-only auxiliary value loss (docs/next_iteration.md §2 step 2, §3.4).
+        # `critic_v2` only. The main head reaches its target through 299 non-spatial inputs
+        # and draws 76% of its sensitivity from globals against 14% from the board, so the
+        # board pathway gets almost no gradient and its ReLU trunk falls into an absorbing
+        # state it can never leave. This term regresses the SAME return from the pooled
+        # board block alone, so it cannot be satisfied from globals and the trunk has to
+        # carry signal. Kept small — it is a pressure source, not a second objective.
+        self._aux_board_coeff = hp.get('aux_board_coeff', 0.1)
+        # How often to log per-conv trunk health. This bug ran undetected for a whole
+        # generation of checkpoints and voided every search measurement taken with them.
+        self._trunk_health_every = hp.get('trunk_health_every', 10)
+
+        # Shaped-return dump (docs/next_iteration.md §5 row 2a). Off unless a directory is
+        # given. Collects the dataset the critic-target A/B needs and nothing else touches.
+        self._dump_returns_dir = hp.get('dump_returns_dir')
+        self._dump_every_samples = hp.get('dump_returns_every_samples', 16000)
+        self._dump_parts = []
+        self._dump_n = 0
+        self._dump_shard = 0
 
         # training-lifetime state (persists across batches).
         # Snapshotting rarely (vs every batch) makes the fixed-size pool span a wide skill
@@ -297,6 +319,7 @@ class PPOTrainer:
                 self._compute_values_batched()
                 self._buffer.compute_gae(self._gamma, self._lam, self._device)
                 self._ret_normalizer.update(self._buffer.returns)
+                self._maybe_dump_returns(batch_num)
                 self._t_value_pass = time.perf_counter() - tv
 
                 # --- overlap: launch next batch's rollout NOW (pre-update weights) so the
@@ -527,6 +550,36 @@ class PPOTrainer:
             'n_actor_skipped': n_actor_skipped,
         }
 
+    def _maybe_dump_returns(self, batch_num: int) -> None:
+        """Append this batch's (critic input -> shaped GAE return) pairs to a shard on disk.
+
+        Enabled by `dump_returns_dir`. Exists because the shaped return — the target that
+        makes a critic able to rank siblings (docs/next_iteration.md §3.3b) — was computed
+        every batch and thrown away, so the A/B against ExIt's outcome `z` had no dataset to
+        run on. Shards are written with the ExIt key names (`z` holds the shaped return), so
+        `eval_board_value.py fit --data '<dir>/round*.npz'` consumes them unchanged.
+        """
+        if not self._dump_returns_dir:
+            return
+        arrays = self._buffer.critic_target_arrays()
+        if arrays is None:
+            return
+        self._dump_parts.append(arrays)
+        self._dump_n += len(arrays['z'])
+        if self._dump_n < self._dump_every_samples and batch_num < self._n_batches:
+            return
+        os.makedirs(self._dump_returns_dir, exist_ok=True)
+        merged = {k: np.concatenate([p[k] for p in self._dump_parts])
+                  for k in self._dump_parts[0]}
+        # `round{n}` matches the ExIt shard naming that `fit`'s round-wise held-out split
+        # keys on, so consecutive states from one batch cannot leak across the split.
+        path = os.path.join(self._dump_returns_dir, f'round{self._dump_shard}.npz')
+        np.savez_compressed(path, **merged)
+        logger.info(f'dumped {len(merged["z"])} (state -> shaped return) samples to {path}')
+        self._dump_parts.clear()
+        self._dump_n = 0
+        self._dump_shard += 1
+
     def _update_critic(self, batch_num: int) -> dict:
         critic_accum = 0.0
         critic_mae_accum = 0.0
@@ -534,6 +587,11 @@ class PPOTrainer:
         critic_std_accum = 0.0
         last_critic_grad = 0.0
         n_critic_updates = 0
+        board_aux_accum = 0.0
+        n_board_aux = 0
+        trunk_alive = None
+        trunk_out_std = None
+        health = None
         done = False
 
         for epoch in range(self._ppo_epochs):
@@ -550,6 +608,15 @@ class PPOTrainer:
                     (val_n - ret_n) ** 2,
                     (v_clipped_n - ret_n) ** 2,
                 ).mean()
+
+                # Board-only pressure on the trunk (see _aux_board_coeff). No value clip:
+                # this head has no v_old to clip against, and it is deliberately weak.
+                if self._critic.board_only_head is not None and self._aux_board_coeff > 0:
+                    bval_n = self._critic.board_only_value(batch['board'])
+                    board_aux = 0.5 * ((bval_n - ret_n) ** 2).mean()
+                    board_aux_accum += board_aux.item()
+                    n_board_aux += 1
+                    critic_loss = critic_loss + self._aux_board_coeff * board_aux
 
                 self._critic_optimizer.zero_grad(set_to_none=True)
                 critic_loss.backward()
@@ -605,12 +672,42 @@ class PPOTrainer:
                     aux_accum += aux_loss.item()
                     n_aux_updates += 1
 
+        # --- trunk health guard (docs/next_iteration.md §3.4) ---------------------- #
+        # A conv block reading exactly 0.0 means its ReLU output is identically zero for
+        # every state: the trunk is dead, `_split_pool` feeds the head hard zeros, and the
+        # critic is BLIND TO THE BOARD. It cannot recover — the ReLU gradient is exactly 0
+        # from then on. Logged so a run that produces a board-blind critic is visible while
+        # it is still running, instead of being discovered a generation of checkpoints later.
+        if self._trunk_health_every and batch_num % self._trunk_health_every == 0:
+            for probe in self._buffer.iter_minibatches(self._minibatch_size, self._device):
+                health = self._critic.trunk_health(probe['board'])
+                break
+            if health is not None:
+                trunk_alive = health['alive']
+                trunk_out_std = health['out_std']
+                # Two distinct failures, see Critic.trunk_health: v1 dies into the ReLU
+                # absorbing state (alive -> 0); either arch can collapse to a constant
+                # output (out_std -> 0), which the alive fraction alone does not catch.
+                if min(trunk_alive) == 0.0 or trunk_out_std < 1e-6:
+                    logger.error(
+                        f'batch={batch_num} BOARD-BLIND CRITIC: per-conv alive '
+                        f'{["%.4f" % a for a in trunk_alive]} pooled-output std '
+                        f'{trunk_out_std:.3g}. The value head is receiving no board '
+                        f'information, so it cannot rank two positions and every '
+                        f'measurement taken with this checkpoint is void — see '
+                        f'docs/next_iteration.md §3.4.'
+                    )
+
         denom = max(n_critic_updates, 1)
         return {
             'avg_critic': critic_accum / denom,
             'avg_critic_mae': critic_mae_accum / denom,
             'avg_critic_mean': critic_mean_accum / denom,
             'avg_critic_std': critic_std_accum / denom,
+            'avg_critic_board_aux': board_aux_accum / max(n_board_aux, 1),
+            **({f'critic_trunk_alive_conv{i + 1}': a for i, a in enumerate(trunk_alive)}
+               if trunk_alive else {}),
+            **({'critic_trunk_out_std': trunk_out_std} if trunk_out_std is not None else {}),
             'last_critic_grad': last_critic_grad,
             'n_critic_updates': n_critic_updates,
             'avg_aux_critic': aux_accum / max(n_aux_updates, 1),
@@ -723,7 +820,7 @@ class PPOTrainer:
         avg_turns = float(np.mean([ep['turns'] for ep in self._batch_eps]))
         total_invalid = sum(ep['invalid_count'] for ep in self._batch_eps)
         n_eps = len(self._batch_eps)
-        # Bolster usage (docs/IDEAS.md #8 — measured as near-zero pre-Material-PBRS).
+        # Bolster usage (docs/IDEAS.md #R8 — measured as near-zero pre-Material-PBRS).
         # Tracked per batch so a training run shows whether/when the rate moves.
         bolster_per_ep = sum(ep['bolster_count'] for ep in self._batch_eps) / n_eps
         bolster_fully_available_per_ep = (
@@ -750,6 +847,15 @@ class PPOTrainer:
             f'ret mean={self._buffer.raw_ret_mean:.4f} std={self._buffer.raw_ret_std:.4f} '
             f'critic mean={s["avg_critic_mean"]:.4f} std={s["avg_critic_std"]:.4f} '
             f'clip_frac={s["avg_clip_frac"]:.3f} critic_mae={s["avg_critic_mae"]:.4f}'
+            # Trunk health on the console, not only in W&B: a board-blind critic must be
+            # visible in a plain log tail, which is where this failure was eventually found.
+            + (''.join(f' alive{i + 1}={s[k]:.3f}'
+                       for i, k in enumerate(sorted(k for k in s if k.startswith('critic_trunk_alive'))))
+               )
+            + (f' out_std={s["critic_trunk_out_std"]:.4f}'
+               if 'critic_trunk_out_std' in s else '')
+            + (f' board_aux={s["avg_critic_board_aux"]:.4f}'
+               if s.get('avg_critic_board_aux') else '')
         )
         # rollout = worker critical-path wall (max over workers in parallel; the serial wall
         # otherwise). env/model_play are aggregate CPU-seconds across workers in parallel (so
@@ -811,6 +917,11 @@ class PPOTrainer:
                 'grad_norm_critic': s['last_critic_grad'],
                 'clip_frac': s['avg_clip_frac'],
                 'critic_mae': s['avg_critic_mae'],
+                # Board-trunk health per conv, and the board-only aux loss that keeps it
+                # alive (docs/next_iteration.md §3.4). A conv at 0.0 means a board-blind
+                # critic — watch these, not just the loss curves.
+                **{k: v for k, v in s.items() if k.startswith('critic_trunk_alive')},
+                'critic_board_aux': s['avg_critic_board_aux'],
                 'advantage_std': self._buffer.raw_adv_std,
                 'avg_turns': avg_turns,
                 'entropy_coeff': self._entropy_coeff,
@@ -838,11 +949,27 @@ if __name__ == '__main__':
     parser.add_argument(
         '--dense-critic-targets', action='store_true',
         help='Also regress the critic on opponent-decision nodes via an auxiliary MC-return '
-             'loss (docs/next_steps.md). Off by default; opt-in experiment. Save both this '
+             'loss (docs/IDEAS.md #12). Off by default; opt-in experiment. Save both this '
              "run's and a baseline run's critic to compare (see the gauntlet measurement plan).")
     parser.add_argument(
         '--aux-critic-coeff', type=float, default=0.5,
         help='Weight of the dense auxiliary critic loss (only used with --dense-critic-targets).')
+    parser.add_argument(
+        '--critic-arch', choices=CRITIC_ARCHS, default=CURRENT_CRITIC_ARCH,
+        help="Critic architecture. 'critic_v2' (default) adds GroupNorm to the board trunk "
+             'and a board-only auxiliary head; the un-normalised critic_v1 trunk provably '
+             'dies (docs/next_iteration.md §3.4). Pass critic_v1 only to reproduce a baseline.')
+    parser.add_argument(
+        '--aux-board-coeff', type=float, default=0.1,
+        help='Weight of the board-only auxiliary value loss (critic_v2 only). This is what '
+             'gives the board trunk gradient pressure the main head does not supply; 0 '
+             'disables it and lets the trunk drift toward the v1 failure mode.')
+    parser.add_argument(
+        '--dump-returns-dir', default=None,
+        help='If set, dump (critic input -> shaped GAE return) shards here as round*.npz, '
+             "with the shaped return under the key 'z'. Feeds the critic-target A/B: "
+             "`eval_board_value.py fit --data '<dir>/round*.npz'` reads them unchanged "
+             '(docs/next_iteration.md §5 row 2a).')
     cli_args = parser.parse_args()
 
     use_wandb = True
@@ -870,7 +997,7 @@ if __name__ == '__main__':
         'collect_episodes': 64,
         'max_t': 1000,
         'gamma': 0.99,
-        # GAE-lambda raised 0.95 -> 0.97 (docs/IDEAS.md #7): propagates the terminal
+        # GAE-lambda raised 0.95 -> 0.97 (docs/IDEAS.md #R7): propagates the terminal
         # win/loss signal further back with less bias, densifying credit for
         # delayed-payoff actions (bolster -> durable stack -> later trade/base) without
         # touching the reward. Reward-neutral, so A/B against 0.95 in isolation.
@@ -879,7 +1006,7 @@ if __name__ == '__main__':
         'ppo_eps': 0.2,
         'entropy_coeff': 0.025,
         'entropy_coeff_final': 0.003,  # linearly annealed from entropy_coeff over the run
-        # Dedicated entropy bonus on the top-level verb marginal P(verb) (docs/IDEAS.md #8).
+        # Dedicated entropy bonus on the top-level verb marginal P(verb) (docs/IDEAS.md #R8).
         # The flat-joint entropy above is dominated by the many spatial actions, so it
         # barely constrains the 11-way verb head and lets rare verbs (BOLSTER, TACTIC)
         # collapse out of the repertoire in the first ~80 batches (see the bolster_per_ep
@@ -904,7 +1031,7 @@ if __name__ == '__main__':
         # zero): the last ~25% of training then did no learning and the elo plateau in
         # those batches was purely the vanishing LR. 0.1 keeps a small floor so late
         # self-play refinement still moves the weights.
-        # IDEAS.md #5: widen the policy the same way the critic was widened, one clean
+        # IDEAS.md #R5: widen the policy the same way the critic was widened, one clean
         # step (64 -> 128) so a policy-capacity gain stays attributable — no added conv
         # depth (the 3-layer trunk's radius-3 receptive field is deliberate, policy.py),
         # no jump straight to 192. The policy/critic board encoders are independent during
@@ -956,11 +1083,18 @@ if __name__ == '__main__':
         # skill range (~pool_max_size * pool_snapshot_every batches) rather than near-copies.
         'pool_max_size': 20,
         'pool_snapshot_every': 15,
-        # Dense critic targets (opt-in via --dense-critic-targets; docs/next_steps.md). Adds
+        # Dense critic targets (opt-in via --dense-critic-targets; docs/IDEAS.md #12). Adds
         # an auxiliary MC-return regression on opponent-decision nodes, leaving the policy
         # path and main critic targets unchanged.
         'dense_critic_targets': cli_args.dense_critic_targets,
         'aux_critic_coeff': cli_args.aux_critic_coeff,
+        # Critic trunk fix (docs/next_iteration.md §2 step 2): GroupNorm + a board-only
+        # auxiliary head, so the trunk cannot enter the ReLU absorbing state and has a
+        # gradient source the main head does not give it.
+        'critic_arch': cli_args.critic_arch,
+        'aux_board_coeff': cli_args.aux_board_coeff,
+        'trunk_health_every': 10,
+        'dump_returns_dir': cli_args.dump_returns_dir,
     }
     logger.info(f'hyperparameters={hp}')
 
@@ -986,7 +1120,8 @@ if __name__ == '__main__':
         return Policy(device=device, hidden_dim=hp['hidden_dim'])
 
     warchest_policy = policy_constructor().to(device)
-    warchest_critic = Critic(device=device, hidden_dim=hp['critic_hidden_dim']).to(device)
+    warchest_critic = Critic(device=device, hidden_dim=hp['critic_hidden_dim'],
+                             arch=hp['critic_arch']).to(device)
     actor_optimizer = optim.Adam(warchest_policy.parameters(), lr=hp['lr_actor'])
     critic_optimizer = optim.Adam(warchest_critic.parameters(), lr=hp['lr_critic'])
 
@@ -1032,6 +1167,7 @@ if __name__ == '__main__':
                     warchest_critic, f'data/{critic_filename}',
                     obs_version=environment._obs_encoder.version,
                     hidden_dim=hp['critic_hidden_dim'],
+                    arch=hp['critic_arch'],
                     return_mean=trainer._ret_normalizer.mean,
                     return_std=trainer._ret_normalizer.std,
                 )

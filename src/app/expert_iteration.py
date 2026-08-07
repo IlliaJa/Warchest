@@ -2,7 +2,7 @@
 
 `PuctBot` (the gauntlet's strongest agent) teaches its own priors and leaf values to
 fresh policy/critic nets, which then seed a stronger `PuctBot`, and so on — the
-AlphaZero/ExIt loop (docs/next_steps.md). See `src/services/expert_iteration.py` for
+AlphaZero/ExIt loop (docs/history.md — expert iteration). See `src/services/expert_iteration.py` for
 the reusable core and `src/services/selfplay_collector.py` for the parallel self-play
 worker pool (mirrors `rollout_collector.py`'s design for PPO rollout collection). Run
 from the project root:
@@ -113,7 +113,8 @@ def _load_policy(path, device):
 def _load_critic(path, device):
     meta = load_critic_checkpoint(path, map_location=device)
     encoder = get_encoder(meta['obs_version'])
-    critic = Critic(device=device, hidden_dim=meta['hidden_dim'], obs_encoder=encoder).to(device)
+    critic = Critic(device=device, hidden_dim=meta['hidden_dim'], obs_encoder=encoder,
+                    arch=meta['arch']).to(device)
     critic.load_state_dict(meta['state_dict'])
     return critic, meta
 

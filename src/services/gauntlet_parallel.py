@@ -107,13 +107,13 @@ def _worker_loop(worker_id, task_q, result_q, log_q, agent_specs):
                 res = play_game(agents[i], agents[j], seed=game_seed)
             else:
                 res = play_game(agents[j], agents[i], seed=game_seed)
-            result_q.put((worker_id, 'OK', (i, j, p1_is_i, res)))
+            result_q.put((worker_id, 'OK', (i, j, game_seed, p1_is_i, res)))
         except Exception:
             import traceback
             result_q.put((worker_id, 'ERROR', traceback.format_exc()))
 
 
-def round_robin_parallel(agent_specs, names, *, k_games=20, seed=0, n_workers):
+def round_robin_parallel(agent_specs, names, *, k_games=20, seed=0, n_workers, tasks=None):
     """Parallel equivalent of `gauntlet.round_robin`, given agent specs (not live agents).
 
     `names` must be the display names in the same order `agent_specs` implies
@@ -121,14 +121,22 @@ def round_robin_parallel(agent_specs, names, *, k_games=20, seed=0, n_workers):
     produce) — passed in rather than recomputed so the caller isn't forced to
     build a throwaway agent field in the main process just to read `.name`.
 
-    Returns the same dict shape as `round_robin`. With the same `seed`/`k_games`
-    and a field of budget-free agents (no wall-clock search), the result matrix
-    is bit-identical to `round_robin`'s regardless of `n_workers`, since the task
-    list (and its seed assignment) is built once, up front, independent of
-    dispatch order.
+    `tasks` overrides the default all-pairs schedule with an explicit
+    `[(i, j, game_seed, p1_is_i), ...]` list (`k_games`/`seed` are then unused), for
+    experiments that need a specific pairing/seed layout — see
+    `src/app/eval_info_value.py`. Dispatch order is still re-prioritised by agent kind.
+
+    Returns the same dict shape as `round_robin`, including the raw per-game log
+    under `'results'` (in completion order, which is nondeterministic here — sort by
+    seed if order matters). With the same `seed`/`k_games` and a field of budget-free
+    agents (no wall-clock search), the result matrix is bit-identical to
+    `round_robin`'s regardless of `n_workers`, since the task list (and its seed
+    assignment) is built once, up front, independent of dispatch order.
     """
     n = len(agent_specs)
-    tasks = _prioritize(build_task_list(n, k_games=k_games, seed=seed), agent_specs)
+    if tasks is None:
+        tasks = build_task_list(n, k_games=k_games, seed=seed)
+    tasks = _prioritize(tasks, agent_specs)
 
     ctx = mp.get_context('spawn')
     task_q = ctx.Queue()
@@ -158,6 +166,7 @@ def round_robin_parallel(agent_specs, names, *, k_games=20, seed=0, n_workers):
 
     wins = np.zeros((n, n), dtype=np.float64)
     games = np.zeros((n, n), dtype=np.float64)
+    results = []
 
     def _shutdown():
         for p in procs:
@@ -174,12 +183,13 @@ def round_robin_parallel(agent_specs, names, *, k_games=20, seed=0, n_workers):
                 if status == 'ERROR':
                     _shutdown()
                     raise RuntimeError(f'gauntlet worker {worker_id} failed:\n{payload}')
-                i, j, p1_is_i, res = payload
+                i, j, game_seed, p1_is_i, res = payload
                 record_result(wins, games, i, j, p1_is_i, res)
+                results.append((i, j, game_seed, p1_is_i, res))
                 progress.update(task_id, advance=1)
     except BaseException:
         _shutdown()
         raise
     _shutdown()
 
-    return _finalize_report(names, wins, games)
+    return _finalize_report(names, wins, games, results)

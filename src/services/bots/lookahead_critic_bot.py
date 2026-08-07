@@ -228,7 +228,8 @@ class LookaheadCriticBot(LookaheadBot):
 
         meta = load_critic_checkpoint(critic_path, map_location=device)
         encoder = get_encoder(meta['obs_version'])
-        self._critic = Critic(device=device, hidden_dim=meta['hidden_dim'], obs_encoder=encoder).to(device)
+        self._critic = Critic(device=device, hidden_dim=meta['hidden_dim'], obs_encoder=encoder,
+                             arch=meta['arch']).to(device)
         self._critic.load_state_dict(meta['state_dict'])
         self._critic.eval()
 

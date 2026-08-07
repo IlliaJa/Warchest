@@ -2,7 +2,7 @@
 
 `PuctBot` is the strongest agent in the gauntlet, so its *own* search output is a
 better teacher than the raw policy that seeds it. This module closes that loop
-(docs/next_steps.md — "search moves become new training targets"):
+(docs/history.md — "search moves become new training targets"):
 
   1. `play_selfplay_game` / `generate_selfplay` — `PuctBot` (in `value_mode='outcome'`,
      root Dirichlet noise on) plays itself; per move it records the *ego-frame*

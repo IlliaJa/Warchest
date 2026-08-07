@@ -78,7 +78,7 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
     ``t_model_play`` so the caller can accumulate timing (this function owns no trainer
     state). The critic is never called here — V(s) is computed in one batched pass later.
 
-    ``collect_dense`` (docs/next_steps.md — dense critic targets): also emit auxiliary
+    ``collect_dense`` (docs/IDEAS.md #12 — dense critic targets): also emit auxiliary
     value-regression samples at every *opponent* decision node, so the critic gets
     supervision on the half of the game tree the main stream never covers. Each such node
     is scored from its (opponent) mover's perspective, conditioned on the `pool` opponent
@@ -107,7 +107,7 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
     bolster_count = 0
     # Stricter subset of bolster_count: board + supply == the bolstered unit's full
     # roster coin count (none of that type sits in hand/bag/discard, none boxed) —
-    # a "genuinely available, nothing lost" bolster (docs/IDEAS.md #8 bolster underuse).
+    # a "genuinely available, nothing lost" bolster (docs/IDEAS.md #R8 bolster underuse).
     bolster_fully_available_count = 0
     main_score = 0.0
     turns = 0

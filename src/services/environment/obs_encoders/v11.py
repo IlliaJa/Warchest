@@ -1,6 +1,6 @@
-"""Observation encoder v10 — extracted from warchest_env (docs/next_steps.md Step 1).
+"""Observation encoder v11 — v10 + draw-share features (docs/history.md 2026-07-25).
 
-Owns everything version-specific about the OBS_VERSION 10 observation: the board-
+Owns everything version-specific about the OBS_VERSION 11 observation: the board-
 plane layout, the global-feature layout, the normalizers, the ego (P2) 180°
 rotation, and the derivation of the threat / base-reach feature planes plus the
 material-at-risk / E_opp_hand / base-reach scalars.
@@ -80,7 +80,7 @@ OWNED_TOTAL = UNITS_PER_PLAYER * MAX_TOTAL + 1  # 21
 # universe (DECK, len C=17) or the unit types (U=16); absent types are zero.
 #   [0] round fraction  [1] my bases  [2] opp bases  [3] my initiative
 #   own (known): hand[C] bag[C] discard[C] supply[U] bag_size[1] owned[C]
-#                p_soon[C] p_mean[C]  (draw-share features, docs/IDEAS.md #2)
+#                p_soon[C] p_mean[C]  (draw-share features, docs/IDEAS.md #R2)
 #   opponent (public): on_board[U] faceup[C] supply[U] hidden_pool[C] owned[C]
 #                      opp_hand_size[1]  init_transferred[1]
 #   material-at-risk: own_at_risk[1] opp_at_risk[1]
@@ -159,7 +159,7 @@ def _counter_to_unit_vec(counter) -> np.ndarray:
 
 
 class ObsEncoderV11:
-    """OBS_VERSION 11 encoder. v10 + own-side draw-share features (docs/IDEAS.md #2).
+    """OBS_VERSION 11 encoder. v10 + own-side draw-share features (docs/IDEAS.md #R2).
 
     Adds two per-type [C] vectors to the own-side global block:
       - p_soon[t]: expected share of the *next* hand that is type t (imminent draw
@@ -338,7 +338,7 @@ class ObsEncoderV11:
         supply_v  = _counter_to_unit_vec(own_supply)
         owned_v   = _counter_to_deck_vec(own_owned)
 
-        # Draw-share features (docs/IDEAS.md #2), own-side, per type; already in [0,1].
+        # Draw-share features (docs/IDEAS.md #R2), own-side, per type; already in [0,1].
         # p_soon: expected share of the next hand that is type t (hypergeometric mean;
         # one reshuffle from the discard if the bag empties mid-draw).
         bag_size = bag_v.sum()

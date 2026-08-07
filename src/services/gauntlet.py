@@ -1,4 +1,4 @@
-"""Round-robin gauntlet (docs/next_steps.md Step 1).
+"""Round-robin gauntlet (docs/history.md — measurement infra).
 
 A fixed set of agents plays all-pairs, K games per pair with alternating colors,
 producing a pairwise win-rate matrix, a Bradley-Terry rating (Elo-scaled) anchored
@@ -23,6 +23,7 @@ from .environment.warchest_env import WarChestEnv
 from .environment.obs_encoders import get_encoder, latest_encoder
 from .bots.greedy_bot import GreedyBot
 from .bots.greedy_sim_bot import SimGreedyBot
+from .bots.bolster_bot import BolsterBot
 from .bots.random_bot import RandomBot
 from .bots.lookahead_bot import LookaheadBot
 from .bots.lookahead_critic_bot import LookaheadCriticBot
@@ -76,13 +77,28 @@ class HeuristicAgent(GauntletAgent):
         return WarChestEnv.remap_action(action) if env.active_player == 2 else action
 
 
-def greedy_sim_agent(name='greedy_sim', encoder=None):
+def greedy_sim_agent(name='greedy_sim', encoder=None, **kwargs):
     """The 1-ply forward-simulation greedy (`SimGreedyBot`) — the strong greedy
     yardstick. Speaks `act(env)` + `.name` directly (like LookaheadBot), so it
     drops in without a HeuristicAgent obs-encoding wrapper. `encoder` is accepted
     for a uniform factory signature but unused (this bot reads the env, not obs).
+
+    `kwargs` reach `SimGreedyBot` (e.g. `see_opponent_hand` — its 2-ply reply model
+    consumes the opponent's hand, so the flag is live here despite the shallow
+    search; `src/app/eval_info_value.py` builds both variants from this).
     """
-    return SimGreedyBot(name=name)
+    return SimGreedyBot(name=name, **kwargs)
+
+
+def bolster_agent(name='bolster', encoder=None, **kwargs):
+    """BolsterBot — the Berserker/Priest bolster-archetype exploiter
+    (docs/independent_opponents.md). Speaks `act(env)` + `.name` directly, like the
+    other simulation bots. NOTE: its archetype is only in force when it actually drafts
+    a Berserker/Priest; the standard gauntlet drafts randomly, so to see its intended
+    strength force the draft — `src/app/eval_bolster.py` does this. Without the forced
+    draft it degrades to its `SimGreedyBot` base behaviour.
+    """
+    return BolsterBot(name=name, **kwargs)
 
 
 def greedy_fast_agent(name='greedy_fast', encoder=None):
@@ -135,7 +151,7 @@ def checkpoint_agent(path, device):
 
     A bare legacy checkpoint from an older architecture / obs version (different
     layer names or dims) is not loadable into the current code — resurrecting those
-    is the subprocess/worktree path (docs/next_steps.md), out of scope here. We
+    is the subprocess/worktree path (docs/history.md — the gauntlet design contract), out of scope here. We
     skip them with a warning so the gauntlet still runs on the loadable field.
     """
     try:
@@ -164,7 +180,9 @@ def build_agent(spec, *, device):
     """
     kind = spec['kind']
     if kind == 'greedy_sim':
-        return greedy_sim_agent(spec['name'])
+        return greedy_sim_agent(spec['name'], **spec.get('kwargs', {}))
+    if kind == 'bolster':
+        return bolster_agent(spec['name'], **spec.get('kwargs', {}))
     if kind == 'greedy_fast':
         return greedy_fast_agent(spec['name'])
     if kind == 'random':
@@ -259,8 +277,15 @@ def record_result(wins, games, i, j, p1_is_i, res):
         wins[j, i] += 1.0
 
 
-def _finalize_report(names, wins, games):
-    """Shared post-processing: win-rate matrix, BT ratings, intransitivity."""
+def _finalize_report(names, wins, games, results=None):
+    """Shared post-processing: win-rate matrix, BT ratings, intransitivity.
+
+    `results` is the optional raw per-game log, `[(i, j, game_seed, p1_is_i, res), ...]`
+    in completion order. The aggregate matrices are enough to rank a field, but a
+    *paired* analysis needs to line games up by seed across pairs — see
+    `src/app/eval_info_value.py`, which plays two arms on one seed block and compares
+    them game by game.
+    """
     with np.errstate(invalid='ignore', divide='ignore'):
         win_rate = np.where(games > 0, wins / games, np.nan)
 
@@ -274,29 +299,38 @@ def _finalize_report(names, wins, games):
         'win_rate': win_rate,
         'ratings': dict(zip(names, ratings)),
         'intransitive_fraction': transitivity,
+        'results': results if results is not None else [],
     }
 
 
-def round_robin(agents, *, k_games=20, seed=0):
+def round_robin(agents, *, k_games=20, seed=0, tasks=None):
     """Play every pair K games with balanced colors.
 
     Returns a dict with agent names, the wins/games/win-rate matrices (wins counts
-    draws as 0.5 to each side), Bradley-Terry ratings (Elo-scaled), and the
-    intransitive-triple fraction.
+    draws as 0.5 to each side), Bradley-Terry ratings (Elo-scaled), the
+    intransitive-triple fraction, and the raw per-game log.
+
+    `tasks` overrides the default all-pairs schedule with an explicit
+    `[(i, j, game_seed, p1_is_i), ...]` list — for experiments that need a specific
+    pairing/seed layout rather than a round-robin (`k_games`/`seed` are then unused).
     """
     n = len(agents)
     names = [a.name for a in agents]
     wins = np.zeros((n, n), dtype=np.float64)   # wins[i,j] = i's score vs j (draw=0.5)
     games = np.zeros((n, n), dtype=np.float64)
+    results = []
 
-    for i, j, game_seed, p1_is_i in build_task_list(n, k_games=k_games, seed=seed):
+    if tasks is None:
+        tasks = build_task_list(n, k_games=k_games, seed=seed)
+    for i, j, game_seed, p1_is_i in tasks:
         if p1_is_i:
             res = play_game(agents[i], agents[j], seed=game_seed)
         else:
             res = play_game(agents[j], agents[i], seed=game_seed)
         record_result(wins, games, i, j, p1_is_i, res)
+        results.append((i, j, game_seed, p1_is_i, res))
 
-    return _finalize_report(names, wins, games)
+    return _finalize_report(names, wins, games, results)
 
 
 def _bradley_terry_elo(wins, *, n_iter=10000, tol=1e-10, anchor=1000.0, reg=1.0):

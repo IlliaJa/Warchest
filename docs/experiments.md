@@ -191,3 +191,64 @@ is the true bot (`RANDOM_ACTION_PROB=0`), so WR-vs-greedy is honest.
    (`n_workers=1` vs `6`) is still pending (`docs/parallel_rollouts.md`).
 
 ![New obs + annealed material PBRS + PPO tuning — W&B training panels (~600 batches)](assets/2026-07-04.png)
+
+---
+
+## 2026-07-07 — Long run, 1500 batches (run: `ppo_20260706-194732` → `warchest_ppo_20260707-0026.pth`)
+
+*Backfilled 2026-08-01 from the retired `docs/next_steps.md` (Step 4), which was the only
+record of this run outside git history.*
+
+**What it was.** The 1000–1500-batch long run the roadmap had been deferring until a
+non-saturated yardstick existed. It ran *before* `LookaheadBot` and the round-robin gauntlet
+were fully in place, so — like every prior run — it was read against greedy while it trained.
+
+**Result.** `wr_greedy` saturates to **1.0 by batch ~1200**, the same shape as the
+2026-06-30 plateau run: the back half of the run was optimizing a dead signal. Despite that,
+the checkpoint was **validated after the fact** by the first gauntlet (below): it is the
+strongest agent in that field, beats the previous checkpoint (`ckpt_20260704-1243`) 70/30, and
+beats both search bots. So this run's gains were real, not a saturated-signal artifact — this
+time.
+
+**Lesson carried forward.** A long run should train against a curriculum that still moves at
+batch 1200 (an independent opponent in the pool) and be read against the gauntlet from the
+start rather than after the fact.
+
+---
+
+## 2026-07-08 — First round-robin gauntlet (5 agents, `app/gauntlet.py`)
+
+*Backfilled 2026-08-01 from the retired `docs/next_steps.md`.* First measurement against a
+fixed, non-self-referential field after the versioned-encoder + gauntlet work
+(`docs/history.md` → *Measurement + opponent infrastructure*).
+
+```
+Win-rate matrix (row vs column):
+                         ckpt_2  ckpt_2  greedy  lookah  lookah
+ckpt_20260704-1243[v10]     -      0.30    0.90    0.55    0.57
+ckpt_20260707-0026[v10]    0.70     -      1.00    0.65    0.75
+                 greedy    0.10    0.00     -      0.15    0.47
+              lookahead    0.45    0.35    0.85     -      0.80
+       lookahead_critic    0.42    0.25    0.53    0.20     -
+
+Bradley-Terry ranking (Elo-scaled, field mean = 1000):
+  ckpt_20260707-0026[v10]   1177.1
+                lookahead   1070.6
+  ckpt_20260704-1243[v10]   1051.4
+         lookahead_critic    909.2
+                   greedy    791.7
+```
+
+**Reading it:**
+
+- **The 1500-batch checkpoint is the strongest agent in the field**, beating everything
+  including both lookahead bots. First time "beats predecessors" was checked against a
+  genuinely non-saturated yardstick and held up.
+- **Plain `lookahead` beat `lookahead_critic` 80/20**, which was backwards from its design
+  intent (critic-guided beam search was supposed to search *better*). Diagnosed 2026-07-11 as
+  a **missing critic denormalization**; post-fix it wins 68–78% vs `lookahead`
+  (`docs/bots.md`). **This ranking is therefore stale** — treat it as a historical first
+  measurement, not a current standing.
+- **No cycles found by hand-checking triples**, but 5 agents is too small a field to trust
+  that qualitatively; the gauntlet's own intransitive-triple metric is the check as the field
+  grows (it later measured 0.11 on a 31-agent ExIt field — `docs/independent_opponents.md` §1).

@@ -1,4 +1,4 @@
-"""Bucketed evaluation + loss autopsy vs LookaheadBot — docs/future_steps.md Step 0.
+"""Bucketed evaluation + loss autopsy vs LookaheadBot — docs/IDEAS.md #5.
 
 The training-loop eval (`PPOTrainer._maybe_eval`) reports one aggregate win
 rate over 20 games. That hides the question that actually matters before any
@@ -41,7 +41,7 @@ _STACK_CHAIN_UNIT_IDS = {u.id for u in UNIT_BY_ID.values() if u.extra_maneuvers_
 
 # Knight can only be damaged by a bolstered attacker (roster: only_attackable_when_bolstered),
 # so a Knight in the OPPONENT's roster is the cleanest natural test of whether the policy
-# has learned bolster at all — docs/IDEAS.md #8/#1. --opp-knight-frac forces it into a
+# has learned bolster at all — docs/IDEAS.md #R8/#R1. --opp-knight-frac forces it into a
 # controllable share of games so the with/without-Knight WR split has real statistical power.
 KNIGHT_ID = next(u.id for u in UNIT_BY_ID.values() if u.name == 'Knight')
 
@@ -62,7 +62,7 @@ def play_one_game(env, policy, bot, main_pid, max_t, reset_options=None):
     state, _ = env.reset(options=reset_options)
     opp_pid = 3 - main_pid
     used_tactic = False
-    # docs/IDEAS.md #9: base-lead (my_bases - opp_bases) at the moment each tactic is
+    # docs/IDEAS.md #R9: base-lead (my_bases - opp_bases) at the moment each tactic is
     # initiated, to disambiguate reverse-causation (tactics reached for only when
     # already behind) from an execution/exploration gap (tactics attempted from a lead
     # too, just executed poorly).
@@ -284,14 +284,14 @@ def _print_initiative_breakdown(records):
 
 
 def _print_tactic_lead_breakdown(records):
-    """docs/IDEAS.md #9: disambiguate whether tactics correlate with losing because
+    """docs/IDEAS.md #R9: disambiguate whether tactics correlate with losing because
     they're reached for only when already behind (reverse causation — no fix needed)
     or attempted from a lead too but executed poorly (an execution/exploration gap —
-    docs/IDEAS.md #8 is on target). Buckets every tactic-initiation instance by
+    docs/IDEAS.md #R8 is on target). Buckets every tactic-initiation instance by
     base-lead (my_bases - opp_bases) at the moment it was initiated."""
     leads = [lead for r in records for lead in r['tactic_base_leads']]
     n = len(leads)
-    print(f'\n=== Tactic-initiation base-lead (docs/IDEAS.md #9) ===')
+    print(f'\n=== Tactic-initiation base-lead (docs/IDEAS.md #R9) ===')
     if n == 0:
         print('  (tactic never initiated — nothing to disambiguate)')
         return
@@ -366,13 +366,13 @@ def _print_bolster_breakdown(records):
 
 
 def _print_knight_matchup_breakdown(records):
-    """docs/IDEAS.md #8/#1: the Knight is only attackable by a bolstered attacker, so a
+    """docs/IDEAS.md #R8/#R1: the Knight is only attackable by a bolstered attacker, so a
     Knight in the OPPONENT's roster is a state where bolster is *mechanically required*
     to remove it. This is the discriminator between the two 'tried-then-dropped' causes:
       - if WR collapses when the opponent has a Knight AND the policy rarely bolsters in
         those games -> bolster was valuable and got wrongly pruned (exploration gap);
       - if WR holds up (or bolstering doesn't move WR) -> bolster genuinely wasn't worth
-        it under current play (credit gap) and IDEAS #8's intrinsic-bonus fix is on target.
+        it under current play (credit gap) and IDEAS #R8's intrinsic-bonus fix is on target.
     Run with --opp-knight-frac 0.5 for enough games in the with-Knight bucket."""
     with_knight = [r for r in records if 'Knight' in r['opp_composition']]
     without_knight = [r for r in records if 'Knight' not in r['opp_composition']]
@@ -417,7 +417,7 @@ def _print_exact_composition_breakdown(records, min_games=3):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Bucketed evaluation + loss autopsy vs LookaheadBot (future_steps.md Step 0).')
+        description='Bucketed evaluation + loss autopsy vs LookaheadBot (docs/IDEAS.md #5).')
     parser.add_argument('--model-path', type=str, default=None,
                          help='Path to .pth file. Defaults to the latest data/warchest_ppo_*.pth.')
     parser.add_argument('--games', type=int, default=200)
@@ -430,7 +430,7 @@ def main():
     parser.add_argument('--opp-knight-frac', type=float, default=0.0,
                          help='Fraction of games in which a Knight is forced into the '
                               'opponent roster (0..1). Bolster is required to kill a '
-                              'Knight, so this stress-tests bolster usage (docs/IDEAS.md #8).')
+                              'Knight, so this stress-tests bolster usage (docs/IDEAS.md #R8).')
     parser.add_argument('--out-csv', type=str, default=None,
                          help='Optional path to dump every game record as CSV.')
     args = parser.parse_args()

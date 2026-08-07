@@ -1,4 +1,4 @@
-"""Observation encoder v10 — extracted from warchest_env (docs/next_steps.md Step 1).
+"""Observation encoder v10 — extracted from warchest_env (docs/history.md — measurement infra).
 
 Owns everything version-specific about the OBS_VERSION 10 observation: the board-
 plane layout, the global-feature layout, the normalizers, the ego (P2) 180°

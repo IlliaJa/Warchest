@@ -1,4 +1,4 @@
-"""Versioned observation encoders (docs/next_steps.md Step 1).
+"""Versioned observation encoders (docs/history.md — measurement infra).
 
 Each encoder owns everything version-specific about turning the canonical game
 state into a policy/critic observation (plane layout, normalizers, ego rotation,

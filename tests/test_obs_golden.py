@@ -3,7 +3,7 @@
 Records a deterministic sequence of encoded observations (board / global /
 valid_action_mask / privileged) into a committed fixture, then asserts the live
 encoder reproduces it byte-for-byte. This is the safety net for the obs-encoder
-extraction refactor (docs/next_steps.md Step 1): any silent drift in a
+extraction refactor (docs/history.md — measurement infra): any silent drift in a
 normalizer, plane layout, or the P2 ego-rotation trips this test.
 
 The rollout drives the env directly in the ABSOLUTE action frame

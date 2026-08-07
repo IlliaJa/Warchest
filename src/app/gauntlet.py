@@ -1,4 +1,4 @@
-"""Round-robin gauntlet CLI (docs/next_steps.md Step 1).
+"""Round-robin gauntlet CLI (docs/history.md — measurement infra).
 
 Plays a fixed field of agents — trained checkpoints plus the GreedyBot baseline —
 all-pairs with balanced colors, then prints the win-rate matrix, a Bradley-Terry

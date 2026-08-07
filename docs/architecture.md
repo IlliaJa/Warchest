@@ -63,7 +63,8 @@ model, feature aggregation, normalizers, plane layout, and ego-rotation. `WarChe
 picks the encoder (default: latest); `Policy`/`Critic` size their input layers from the paired
 encoder's dims. Because `encode(view)` is a pure function of the game state, agents built for
 different obs versions can encode one shared `WarChestEnv` independently — the basis for the
-cross-era round-robin gauntlet (`src/services/gauntlet.py`, `docs/next_steps.md` Step 1).
+cross-era round-robin gauntlet (`src/services/gauntlet.py`; design rationale in `docs/history.md`
+→ *Measurement + opponent infrastructure*).
 `tests/test_obs_golden.py` guards the encoding byte-for-byte.
 
 ## File reference
@@ -73,7 +74,7 @@ cross-era round-robin gauntlet (`src/services/gauntlet.py`, `docs/next_steps.md`
 | `src/app/ppo.py` | PPOTrainer class: collect, update, eval, log |
 | `src/app/reinforce.py` | Legacy REINFORCE+GAE trainer (kept for reference, not the primary path) |
 | `src/app/demo.py` | Evaluate saved model vs random + interactive replay |
-| `src/app/eval_bucketed.py` | Per-composition eval bucketing (`docs/IDEAS.md` #1) |
+| `src/app/eval_bucketed.py` | Per-composition eval bucketing (`docs/IDEAS.md` #R1) |
 | `src/app/gauntlet.py` | Round-robin gauntlet CLI: load checkpoints + baselines, print WR matrix / Elo / transitivity |
 | `src/app/main.py` | Minimal random-action smoke test |
 | `src/services/environment/warchest_env.py` | Gymnasium env: reset, step, rewards, action encode/decode, rules-queries; delegates obs encoding |

@@ -249,22 +249,43 @@ class LookaheadBot:
     def _prepare_root(self, env, root_player):
         """Clone the real state and sample one determinization of future draws.
 
-        In fair mode, the opponent's hand+bag are pooled and re-split first, so the
+        In fair mode, the opponent's hidden coins are pooled and re-split first, so the
         rest of the pipeline (draw-queue sampling) is identical in both modes.
         """
         state = _clone_state(env.state)
         opp = 3 - root_player
         if not self.see_opponent_hand:
-            hand_size = sum(state.hands[opp].values())
-            pool = list((state.hands[opp] + state.bags[opp]).elements())
-            random.shuffle(pool)
-            state.hands[opp] = Counter(pool[:hand_size])
-            state.bags[opp] = Counter(pool[hand_size:])
+            self._resplit_hidden(state, opp)
         queues = {
             root_player: self._shuffled(state.bags[root_player]),
             opp: self._shuffled(state.bags[opp]),
         }
         return state, queues
+
+    @staticmethod
+    def _resplit_hidden(state, opp):
+        """Re-deal the opponent's hidden coins uniformly over their THREE hidden piles.
+
+        Hand, bag and face-down discard are all hidden; only their sizes and their
+        union are public (docs/search_under_uncertainty.md §1.1) — the bag's contents
+        are *not* public, contrary to what this file assumed for a long time. The
+        previous version pooled only `hands + bags`, which left `discard_facedown` at
+        its true value: "fair" mode still knew exactly which coins the opponent had
+        buried face down, and therefore re-split the correct pool. That understates
+        how blind a genuinely blind bot is, and biases
+        `src/app/eval_info_value.py` toward measuring no information gap at all.
+
+        The union is preserved, so `_reshuffle` (which merges both discard piles back
+        into the bag) is unaffected in aggregate.
+        """
+        hand_size = sum(state.hands[opp].values())
+        fd_size = sum(state.discard_facedown[opp].values())
+        pool = list((state.hands[opp] + state.bags[opp]
+                     + state.discard_facedown[opp]).elements())
+        random.shuffle(pool)
+        state.hands[opp] = Counter(pool[:hand_size])
+        state.discard_facedown[opp] = Counter(pool[hand_size:hand_size + fd_size])
+        state.bags[opp] = Counter(pool[hand_size + fd_size:])
 
     @staticmethod
     def _shuffled(counter):

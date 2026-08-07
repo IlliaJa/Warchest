@@ -216,7 +216,7 @@ class Policy(nn.Module):
         the many spatial (cell, direction) actions, so a bonus on its entropy barely
         constrains the 11-way verb marginal and lets low-cardinality verbs (BOLSTER,
         TACTIC) collapse out of the repertoire before reward can reinforce them. A
-        dedicated bonus on this quantity keeps rare verbs alive (docs/IDEAS.md #8).
+        dedicated bonus on this quantity keeps rare verbs alive (docs/IDEAS.md #R8).
         """
         NEG = -1e9
         B = mask.shape[0]
@@ -255,6 +255,11 @@ class Policy(nn.Module):
         return self._joint_log_probs(flat_logits, verb_logits, batch['mask'])  # [N, A]
 
 
+CRITIC_ARCH_V1 = 'critic_v1'
+CRITIC_ARCH_V2 = 'critic_v2'
+CRITIC_GROUPS = 8  # GroupNorm groups; must divide both 32 and hidden_dim
+
+
 class Critic(nn.Module):
     """Separate value network with its own spatial encoder.
 
@@ -263,28 +268,73 @@ class Critic(nn.Module):
       - a PRIV_DIM vector of the opponent's *true* hidden coin split
         (opp hand / bag / face-down discard per coin). Discarded at inference.
 
-    Board trunk: same HexConv2d stack as Policy → [B, Cf, 7, 7].
-    Split flank pool (see `_split_pool`) → [B, 2*Cf]. Concatenate with global
-    features, opp_onehot and the privileged vector → scalar value.
+    Board trunk: HexConv2d stack → [B, Cf, 7, 7]. Split flank pool (see
+    `_split_pool`) → [B, 2*Cf]. Concatenate with global features, opp_onehot and
+    the privileged vector → scalar value.
+
+    Two architectures, selected by `arch`, because every existing checkpoint is v1
+    and the gauntlet has to keep reconstructing them (docs/history.md):
+
+    `critic_v1` — the original `HexConv2d → ReLU` ×3 with no normalisation. **This
+    trunk dies.** Measured on the shipped v11 checkpoint: every pre-activation of
+    the final ReLU is <= 0 for all 1085 probe states and all 192 channels (max
+    -0.003), so the trunk outputs exactly zero, `_split_pool` feeds `head[0]` a
+    block of hard zeros, and the critic is blind to the board. Once there, the ReLU
+    gradient is exactly 0 and Adam's moments stay 0 — it never recovers. Cost:
+    89-93 % of sibling pairs that differ only in position get identical values and
+    cannot be ranked at all (docs/next_iteration.md §3.4).
+
+    `critic_v2` — the fix, two parts:
+      * **GroupNorm before every ReLU.** Re-centres each sample's channels, so a
+        whole channel cannot sit permanently below zero. Measured on 8 fresh seeds:
+        removes the absorbing state and raises |out|max 0.083 -> 5.03. NOT
+        BatchNorm — `ppo.py` toggles `critic.eval()/.train()` around the rollout, so
+        batch statistics would desynchronise the values the critic is fit to from
+        the ones used in the rollout.
+      * **A board-only auxiliary value head** (`board_only_head`). GroupNorm removes
+        the trap but gives the trunk no *reason* to learn: the main head draws 76 %
+        of its sensitivity from globals and 14 % from the board, so the board
+        pathway sees almost no gradient. This head reads the pooled board block
+        alone, so its loss cannot be satisfied from globals, and the trunk must
+        carry signal. `ppo.py` adds it at `aux_board_coeff`. The evidence it is the
+        right mechanism: the `board_solo` probe — same stack, same data, but with no
+        globals to fall back on — trains to a 43.2 % alive trunk and pooled
+        R^2 0.1846, above a globals-only control's 0.1633.
     """
 
     OPP_DIM = 3
 
-    def __init__(self, device, hidden_dim=64, *, obs_encoder=None):
+    def __init__(self, device, hidden_dim=64, *, obs_encoder=None, arch=CRITIC_ARCH_V2):
         super().__init__()
+        if arch not in (CRITIC_ARCH_V1, CRITIC_ARCH_V2):
+            raise ValueError(f'unknown critic arch {arch!r}')
         # Obs dims (incl. the privileged vector) come from the paired encoder.
         enc = obs_encoder or latest_encoder()
         self.board_channels = enc.board_channels
         self.global_dim = enc.global_dim
         self.priv_dim = enc.priv_dim
-        self.board_encoder = nn.Sequential(
-            HexConv2d(self.board_channels, 32),
-            nn.ReLU(),
-            HexConv2d(32, hidden_dim),
-            nn.ReLU(),
-            HexConv2d(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
+        self.arch = arch
+
+        if arch == CRITIC_ARCH_V1:
+            # Module layout preserved EXACTLY so existing state_dicts load unchanged.
+            self.board_encoder = nn.Sequential(
+                HexConv2d(self.board_channels, 32),
+                nn.ReLU(),
+                HexConv2d(32, hidden_dim),
+                nn.ReLU(),
+                HexConv2d(hidden_dim, hidden_dim),
+                nn.ReLU(),
+            )
+        else:
+            if 32 % CRITIC_GROUPS or hidden_dim % CRITIC_GROUPS:
+                raise ValueError(
+                    f'critic_v2 needs hidden_dim divisible by {CRITIC_GROUPS}, got {hidden_dim}')
+            self.board_encoder = nn.Sequential(
+                self._conv_block(self.board_channels, 32),
+                self._conv_block(32, hidden_dim),
+                self._conv_block(hidden_dim, hidden_dim),
+            )
+
         head_in = 2 * hidden_dim + self.global_dim + self.OPP_DIM + self.priv_dim
         self.head = nn.Sequential(
             nn.Linear(head_in, hidden_dim),
@@ -295,16 +345,79 @@ class Critic(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
+        # v1 checkpoints have no such parameter, so it only exists on v2.
+        self.board_only_head = (nn.Linear(2 * hidden_dim, 1)
+                                if arch == CRITIC_ARCH_V2 else None)
+
+    @staticmethod
+    def _conv_block(cin, cout):
+        return nn.Sequential(HexConv2d(cin, cout), nn.GroupNorm(CRITIC_GROUPS, cout), nn.ReLU())
 
     @property
     def device(self):
         return next(self.parameters()).device
 
+    def trunk_health(self, board):
+        """Is the board trunk carrying information? -> {'alive': [f1, f2, f3], 'out_std': float}
+
+        `alive[i]` is the fraction of POSITIVE pre-activations at conv block `i`; `out_std` is
+        the standard deviation of the pooled trunk output across the batch. **Both are needed,
+        because the two architectures fail differently:**
+
+        * `critic_v1` dies by the ReLU **absorbing state** — every pre-activation goes <= 0, so
+          `alive` hits exactly 0.0 and the output is exactly zero. Once there the ReLU gradient
+          is 0 and Adam's moments stay 0, so it never recovers.
+        * `critic_v2` structurally *cannot* reach that state — GroupNorm re-centres each
+          sample, so a whole channel cannot sit below zero. Verified: force the last conv to a
+          constant -50 and v1 reports `alive` 0.0 with output exactly 0, while v2 reports
+          `alive` **1.0**. That is the fix working, but it means the alive fraction alone is a
+          useless guard for v2: an all-positive **constant** output carries exactly as little
+          information as an all-zero one. `out_std` is what catches it.
+
+        So: `min(alive) == 0` diagnoses the v1 failure, `out_std ~ 0` diagnoses either. A
+        board-blind critic voids every measurement taken with it (docs/next_iteration.md §3.4),
+        which is why `ppo.py` logs both every run. Healthy `alive` is roughly 20-50 %.
+        """
+        alive, x = [], board
+        with torch.no_grad():
+            for block in self.board_encoder:
+                if isinstance(block, nn.Sequential):     # v2: [conv, norm, relu]
+                    for layer in block[:-1]:
+                        x = layer(x)
+                    alive.append(float((x > 0).float().mean()))
+                    x = block[-1](x)
+                elif isinstance(block, nn.ReLU):         # v1: flat [conv, relu, ...]
+                    alive.append(float((x > 0).float().mean()))
+                    x = block(x)
+                else:
+                    x = block(x)
+            # Variation of what the value head actually receives, across the batch. This is
+            # the quantity that matters: the head sees `_split_pool(trunk(board))`, and if
+            # that does not vary with the board the critic cannot rank two positions no
+            # matter how many pre-activations are positive.
+            pooled = _split_pool(x)
+            out_std = float(pooled.std()) if pooled.numel() > 1 else 0.0
+        return {'alive': alive, 'out_std': out_std}
+
+    def _pooled(self, board_enc):
+        """Board trunk + flank pool. -> [B, 2*hidden_dim]"""
+        return _split_pool(self.board_encoder(board_enc))
+
     def _forward(self, board_enc, global_feats, opp_onehot, privileged):
-        feat = self.board_encoder(board_enc)  # [B, hidden_dim, 7, 7]
-        pooled = _split_pool(feat)  # [B, 2*hidden_dim]
+        pooled = self._pooled(board_enc)  # [B, 2*hidden_dim]
         combined = torch.cat([pooled, global_feats, opp_onehot, privileged], dim=-1)
         return self.head(combined).squeeze(-1)
+
+    def board_only_value(self, board_enc):
+        """Value predicted from the BOARD ALONE. -> [B]  (critic_v2 only.)
+
+        The auxiliary target that keeps the trunk alive: because this head sees no
+        globals, opp_onehot or privileged features, its loss is unsatisfiable without a
+        board representation that carries signal. See the class docstring.
+        """
+        if self.board_only_head is None:
+            raise RuntimeError(f'board_only_value requires {CRITIC_ARCH_V2}, this is {self.arch}')
+        return self.board_only_head(self._pooled(board_enc)).squeeze(-1)
 
     def value_single(self, obs, opp_onehot, privileged):
         """V(s) for one raw observation dict.

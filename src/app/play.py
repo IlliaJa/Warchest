@@ -56,7 +56,8 @@ if __name__ == '__main__':
         try:
             cmeta = load_critic_checkpoint(args.critic_path, map_location=device)
             critic_encoder = get_encoder(cmeta['obs_version'])
-            critic = Critic(device=device, hidden_dim=cmeta['hidden_dim'], obs_encoder=critic_encoder).to(device)
+            critic = Critic(device=device, hidden_dim=cmeta['hidden_dim'], obs_encoder=critic_encoder,
+                            arch=cmeta['arch']).to(device)
             critic.load_state_dict(cmeta['state_dict'])
             critic.eval()
             if cmeta['return_mean'] is not None and cmeta['return_std'] is not None:

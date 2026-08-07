@@ -278,7 +278,7 @@ class WarChestEnv(gym.Env):
         super().reset(seed=seed)
         # options={'force_units': {pid: [unit_id, ...]}} pins those unit types into a
         # player's drafted composition (used by eval to force controlled matchups, e.g.
-        # a Knight always in the opponent's roster — docs/IDEAS.md #8/#1 diagnostic).
+        # a Knight always in the opponent's roster — docs/IDEAS.md #R8/#R1 diagnostic).
         force_units = (options or {}).get('force_units')
         self.set_init_state(force_units=force_units)
         return self.generate_observation(), {}

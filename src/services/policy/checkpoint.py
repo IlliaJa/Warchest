@@ -1,7 +1,7 @@
 """Policy/critic checkpoint (de)serialization with obs-version + architecture metadata.
 
 A bare `state_dict` is meaningless without knowing which obs encoder and network
-architecture produced it (docs/next_steps.md Step 1 "the compatibility blocker").
+architecture produced it (docs/history.md — the gauntlet design contract).
 Checkpoints are therefore saved as a metadata envelope so any era's policy (or
 critic) can be reconstructed and dropped into the round-robin gauntlet.
 
@@ -32,8 +32,15 @@ from ..environment.obs_encoders import LATEST_VERSION
 # Architecture id for the current factored-head Policy. Bump (and register a
 # loader) when the network class changes; the gauntlet keys reconstruction on it.
 CURRENT_ARCH = 'policy_factored_v1'
-# Architecture id for the current Critic (docs/rewards.md's widened critic-only trunk).
-CURRENT_CRITIC_ARCH = 'critic_v1'
+# Architecture id for the current Critic. `critic_v1` is the original un-normalised
+# HexConv+ReLU trunk — the one that dies (docs/next_iteration.md §3.4); `critic_v2` adds
+# GroupNorm plus a board-only auxiliary head. Every checkpoint saved before 2026-08-07 is
+# v1, and the gauntlet must keep reconstructing them, so `Critic` builds either on demand
+# and callers pass the loaded `arch` straight through.
+CURRENT_CRITIC_ARCH = 'critic_v2'
+CRITIC_ARCHS = ('critic_v1', 'critic_v2')
+# Checkpoints predating the `arch` key are all v1 by definition.
+LEGACY_CRITIC_ARCH = 'critic_v1'
 
 
 def save_policy_checkpoint(policy, path, *, obs_version, hidden_dim, arch=CURRENT_ARCH):
@@ -56,7 +63,7 @@ def load_policy_checkpoint(path, map_location='cpu', *, default_hidden_dim=64):
     obj = torch.load(path, map_location=map_location, weights_only=False)
     if isinstance(obj, dict) and 'state_dict' in obj and 'obs_version' in obj:
         arch = obj.get('arch', CURRENT_ARCH)
-        if arch == CURRENT_CRITIC_ARCH:
+        if arch in CRITIC_ARCHS:
             raise ValueError(
                 f"{path!r} is a CRITIC checkpoint (arch={arch!r}), not a policy checkpoint "
                 f"— it was likely copied from a data/warchest_critic_*.pth file by mistake. "
@@ -115,7 +122,7 @@ def load_critic_checkpoint(path, map_location='cpu', *, default_hidden_dim=64):
     there's no way to recover them after the fact (see `save_critic_checkpoint`).
     """
     obj = torch.load(path, map_location=map_location, weights_only=False)
-    arch = obj.get('arch', CURRENT_CRITIC_ARCH)
+    arch = obj.get('arch', LEGACY_CRITIC_ARCH)
     if arch == CURRENT_ARCH:
         # The #1 real-world cause: someone copied a data/warchest_ppo_*.pth (policy)
         # over the critic path by mistake. Catching it here, keyed on the saved

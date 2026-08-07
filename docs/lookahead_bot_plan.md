@@ -2,7 +2,7 @@
 
 Written 2026-07-05, decisions on open questions added 2026-07-06. Design for a new bot that
 searches 5-10 moves (plies) ahead, intended as a stronger yardstick than `GreedyBot` (see
-`docs/next_steps.md` — WR vs greedy is saturated at ~100% and no longer measures anything).
+`docs/IDEAS.md` — WR vs greedy is saturated at ~100% and no longer measures anything).
 
 ## Implementation status (2026-07-06)
 
@@ -275,7 +275,7 @@ them on this evidence would be fitting noise, not calibrating.
 This result matters beyond just these two coefficients: LookaheadBot's WR vs
 `GreedyBot` is now high enough (~80-93%, batch-dependent) that `GreedyBot` is
 approaching the same "saturated yardstick" problem that motivated building
-LookaheadBot in the first place (`docs/next_steps.md`'s original observation about
+LookaheadBot in the first place (`docs/IDEAS.md`'s guiding principle, made about
 the trained policy). Further fine-grained calibration will need either a much larger
 per-config sample (expensive at real time-per-game) or a tougher/more discriminating
 opponent than `GreedyBot` to measure against — e.g. the trained checkpoint, or
@@ -310,7 +310,7 @@ opponent than GreedyBot" from the previous section, immediately in effect.
 ### A real benchmark: the trained checkpoint (2026-07-06, continued)
 
 `GreedyBot` just stopped being able to resolve further changes — exactly the
-"saturated yardstick" problem `docs/next_steps.md` describes for the trained policy.
+"saturated yardstick" problem `docs/IDEAS.md` describes for the trained policy.
 `app/gauntlet.py` already supports a checkpoint field (`--lookahead --no-greedy`, 20
 games/pair via `round_robin`), so ran LookaheadBot directly against
 `data/warchest_ppo_20260704-1243.pth` — a checkpoint that itself beats `GreedyBot`
@@ -335,7 +335,7 @@ batch-to-batch noise.
 - Reads the opponent's current hand directly (`state.hands[opponent]`) rather than the
   `E_opp_hand` estimate the observation encoder exposes to normal agents — a "cheat" used
   deliberately as a stress-test / exploitability-probe knob, not baked into the bot's name.
-  This connects to `docs/next_steps.md` Step 3 (exploitability metric): a hand-seeing
+  This connects to `docs/IDEAS.md` #4 (exploitability probe): a hand-seeing
   heuristic search is a cheap proxy for "train a best-response against the frozen agent,
   see how badly it loses," without training a separate network.
 - Also reads both players' bag `Counter`s directly (exact composition, not an estimate) —

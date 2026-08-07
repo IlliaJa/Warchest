@@ -14,55 +14,34 @@ concrete case this bit us), and compare **distributions** over each run's settle
 eval checkpoints from batch 200 on), not endpoints or peaks — a ~0.3 pooled-std gap from a
 single run per side is noise, not signal.
 
-Current state: WR vs greedy ~49% (post C1–C7 fixes, run `ppo_20260527-191432`); vs *true*
-greedy on the full base game, ~70-90% depending on run (`docs/experiments.md`). Target: keep
-improving self-play Elo/WR, not a fixed number vs. greedy — `GreedyBot` never bolsters,
-recruits, or initiates a tactic, so optimizing directly against it risks exploiting its
-specific blindness rather than building a general strategy (`docs/rewards.md`).
+**Guiding principle — measurement first** (from the retired `next_steps.md`, still the rule):
 
-### 1. Game-completeness — remaining Phase 5 work
+> **Restore a trustworthy yardstick before training longer or shipping big features.**
+> Do not optimize, or ship online, against saturated instruments.
 
-The full base game (all 16 units + per-game disjoint drafting) is implemented; drafting was carried forward into Phase 3, so the old `full_game_plan.md` roadmap is retired (its history now lives in `docs/history.md`). These are the only pieces of the "Phase 5 / full game" spec that were **not** carried forward:
+Two failure modes it guards against, both of which have already happened here: an *absolute*
+yardstick that saturates (WR vs `GreedyBot` reached ~100% — a myopic 1-ply bot that never
+bolsters, recruits, or initiates a tactic, so beating it says nothing), and a *relative* one
+that can rise without any real gain (self-play "beats its own predecessors" is compatible with
+a non-transitive strategy space — the 30-round ExIt field measured a 0.11 intransitive-triple
+fraction). The gauntlet's Bradley-Terry ranking + cycle metric (`app/gauntlet.py`) is the
+measurement of record; per-behaviour rates (bolster/tactic/recruit/chain) are the
+opponent-independent complement.
 
-- **P5a. Variable-composition eval bucketing.** Eval currently reports a single aggregate WR across all randomly-drafted matchups. Add per-composition (or per-composition-bucket) WR reporting so we can see *which* unit sets the agent is weak/strong on instead of averaging over the ~1820 possible 4-unit matchups. **Done** — `src/app/eval_bucketed.py` (`docs/experiments.md`'s `ppo_20260702-1442` eval run). Difficulty: low-moderate.
-- **P5b. Rulebook drafting mode (optional).** Setup currently assigns each player 4 random disjoint types. The real game uses a snake/alternating draft from a shared pool. Implement it as an optional setup mode for parity with tabletop games; not required for training. Difficulty: moderate.
-- **P5c. Freeze `baseline_tactics` snapshot.** Freeze a strong policy as a named pool/eval anchor for the current (`OBS_VERSION=9`) schema generation, so future changes have a fixed comparison point instead of always comparing against whatever the last run happened to be. Difficulty: trivial.
-
-### 2. Draw-probability observation features (bag dilution / draw efficiency)
-
-**Goal.** Give the agent a legible signal for the coin-economy nuance that over-recruiting *dilutes* the units it actually wants to play. Hand size is fixed at `HAND_SIZE=3` (`_draw_hand`, `warchest_env.py:416-437`) and draws are uniform-without-replacement from the bag, so recruiting a coin you won't reliably draw grows the cycle **without** raising actions/round — it just lowers the chance of drawing the coin that matters. All the raw state (per-type bag/hand/discard) is already in the observation, but the agent must learn the division + reshuffle timing implicitly; these features hand it the answer.
-
-**Decision: feature-only, no reward term.** A reward is the wrong tool here (see the discussion that produced this section):
-- "smaller bag = better" is a **trap** — as PBRS it pays a positive pulse whenever coins leave the cycle, and the biggest exit is *your own coins getting boxed on unit death*, so it would reward losing material (directly contradicting the material PBRS term).
-- "higher per-unit draw rate = better" is *also* wrong — a fully-recruited "4-of-each + Royal" (17-coin) bag scores `3·4/17 ≈ 0.71` per unit, **higher** than the 9-coin starting bag's `0.67`, yet is a bad bag (tempo wasted recruiting; no ability to draw a *specific* unit in pairs to chain/bolster).
-- The real target — "reliably draw *the unit I've chosen to play next rounds*" — has a **policy-defined** target (which unit is "preferred" is the agent's call, and 1-unit play is valid only for rare comps / Berserker / Warrior Priest). A fixed potential must pick the target concentration and is wrong somewhere (Herfindahl → pushes monotype; fielded-average → fails to flag 4-of-each). So it belongs in the observation, letting the policy own the preference. This also respects the `ppo_20260630` over-shaping diagnosis (don't add dense heuristic reward).
-
-**The two features — same quantity ("what share of my draws is type `t`") at two horizons.** Own-side only (`p_soon` needs the bag↔discard split, hidden for the opponent). Emit both as per-type vectors over `DECK` (Royal included in denominators; same layout as `bag_v`/`hand_v`).
-
-1. **`p_soon[t]` — imminent draw share (position now).** Expected copies of `t` in the *next* hand, before any reshuffle, normalized to a share:
-   ```python
-   B = sum(bag)                          # current bag size
-   if B >= HAND_SIZE:
-       E_soon = HAND_SIZE * bag[t] / B   # == bag[t]/B share when bag is healthy
-   else:                                 # bag empties mid-draw → one reshuffle
-       rest, D = HAND_SIZE - B, sum(disc)   # disc = discard_faceup + discard_facedown
-       E_soon = bag[t] + (rest * disc[t] / D if D > 0 else 0)
-   p_soon[t] = E_soon / HAND_SIZE        # in [0,1]
-   ```
-   (Expectation = hypergeometric mean, so exact for the next hand without the full distribution.)
-
-2. **`p_mean[t]` — steady-state draw share (structure).** Long-run share of the recirculating pool — the dilution/concentration signal recruiting moves:
-   ```python
-   recirc[t] = bag[t] + hand[t] + disc_faceup[t] + disc_facedown[t]
-             = owned[t] - on_board[t] - boxed[t] - supply[t]   # same identity the coin-counter uses
-   p_mean[t] = recirc[t] / sum(recirc)                          # in [0,1]
-   ```
-
-**The gap is the signal (no third feature).** Both are `[0,1]` shares, directly comparable per type: `p_soon > p_mean` = *loaded now, spend it*; `p_soon < p_mean` = *key coins stuck in the discard behind a reshuffle, can't rely on `t` this round*. Flat "4-of-each" reads as no type peaking on either horizon.
-
-**Wiring / difficulty.** Two counter-sums + a divide per type in `generate_observation` — negligible cost. Schema change → **bump `OBS_VERSION`** (invalidates the current `OBS_VERSION=9` pool snapshots; retrain). Difficulty: low-moderate. Plan to A/B against a no-feature baseline so any gain is attributable.
-
-**Priority: backlog, bundle with the next observation-schema change rather than standalone.** Deprioritized because: (a) self-assessed as a weak effect, and weak effects are exactly what the current ~0.10 eval-noise band cannot detect; (b) `GreedyBot` never recruits, so it doesn't punish bag dilution — this barely touches the "beat greedy" axis; (c) it's the same class of change as the threat planes ("hand the network a value it could in principle already compute from raw state"), and that class already produced a measured **no-effect** result (`docs/history.md` → "Threat/position-aware observation"). Add it opportunistically when another `OBS_VERSION` bump is already planned, so the retrain cost is shared rather than spent on this alone.
+Current state: the live plan is **not** in this file — it is
+[next_iteration.md](next_iteration.md) §5, which supersedes both the sequencing in
+[independent_opponents.md](independent_opponents.md) §7 and this file's *Recommended next steps*.
+(The intermediate step was the self-play-collapse diagnosis in `independent_opponents.md`: the
+binding constraint is opponent *independence* and behavioural coverage, not reward terms. That
+still stands; what moved on is the ordering.) A new block of proposals sits below the numbered
+items — [New directions (2026-08-07)](#new-directions-2026-08-07--opponent-pool-architecture-learning-process),
+groups **B** / **A** / **L** for opponent pool, architecture and learning process, with its own
+suggested order in §N.4. Items **1–9 are retired** — the shipped ones are in `docs/history.md`, the rest are
+dropped; the map is in [Retired items](#retired-items-19) below. Numbering of what's left is
+deliberately unchanged so existing references in code and docs still resolve. Items **12–22**
+came from `next_steps.md` when that doc was dissolved (2026-08-01); its implemented half is in
+`docs/history.md` → *Measurement + opponent infrastructure*, its measurements in
+`docs/experiments.md` (2026-07-07, 2026-07-08).
 
 ### Likelihood-weighted threat-plane magnitude
 
@@ -73,42 +52,6 @@ The enemy threat planes gate opponent availability worst-case: a unit type contr
 **The idea:** scale each unit's threat contribution by its **likelihood of being playable this round** — the shipped `E_opp_hand[t]` feature (`docs/observation_improvement.md`) instead of the binary `≥1` gate. The plane would then read *"how likely am I to actually be hit here,"* not *"could I possibly be hit here."*
 
 **Why it's parked, not planned:** it understates exactly the tails that lose material. Worst-case planes + an expected-hand **global** scalar (the split shipped in `observation_improvement.md`) already give both signals — max for "where can I die," mean for "how loaded are they" — without diluting the spatial safety read. Only revisit likelihood-weighting the *planes* if the worst-case version makes the agent measurably too timid (over-bolstering, refusing good trades). If pursued, A/B against the worst-case planes directly; keep the two mutually exclusive within the threat-plane block.
-
-### 3. A/B the 2026-07-03 reward + capacity bundle
-
-Material PBRS, annealed holding + material shaping, the base-diff-proportional truncation reward, and the critic-only widening all shipped together on 2026-07-03 (`docs/history.md`). The controlled A/B against the pre-change baseline is still owed — a run was started same-day (`ppo_20260703-142941`) but its outcome wasn't known at time of writing. Since all four changes landed in one pass, a clean A/B can only attribute the *bundle*, not the individual pieces; if the result is ambiguous, consider ablating one term at a time (start with material PBRS alone, since it's the one targeting the specific measured gap below).
-
-**What to check beyond aggregate WR:** bolster/stack-chain rate specifically (`eval_bucketed.py` already emits `bolster_count`, `chain_offered`, `chain_used`). The original motivation was a measured gap — the policy essentially never bolsters (1/200 games) and never triggers a Berserker stack chain (never reached in 50/200 games it was drafted) — so success means that rate moving, not just WR.
-
-**Caveat.** Advantages are z-scored but returns are kept in original scale and fed through a return normalizer (`ppo.py`); adding `phi_material` and the anneal schedule shifts the return distribution. Re-verify the normalizer's running stats settle and the critic loss scale stays sane after the change, or a "no-effect" A/B result might actually be a normalization artifact rather than a real null result.
-
-### 4. Re-test a small `CLAIM_BASE_REWARD`
-
-`CLAIM_BASE_REWARD` was zeroed early on because a non-zero value caused a circular-claiming exploit under frequent near-identical pool opponents (`docs/rewards.md` §2). Pool snapshotting is now much rarer (`pool_snapshot_every=15` vs. the `snapshot_every=1`-era exploit), so the exploit's precondition may no longer hold. Worth a cheap re-test; keep the value small and watch training-loop score for the exploit's signature (reward far exceeding what a single win should pay) if it's reintroduced.
-
-### 5. Widen the policy network too
-
-The critic was widened alone first (`critic_hidden_dim=128`, `hidden_dim=64` unchanged) so any capacity gain would be attributable to the densifier specifically (`docs/decision.md`, 2026-07-03). Widening the *policy* the same way is untested. Do this **after** idea 3's A/B lands, so a policy-capacity gain isn't conflated with the reward-bundle change.
-
-### 6. Unit / board-presence PBRS (coin-economy §10)
-
-A softer companion to material PBRS: reward having units **deployed and alive on the board** (you can't claim or hold a base with an empty board). Full proposal, rationale, and failure modes (over-deploy risk, overlap with material shaping): `docs/rewards.md` § *Unrealized ideas*. Only worth pursuing if ideas 3–5 above still leave a measurable tempo gap — treat material PBRS as primary and this as a low-coefficient add-on, never a replacement.
-
-### 7. GAE-λ sweep (reward-neutral densification)
-
-Reward sparsity is fundamentally a *credit-assignment* problem, not only a reward-design one — tune the propagation, not just the terms. `lam=0.95` has never been swept. λ closer to 1 propagates the terminal reward further back with less bias (the TD-Gammon eligibility-trace lesson), which densifies the effective per-step signal **without** touching the reward or risking any of the distortion/exploit issues shaping changes carry. Cheap A/B; do independently of ideas 3–6 since it doesn't interact with the reward terms.
-
-### 8. Tactic/bolster underuse may be an exploration problem, not (only) a reward one
-
-Entropy is annealed to a near-zero floor (`entropy_coeff_final=0.003`) fairly early in training — plausibly *before* random exploration ever surfaced a case where bolstering or a named tactic paid off, meaning the behavior could have been dropped from the repertoire before any reward (including material PBRS) had a chance to reinforce it. Material PBRS only helps if the behavior is *sometimes sampled*. Two options, either decaying and kept tiny (the board is small — this is about *action* coverage, not spatial coverage):
-- a higher, or again-annealed (rather than monotonic), entropy floor; or
-- a small decaying **intrinsic/count-based bonus on rarely-used verbs** (`BOLSTER`, `TACTIC`) — the approach JP-DouZero used to break an analogous collaboration-behavior gap.
-
-Do idea 9 first — if tactic usage turns out to be reverse-causation, this isn't the right fix.
-
-### 9. Disambiguate tactic reverse-causation before acting on idea 8
-
-"Tactics correlate with losing" (11.5% usage, WR 0.696 with vs 0.915 without, from the same 200-game eval that motivated material PBRS) has two readings that imply *opposite* responses: reached-for-only-when-already-behind (reverse causation — no fix needed) vs. executed poorly when reached for (an execution/exploration gap — ideas 6/8 are on target). Cheap disambiguator: log tactic usage **conditioned on base-lead at the time of use**. If usage clusters in already-behind states, it's reverse causation; if it's spread across lead states, it's execution. Difficulty: low (logging only, no training change).
 
 ### 10. Factor direction out of the move/attack spatial head
 
@@ -127,15 +70,734 @@ Full design in `docs/parallel_rollouts.md`. **All phases 1-5 are now implemented
 
 Standing-rule reminder: measure over ≥10 batches per config, not a single batch — spawn/import startup (batch 1) and pool-phase (`p_pool→0.9`) opponent cost both skew early/late batches.
 
+### 12. Exploitability probe → PSRO-lite pool weighting
+
+The Nash direction, scoped as **measurement, not as the engine**. Warchest is two-player,
+zero-sum, imperfect-information (hence the privileged critic) — the Stratego/DeepNash regime —
+so "a policy no opponent can beat >50%" is a legitimate north star for *unexploitability*. But
+round-robin measures *relative* strength; exploitability is the measure of Nash-ness: freeze the
+agent, train a best response (BR) against it, see how badly it loses.
+
+Two probes, cheapest first, both on existing infra:
+
+1. **Search BR proxy** (hours): `LookaheadCriticBot`/`PuctBot` with `see_opponent_hand=True` vs
+   the frozen best checkpoint. The hand-seeing "stress-test" mode already exists
+   (`docs/bots.md`, `docs/lookahead_bot_plan.md`).
+2. **RL BR** (a day or two): a fresh PPO run whose opponent pool contains **only** the frozen
+   checkpoint. The WR trajectory over that run *is* the exploitability curve. No new infra — an
+   `opponent_pool.py` weight config, reusing the whole training stack.
+
+**The result is a decision procedure, not a score.** BR reaches ~80–90% ⇒ a real exploitable
+hole ⇒ PSRO-style pool weighting is justified: solve the meta-Nash over the Bradley-Terry matrix
+the gauntlet already produces and sample opponents by that mixture instead of fixed weights,
+and add the BR policy itself as a pool opponent (that is PSRO iteration 1 — the current pool is
+already a crude PSRO *without* the meta-Nash solve). BR caps at ~55–60% ⇒ the policy is hard to
+exploit within this policy class ⇒ stop; further Nash investment buys robustness that can't be
+measured as improvement.
+
+**Why Nash is the thermometer, not the heater:** equilibrium-seeking optimizes the worst case
+against the *current* population; at this compute scale the binding constraint is elsewhere
+(opponent coverage, no search at inference, capacity). Full R-NaD theory and why it is not the
+next step: `docs/rl_algorithms.md` § *R-NaD*. Every scripted exploiter
+(`docs/independent_opponents.md` Phase 1) is a free BR sample, so this probe gets cheaper as
+that panel grows.
+
+### 13. Opponent-independent quality metrics in `eval_bucketed`
+
+Half-done. `eval_bucketed.py` already emits per-composition WR, bolster/tactic/chain counts, the
+tactic-initiation base-lead breakdown, the initiative "wasted move" split, and the Knight
+bolster probe. Still missing from the original list, all opponent-strength-*independent* so they
+cannot saturate the way WR-vs-greedy did: **does it ever `recruit`**, **does it leave the Royal
+exposed**, **material efficiency** (coins-to-box ratio), **tempo**, and **win-by-base-control vs
+win-by-elimination**. Cheap — counters inside `play_one_game`. Same family as the per-behaviour
+metric panel in `docs/independent_opponents.md` Phase 4. Difficulty: low.
+
+### 14. Puzzle/scenario suite + automated blunder finder
+
+Two halves of one pipeline over logged games (`game_record.py`, `data/games` — already written
+by `src/app/play.py`):
+
+- **Blunder finder.** For every position in a logged game (human, gauntlet, or self-play),
+  compare the policy's move against a search agent's choice and track the critic's value
+  trajectory; large policy/search disagreement *plus* a value drop flags a candidate blunder.
+  Turns any pile of games into a ranked list of concrete positions with no human in the loop
+  after the first pass. Half-built already: ExIt computes policy/search agreement per round
+  (`docs/independent_opponents.md` §1).
+- **Puzzle suite.** Freeze those positions into a set of (state, known-correct-response)
+  scenarios — "must bolster here or lose the stack next turn", "must block the charge lane" —
+  and run the policy over the suite at every eval: gameplay regression tests, and the strongest
+  form of the opponent-independent metric #13 asks for. Bonus: running the **critic** over the
+  same positions is the cheap obs-gap-vs-policy-gap disambiguator (knows-but-doesn't-play ⇒
+  policy side; blind ⇒ observation/capacity).
+
+### 15. Wire the independent `LookaheadBot` into the training pool
+
+`opponent_pool.py` samples `pool` / `lookahead_critic` / `puct` — *all* policy-derived (frozen
+snapshots of itself, or a beam/tree guided by its own critic) — with greedy and random at
+**zero** weight in the finetune schedule. Plain `LookaheadBot` is the strongest genuinely
+*independent* agent in the repo and is still not wired in. The old blocker (the `Bot` vs
+`GauntletAgent` interface split) is gone: `_SEARCH_OPP_TYPES` routing and `OPP_ONEHOT_SLOT`
+already exist, so this is a lazy builder + a weight. Caveat: ~0.1 s/move will dominate rollout
+wall-clock, which is what motivates #16. This is the same fix `docs/independent_opponents.md`
+§2 argues for from the coverage side. Difficulty: low.
+
+### 16. Distill the search bots into a fast network
+
+Behaviour-clone `LookaheadBot` (and the scripted exploiters) into a small net from a few
+thousand games, then pool the *clone* — network speed instead of search speed, keeping an
+independent opponent affordable in the rollout hot path. Doubles as a dry run of the
+distillation machinery. `docs/independent_opponents.md` Phase 3 lists this as one of the two
+routes to a strong independent opponent; the other is a **quiescence extension** for
+`LookaheadBot` (resolve stack fights to the end so a bolster that saves a stack two plies later
+is actually valued — the diagnosed reason no search bot ever bolsters). Difficulty: moderate.
+
+### 17. Prioritized composition curriculum
+
+`set_init_state` drafts uniformly, while `eval_bucketed` already knows which compositions the
+agent is weak on. Sample training drafts from a distribution tilted toward the weak buckets,
+re-estimated at each eval — the draft-level analogue of prioritized fictitious self-play. Cheap:
+a sampling-weights hook in `set_init_state` plus a weights file the eval refreshes. Difficulty:
+low-moderate.
+
+### 18. Belief auxiliary head (actor-side hand inference)
+
+The actor sees `E_opp_hand` (an analytic hypergeometric mean); the critic sees the true hand.
+Add a small auxiliary head on the **actor** trunk trained to predict the opponent's actual hand
+— a supervised target available at training time and never at inference (privileged-information
+distillation). Unlike the analytic mean, a learned head can condition on *behaviour*: what the
+opponent chose to do reveals what they hold. Cost: one head + one loss term; no schema change,
+no inference-time leak; directly A/B-able. Difficulty: moderate.
+
+### 19. Warm-start vs. from-scratch on curriculum changes
+
+Every run so far starts fresh. When the pool gains exploiters / `LookaheadBot` (#15), also run
+*continuing* the best existing checkpoint on the new curriculum as a second arm. If fine-tuning
+holds general strength while patching the gaps, it halves the cost of every future curriculum
+iteration. Difficulty: trivial (a config arm, not new code).
+
+### 20. A/B the dense-critic-targets opt-in
+
+`--dense-critic-targets` shipped 2026-07-13 and is **off by default, never measured**
+(`docs/history.md` → *Measurement + opponent infrastructure*): an auxiliary MC-return regression
+on *opponent*-decision nodes (`rollout_core.collect_dense` → `aux_*` samples → a separate critic
+minibatch loop at `aux_critic_coeff=0.5`), leaving the policy path and the main GAE targets
+untouched. The rationale is that those nodes are collected anyway and carry a return signal the
+main path discards. Cheap to test — it is a flag. Read `critic_mae` against the return std plus
+the elo/WR trajectory, per the standing rule. Difficulty: trivial.
+
+### 21. Online play vs humans (deferred, deliberately last)
+
+The ultimate absolute-strength test — real, non-cyclic, vs humans. Design exists, code does not:
+`docs/web_agent.md` + `config/web_agent.sample.toml` (Playwright driver, action mapping to the
+site's UI, state parsing). Reasons it stays last:
+
+- **Rules-parity risk.** The site must match our env *exactly*; any divergence makes every
+  number meaningless. Audit rule-by-rule before trusting a single game.
+- **Low statistical power.** Human games are slow → few samples → wide confidence intervals.
+- **ToS / anti-bot risk.** Check terms; rate-limit conservatively.
+- **Big feature** relative to its information yield while cheaper probes are still open.
+
+Two standing decisions: field the **search-augmented** agent (`PuctBot` over the best
+checkpoint), not the raw policy — search directly papers over the tactical blunders that read as
+"newbie" to a human; and prefer the local substitute first, which already exists —
+`src/app/play.py` (human vs policy, with game logging that feeds #14).
+
+### 22. Rebuild the policy's action space
+
+Noted for later; the deeper version of #10. The gauntlet contract absorbs it by design: as long
+as each agent maps its own head → an **absolute env action id**, an action-space rebuild does not
+break cross-era comparison (`docs/history.md` → *the gauntlet design contract*). Worth pursuing
+on sample-efficiency merits, but it is an *improvement*, not a measurement fix, so it sits
+behind everything above. If done, land it as a new versioned arch so it drops straight into the
+gauntlet.
+
+---
+
+## New directions (2026-08-07) — opponent pool, architecture, learning process
+
+Written after the critic dead-trunk diagnosis (`docs/next_iteration.md` §3.4) landed and while
+the fix is being run, as a deliberate step *outside* the within-state-ranking investigation that
+has occupied the last week. Three groups, numbered **B** (bots), **A** (architecture), **L**
+(learning) so nothing collides with #10–#22 or C20/C21.
+
+Everything below is grounded in one of three things: a number measured *today* (§N.0), a rule in
+`docs/UNITS.md` / `roster.py`, or a measurement already in the docs (cited). Where an idea looks
+like something already tried and rejected, the difference is stated explicitly — several of these
+sit next to a recorded negative result and the reason they are not the same thing is the load-
+bearing part of the argument.
+
+Nothing here is sequenced ahead of `docs/next_iteration.md` §5 rows 2b/3 (run the shipped critic
+fix). §N.4 is the suggested order once those report.
+
+### N.0 Three measurements this section rests on
+
+Taken 2026-08-07 on the 16-core box, `torch.set_num_threads(1)` (how the rollout workers run —
+these numbers only compose with the per-worker budget at that setting). Tables A and B are
+reproducible with **`python src/app/probe_costs.py`** — landed under `src/app/` for this section
+rather than left in a scratchpad; Table C is arithmetic on an existing training log. None of the
+three appears in any other doc.
+
+**Table A — per-decision cost.** This is the table that decides what "fast enough for the rollout
+hot path" means.
+
+| component | cost | note |
+|---|---|---|
+| `env.step` + `get_possible_actions` | 0.35 ms | the floor for anything |
+| `get_possible_actions` alone | 27 µs | |
+| `_clone_state` | 10 µs | what search pays per candidate |
+| `Policy.act`, `hidden_dim=128` | **0.86 ms** | the reference "network speed" |
+| `Policy.act`, `hidden_dim=64` | 0.57 ms | |
+| `Critic.value_single`, 192 | 0.85 ms | |
+| `Critic.value_batch(64)`, 192 | 0.37 ms/state | batching buys only ~2× on CPU |
+| `RandomBot.act(obs)` | 0.008 ms | |
+| `GreedyBot.act(obs)` | **0.83 ms** | *as expensive as a policy forward* — see below |
+| `SimGreedyBot.act(env)` | 18.0 ms | ~21× a policy forward |
+| `LookaheadBot.act(env)` @0.02 s | 20.6 ms | |
+| `LookaheadBot.act(env)` @0.1 s | 104 ms | ~121× a policy forward; ~10–12 k nodes/s |
+
+Two readings that are not obvious from the rows:
+
+- **The obs-only "cheap" bot is not cheap.** `GreedyBot` costs the same as a 128-wide policy
+  forward, because `_best_move_toward_base` runs a fresh whole-board BFS for *every candidate move
+  × every target base* — a product of two quantities that both grow as the game opens up.
+  Anything built to replace it should run **one multi-source BFS** and index it, which is linear
+  in candidates and lands comfortably under 0.3 ms. Applies directly to B3 and B5.
+- The env-taking rows are backed out of complete games (4–5 games each, the bot moving on ~half
+  the plies) as `2·(ms_per_ply − env) − opponent`, not read off one probe state: a single state's
+  `legal_at_root` swings a search bot's node count and reachable depth by an order of magnitude.
+  Only the nodes/s figure is state-independent.
+
+**Table B — how much of the observation is zero.** 2757 real decision states.
+
+| | dead per decision | of which structural |
+|---|---|---|
+| board planes | **29.8 / 48 (62 %)** | 24 — only 4 of 16 unit types are drafted per side |
+| global dims | **201.2 / 245 (82 %)** | ~156 — the ten length-17 coin vectors carry 5 live entries |
+| whole input surface (`48·49 + 245`) | **64 % exactly zero** | |
+
+The structural share never fills in: the draft is 4/4 disjoint out of 16, so 12 own + 12 opponent
+unit planes are identically zero *for the whole game*, and **which 24 changes every game**. The
+remainder is transient (a drafted type not yet deployed, an empty supply). See A1.
+
+**Table C — where the rollout wall-clock actually goes.** From `logs/ppo_20260726-203902.log`
+batch 1495–1500 (finetune phase, `p_lookahead_critic = 0.25`), 64 episodes, `turns ≈ 85` plies:
+
+```
+rollout=20s wall (6 workers ⇒ ~120 core-s) | env=9.7s | model_play=97s | actor_grad=7s critic_grad=5s
+```
+
+So **model inference is ~89 % of rollout core-time and env simulation is ~9 %**. Arithmetic on
+the 25 % search-opponent slice: `0.25 · 64 episodes · ~42 opponent plies · 0.104 s ≈ 70 s` — i.e.
+roughly **two thirds of all rollout compute is spent by an opponent that plays a quarter of the
+episodes**. (Estimate, not an instrumented split: the remaining ~27 s is the policy's own
+forwards, the pool snapshots', and the search bot overrunning its budget on critic calls.) The
+direct consequence is B4: this is the single largest throughput lever in the repo, worth ~2.5–3×.
+
+---
+
+### B — a pool of fast opponents
+
+The standing diagnosis (`docs/independent_opponents.md`) is right and is *still* not acted on:
+the finetune schedule is ~100 % policy-derived (`p_random = p_greedy = 0`). What follows is a
+different route to fixing it than "write four hand-coded archetypes", which was tried once
+(`BolsterBot`) and produced a documented negative result.
+
+#### B1. A randomised-coefficient evaluator family — a *continuum* of independent opponents
+
+`HeuristicEvaluator` already exposes eight coefficients (`POS_COEFF`, `RISK_COEFF`, `DUR_COEFF`,
+`ECON_COEFF`, `INIT_COEFF`, `PROG_COEFF`, plus the `SHAPING_C`/`C_MAT` weights it imports).
+Sample a coefficient vector **θ per episode** and you get hundreds of distinct, fast,
+policy-independent playstyles for the cost of a constructor argument: base-rusher, material
+grinder, bolster brawler, recruit-economy, tempo/initiative bot — the exact archetype list
+`independent_opponents.md` Phase 1 wants to hand-write, generated instead.
+
+**Why the `rich_eval` negative result does not kill this.** That measurement
+(`docs/bots.md`, `rich_eval=True` vs `False` = 20 %) is about the *bot's strength*: a
+depth-bounded leaf cannot cash a long-horizon asset, so a bot that chases one loses. But an
+opponent-pool entrant is not judged on Elo — `independent_opponents.md` §3 says so explicitly
+("their value is coverage and pressure, not raw Elo"). A θ that makes the bot spam `recruit` is
+not a broken bot, it is *the state distribution self-play never produces*, which is mechanism 4
+of the collapse. The negative result rules θ out as a way to make a **strong** bot; it says
+nothing about θ as a way to make a **varied** one.
+
+Cost: SimGreedy speed (~18 ms/move, Table A), so this needs either a small pool weight,
+`reply_branching=2`, or B4. Test: gauntlet ~8 sampled θ and read the per-behaviour rates — the
+family is working if bolster/recruit/tactic/initiative rates *span a wide range* across θ, and
+failing if every θ collapses onto the same profile. Difficulty: low.
+
+#### B2. θ-search as an automated best-response oracle — a cheaper, *interpretable* #12
+
+Given B1, run CMA-ES or plain random search over the 8-dim θ to maximise win rate against the
+frozen policy. One evaluation is ~40 paired games ≈ 30 s; 200 evaluations ≈ 2 CPU-hours.
+
+That is a **measured best response with no training run**, and unlike #12's RL-BR arm the answer
+is *nameable*: the winning θ says which term the policy fails to respect. Same decision procedure
+as #12 — best θ ≥ ~65 % ⇒ a real exploitable hole and PSRO-style weighting is justified; ≤ ~55 %
+⇒ hard to exploit within this class, stop. Every θ found this way is also a free permanent
+gauntlet entrant and a free curriculum signal (L7). Difficulty: low-moderate. **This supersedes
+the expensive half of #12** — keep #12's RL-BR arm only if the θ family turns out to be too
+narrow a policy class to find anything.
+
+#### B3. `RaceBot` — the archetype the game's own rules say is strongest, and nobody plays it
+
+Four facts, all already established:
+
+- Win at **6 of 10** bases; games end at **round ~11** (`next_iteration.md` §3.3).
+- `Board.is_valid_claim` requires *your own unit standing on the cell*, and you cannot move onto
+  an occupied cell ⇒ **a parked unit is an absolute lock on a base**.
+- 30 games produced **53 steals from occupied bases and 0 from empty ones** (§3.3).
+- Deploy is restricted to bases *you control* (Scout excepted), so bases are also your
+  deployment infrastructure — losing one costs geometry, not just a point.
+
+So Warchest, as implemented, is a **claim-and-park race** in which combat happens only where two
+locks collide. Nothing in the repo plans that. `GreedyBot._best_move_toward_base` walks whichever
+unit gets nearest to *any* target base — no assignment (two units happily chase the same base),
+no parking rule (it will walk a unit *off* a base it holds), and its BFS ignores unit occupancy.
+`LookaheadBot` has `_nearest_dist` as a **tie-break term**, not a plan. `SimGreedyBot` is 2 ply.
+
+**Design.** Multi-source BFS from each of my units and each deployable base to each capturable
+base (37 cells, a handful of BFS ≈ tens of µs) → solve a tiny assignment (≤5 units × ≤8 targets;
+greedy or Hungarian) → a "tempo to 6 bases" estimate → play the action that reduces it most,
+subject to: never vacate a lock that is currently contested, and fight only when a lock blocks the
+cheapest assignment. Target ~0.2–0.3 ms — *below* `GreedyBot`'s measured 0.83 ms, because one
+multi-source BFS replaces its per-move × per-target BFS, so **cheap enough for the hot path at
+any weight**.
+
+**Falsifiable prediction, which is the point of building it:** it beats `lookahead`@0.1 s. The
+evidence for that is already on record — `lookahead`@0.3 vs @0.1 measured **42 %** (depth is not a
+lever here), and the bolster archetype lost to `lookahead` precisely *because* `lookahead`
+out-raced it to bases (`independent_opponents.md` Phase-1 result). If a bot that races
+*deliberately* does not beat one that races by tie-break, the race framing is wrong and that is
+worth knowing. Difficulty: moderate. **Highest-value single bot in this list.**
+
+#### B4. Distil one small net that serves four roles at once
+
+Behaviour-clone into a **32-wide, 2-layer HexConv net** — not the full 128-wide policy arch, the
+opponent does not need it. Scaling from Table A's measured 0.57 ms for the 64-wide 3-layer policy,
+that lands near **0.25 ms**: roughly **70×** cheaper than `SimGreedyBot` and **400×** cheaper than
+`LookaheadBot`@0.1. (Only the 0.25 ms is an estimate; every other figure here is measured.)
+
+**A cleaner target than move-cloning:** regress `HeuristicEvaluator.evaluate(s′)` for every legal
+action, from the *current* observation — one forward pass yields a 1875-vector of
+simulated-consequence scores whose argmax *is* `SimGreedyBot`'s 1-ply choice. No game outcomes
+are needed, so labels can be generated from **random and adversarially-seeded positions**, and
+coverage is not limited by any policy's state distribution — which is the exact failure
+(mechanism 4) that sank ExIt.
+
+One artifact, four uses:
+
+1. a fast, genuinely independent **pool opponent** at real weight in *finetune*;
+2. a **PPO warm start** (L6);
+3. an **independent PUCT prior**, which breaks ExIt's teacher ≡ student (agreement 0.94–0.95);
+4. a policy-independent **reference for the agreement metric**, so "is the teacher teaching" stops
+   being measured against the student.
+
+Plus Table C: removing the 0.1 s search opponent from the finetune pool is worth ~2.5–3× rollout
+throughput on its own. This is IDEAS #16 with a concrete target, a concrete arch, and a
+concrete budget. Difficulty: moderate.
+
+#### B5. `ThreatAwareGreedy` — a sub-millisecond prophylaxis bot the encoder already feeds for free
+
+v11 board planes **38–43** are graded own/enemy threat hit-counts per cell, and the globals carry
+`own_at_risk` / `opp_at_risk`. **No bot reads any of them** — every existing obs-only bot predates
+those planes.
+
+Ladder, pure obs, no simulation: (1) take a capture that is free (own threat ≥ target stack, and
+the landing cell is not under enough enemy threat to lose the attacker); (2) un-hang any unit
+whose incoming hits ≥ its stack; (3) claim / park; (4) march; (5) deploy. That is the user's
+domain claim — *you attack so that your unit is not attacked* — instantiated as an opponent, at a
+cost that permits any pool weight. It also punishes the specific thing the policy is suspected of
+doing (hanging material) without needing anyone to prove that first. Difficulty: low.
+
+#### B6. Tempo-multiplier archetypes, chosen by what the roster actually encodes
+
+Read `roster.py` as a whole and one pattern dominates: **ten of sixteen units buy more than one
+maneuver — or more than one hex of maneuver — per coin.** Swordsman (`move_after_attack`), Cavalry
+and Lancer (move *and* attack on one coin), Light Cavalry (two spaces on one maneuver, so distance
+rather than an extra action), Berserker (`extra_maneuvers_from_stack`), Footman
+(`maneuver_each`, plus `max_on_board=2`), Mercenary (`maneuver_after_recruit`), Ensign and
+Marshall (grant a maneuver to *another* unit), Warrior Priest
+(`bonus_action_after_attack_or_control`).
+
+A game is ~11 rounds × 3 coins ≈ **33 coins**, so a single free maneuver is ~3 % of a player's
+entire budget. **Maneuvers-per-coin is the game's real currency, and no component of this system —
+not the reward, not the evaluator, not the obs, not any metric — represents it.**
+
+The archetype that follows is the one `independent_opponents.md` closes on as untested: a
+**`PriestTempoBot`**, because the Priest's bonus action triggers on *control* — the thing a racer
+does anyway — making it the only unit whose tempo bonus is free rather than conditional on
+winning a fight. Force the draft the way `eval_bolster.py` already does. Difficulty: low-moderate.
+
+#### B7. Search-bot speed engineering, only if search must stay in the loop
+
+Table A gives `LookaheadBot` ~10–12 k nodes/s, i.e. ~85–100 µs/node against a 10 µs
+`_clone_state` — so most of a node is *not* the clone. Make/unmake instead of
+clone-per-candidate, plus a Zobrist-keyed transposition table and the existing ordering key as a
+killer-move heuristic, is a standard 3–5×: `lookahead` at 20–30 ms/move. Worth doing eventually,
+but **worth less than B4**, which is two orders of magnitude and whose artifact is reused four
+ways. Difficulty: moderate.
+
+#### B8. Pool hygiene that costs two lines
+
+Whatever else lands, reserve **≥20–30 % of the *finetune* schedule for non-policy-derived
+opponents**. Today it is 0 %. Argued in `independent_opponents.md` §2 and §5, still not done.
+Route new heuristic bots onto the existing `greedy` one-hot slot via `OPP_ONEHOT_SLOT` — do not
+widen `OPP_TYPE_IDX`, it breaks every critic checkpoint. Difficulty: trivial.
+
+---
+
+### A — architecture
+
+#### A1. Unit-type embeddings instead of 32 one-hot planes
+
+Table B: **62 % of board planes and 82 % of global dims are exactly zero on any given forward
+pass**, and the structural floor — 24 planes, ~156 globals — never fills in, because only 4 of 16
+unit types are drafted per side. Worse, *which* 24 changes every game. So the network maintains
+sixteen disjoint parameter sets for what are really four roles, and each set is trained on ~1/4 of
+the data. There are 1820 × 495 possible drafts; most compositions are seen a handful of times in a
+96 k-episode run.
+
+**Fix:** one learned embedding per unit type (dim ~8), initialised from — or concatenated with —
+the rules attributes `roster.py` already stores: `can_normal_attack`, the `tactic` mechanic and
+its params, `counter_when_attacked`, `only_attackable_when_bolstered`, `deploy_adjacent_to_friendly`,
+`max_on_board`, `total_coins`. The 32 unit planes become `Σ_units stack · E[type]` → ~16 planes;
+the ten length-17 coin vectors become `Σ count · E[type]`.
+
+Two payoffs, and the second is the real one: parameter sharing across types, and **generalisation
+to compositions never seen** — a rare unit is legible through its attributes rather than through
+an under-trained plane index. Cost: an obs schema change ⇒ new `OBS_VERSION`, fresh run; the
+gauntlet contract absorbs it. Pair with A2 so one version bump buys both. Difficulty: moderate.
+
+#### A2. Read the board where the game happens — a base-cell + unit-cell gather readout
+
+`_split_pool` compresses 49 cells into **two numbers per channel**. Against a win condition that
+is a function of **10 fixed base cells**, with **≤5 units per side** (`max_on_board=1`, Footman 2),
+that is close to throwing the board away — and it is the readout feeding the critic head that
+§3.4 measures as tying 89–93 % of purely positional sibling pairs.
+
+**Fix:** gather trunk features at the **10 static base-cell indices** — free, a constant index
+tensor, the base layout never moves — plus at each of my/their unit cells (≤10, padded, or
+attention-pooled as a set), plus a global **max**-pool alongside the mean (a mean destroys "my
+Berserker is hanging on the far flank"; §3.2 records that exact failure for the hand features).
+
+Note carefully how this differs from a tested-and-unresolved idea: `board_xy` is a
+*location-preserving flatten* of all 49 cells, and `board` ≥ `board_xy` on every bucket with
+nothing resolving (§3.1a). A **task-relevant gather at the 10 cells that define the win condition**
+is a different hypothesis, not a re-run of that one. Cheapest large change here — readout only,
+no trunk change, no obs version bump. Difficulty: low-moderate.
+
+#### A3. FiLM the globals into the trunk instead of broadcasting 245 constant planes into the head
+
+Today the trunk never sees the globals at all: `policy_head` is `Conv2d(hidden + 245 → 32, k=1)`,
+so 245 constant planes are pasted onto every cell and the head spends 245×32 weights turning them
+into a per-cell bias. But **what a board means depends on the hand** — a Berserker threat cell is
+irrelevant if no Berserker coin is playable this round.
+
+**Fix:** `MLP(globals) → (γ, β)` per channel, applied after each conv block (FiLM). A few thousand
+parameters, removes the dead head weights, and gives the *trunk* hand-conditioning it currently
+cannot have. It also dissolves §3.5's `opp_onehot` problem structurally — the one-hot becomes one
+conditioning input among many rather than a raw head input with a 0.747 output spread. Difficulty:
+low-moderate.
+
+#### A4. Global context and residuals — the trunk cannot see across the board
+
+Three HexConv layers ⇒ receptive radius 3 on a 7-wide board, so a unit on one flank is invisible
+to the other; whole-board context reaches the net only through the pooled path this section is
+otherwise trying to fix. But the long-range interactions are real: Lancer charge 3, Ensign/Marshall
+grant range 2, ranged attacks at 2 — and a base race is global by definition.
+
+**Fix:** a squeeze-and-excite / broadcast-mean block after conv 2 (every cell gets a whole-board
+summary at O(C) cost) plus residual connections, on top of the GroupNorm `critic_v2` already
+ships. This is the standard AlphaZero-family block; it is cheap in parameters and ~free in FLOPs
+at 7×7. Difficulty: low-moderate.
+
+#### A5. An entity-token transformer as the serious alternative to HexConv
+
+The entire game state is **≤10 units + 10 bases + 2 hands ≈ 22 tokens**. A 2-layer, 4-head
+transformer over 22 tokens is *smaller and faster* than a 3-layer 128-wide conv over 49 cells, and
+every relation the conv must approximate becomes one attention edge: attack, grant-at-range-2,
+line charge, "which of my units is threatened by which of theirs". Pointer-style action heads fall
+out naturally — an attack is attention from my unit token to an enemy token — which is also the
+clean answer to #10 and #22 rather than another patch on the 32-channel spatial head.
+
+Honest cost: this is the largest item in the section, and it should be landed as a new versioned
+arch so the gauntlet compares eras. Do it **after** A2/A3 have reported, because if a better
+readout and hand-conditioning close most of the gap, the rebuild is polish. Difficulty: high.
+
+#### A6. Two value heads on one trunk — `V_shaped` for GAE, `V_win` for search
+
+Two findings currently point in opposite directions. §3.3b: a shaped-return target ranks siblings
+~2× better than `z`. §3.5: the critic's raw output is a z-score of a shaped return and is
+therefore "meaningless to every search bot", which is why `LookaheadCriticBot` needs a
+moment-matching calibration hack.
+
+Both heads on one trunk resolves this instead of choosing: PPO keeps the target that ranks, search
+gets a **calibrated win probability**, and the calibration hack is deleted. Pair with a
+**categorical / HL-Gauss value loss** in place of MSE — one head and one loss change, and a
+well-documented improvement in value regression. Difficulty: low-moderate. Run *after* §5 row 2b
+has settled which target is better, since 2b is the experiment this builds on.
+
+#### A7. Auxiliary heads = one-to-two-ply lookahead installed in the representation
+
+`next_iteration.md` §1's thesis is that value lives one to two moves ahead and nothing computes
+one to two moves ahead. Search fixes that at inference cost. An auxiliary **prediction** head fixes
+it at zero inference cost, and the labels are already sitting in the trajectories being collected:
+
+- **survival head** — for each of my units (or each cell), will this stack lose a coin within the
+  next 2 plies? This is prophylaxis, supervised.
+- **threat-forecast head** — which cells will be enemy-occupied next ply.
+- **opponent-hand head** — #18, on the *actor* trunk; unlike the analytic `E_opp_hand` mean, a
+  learned head can condition on what the opponent chose to do.
+
+The precedent that this mechanism works here is `critic_v2`'s board-only auxiliary head, shipped
+2026-08-07 for exactly the same reason (create gradient pressure the main head does not supply).
+Difficulty: moderate. Each head is independently A/B-able and none touches inference.
+
+---
+
+### L — learning process
+
+#### L1. Record both sides of self-play — a free 2× on data
+
+`rollout_core.play_episode` appends transitions only in the `acting_pid == main_pid` branch. In
+finetune, **75 % of opponents are frozen snapshots of the same network**, and every one of their
+decisions is discarded (`collect_dense` recovers them as *critic* targets only, never as policy
+gradient).
+
+Add a `p_self` opponent — the **current** policy, not a snapshot — and record both sides. Twice
+the samples per env-second, and because the game is zero-sum the two halves are perfectly
+antithetic, which cuts advantage variance as well. Two things to get right: PPO ratio bookkeeping
+for the second stream, and the opponent one-hot has no "self" slot (route to `pool`, or drop the
+input per `next_iteration.md` §5 row 6). Difficulty: moderate.
+**Best data-efficiency per line of code in this section.**
+
+#### L2. Drop λ *with* the critic fix, as one A/B
+
+`next_iteration.md` §3.6 is explicit and its consequence has not been turned into a work item: at λ = 0.97, `V(s_t)`
+cancels in the action comparison and `V(s_{t+1})` enters at γ(1−λ) ≈ 0.03, so **~97 % of the
+discriminative signal is the realised return** — "λ = 0.97 is accidentally the right setting for a
+critic that cannot rank, and improving the critic buys PPO nothing unless λ drops with it."
+
+The trunk fix has shipped. The paired change has not. Run `critic_v2 × λ ∈ {0.97, 0.90, 0.80}`.
+This is the step that *converts* a repaired critic into policy improvement; without it the repair
+is invisible in the gauntlet and will read as a negative result. Difficulty: trivial (a
+hyperparameter arm). **Should ride along with §5 row 8's first training run.**
+
+#### L3. Action-conditional baseline — use the critic where it can actually act
+
+The env is a perfect forward model at 10 µs per clone (Table A). For a sampled subset of
+decisions, evaluate `V(s′)` over K legal successors and use `A(s,a) = Q(s,a) − Σ_a π(a)Q(s,a)`
+instead of the GAE scalar. The critic's *ranking* ability then enters the gradient at full weight
+rather than at 0.03 — which makes the sibling-ranking quantity the entire `next_iteration.md`
+investigation measures into the thing the gradient actually consumes.
+
+Cost control: K = 4 sampled successors on 10–20 % of decisions ≈ +2 ms/decision against a 0.8 ms
+baseline of 0.86 ms; batch the critic call (Table A: 0.37 ms/state at batch 64). This is the cheap version of
+"search at training time". Gate it behind L2 — if λ stays at 0.97 the baseline change is
+pointless. Difficulty: moderate.
+
+#### L4. Two PBRS terms the rules justify — and why the `rich_eval` result does not transfer
+
+**State the distinction first, because it is the whole argument.** `rich_eval` failed as a
+*depth-bounded search-leaf term*: a search cannot cash a long-horizon asset inside its horizon, so
+a bot that chases one trades away tempo and loses (measured three times — `docs/bots.md`,
+`independent_opponents.md`). A **potential-based** shaping term in RL is a different object: it
+telescopes, it provably leaves the optimal policy unchanged (Ng et al.), and it only redistributes
+credit across time. Carrying the leaf-term negative result onto PBRS would be a category error,
+and this repo has already paid for one of those.
+
+Two potentials the rules argue for:
+
+- **Lock potential.** `Φ = SHAPING_C · Σ_bases w(b)` with `w = 1.0` for a base I control *and*
+  occupy, `0.6` for controlled-and-empty. Justification is B3's: a parked unit is an absolute
+  lock, and 0 of 53 observed steals came from an empty base. The current potential
+  (`SHAPING_C · base_diff`) prices a lock and a walk-in-able base identically, which is not how
+  the game works.
+- **Hanging-material potential.** `Φ_risk = −c · own_at_risk`, using the scalar the encoder
+  already computes and `HeuristicEvaluator` already has. This is the prophylaxis thesis expressed
+  in the one shaping form that cannot distort the optimum.
+
+Both are one-line potentials in `play_episode`, both A/B-able, both policy-invariant. Difficulty:
+low. Note this reopens the reward axis that #6 retired — deliberately, and on a different basis
+(a rule, not a tuning intuition).
+
+#### L5. Antithetic (mirrored) game pairs everywhere a number is reported
+
+Every eval and gauntlet number is confounded by draft luck: 1820 × 495 asymmetric matchups and
+~11-round games. Play each matchup **twice with sides swapped under the same seed** and average
+the pair. Free variance reduction on every measurement this project takes.
+
+The case for it is this project's own history: every methodological rule in `next_iteration.md`
+§4 was bought by a conclusion that later reversed, and most of those reversals were a small
+difference read against a large variance. Draft asymmetry is the one remaining large,
+*removable* variance source that nothing currently controls for. Difficulty: low.
+
+#### L6. Supervised warm start
+
+PPO currently spends its first couple hundred batches learning what a 200-line bot already knows.
+Behaviour-clone B4's net (or the θ family, for diversity) for ~1 CPU-hour, initialise the actor
+from it, then run PPO — AlphaStar's ordering, and cheap here because label generation is
+embarrassingly parallel across 16 cores.
+
+Second benefit, which matters more given the standing A/B rule: runs stop differing by "how fast
+did it escape the random phase", so early-batch comparisons become meaningful instead of noise.
+Difficulty: low, once B4 exists.
+
+#### L7. A curriculum over drafts, prioritised by the exploiter rather than by win rate
+
+#17 proposes tilting `set_init_state`'s draft sampling toward buckets `eval_bucketed` says are
+weak. Sharper version, once B2 exists: tilt toward the **(composition, θ) pairs where the
+best-response search found the largest edge**. That closes measurement → curriculum automatically,
+and it targets *exploitable* weakness rather than merely *low-win-rate* weakness — which are not
+the same thing, and only the first one costs games against a real opponent. Difficulty:
+low-moderate.
+
+#### L8. Reward hygiene the tempo reading exposes
+
+`MOVE_NEG_REWARD_PER_TURN = -0.002` is charged at seven call sites in `warchest_env.py`, including
+the tactic continuations (`:1655`, `:1707`, `:1728`, `:1772`, `:1841`). So a Berserker chain, a
+Footman double maneuver and a Swordsman bonus move each pay the penalty **again per maneuver** —
+in a game whose central currency is maneuvers-per-coin (B6), the per-step cost is charged against
+exactly the mechanics the policy never uses. Charge it per **coin spent** instead, or zero it.
+
+Joins the two hygiene items `next_iteration.md` §4 already lists: zero `ATTACK_REWARD = 0.02`
+(double-pays what material PBRS covers), and re-derive `holding_reward_rate` from ~37 real
+main-actor turns rather than the assumed 150. Difficulty: trivial.
+
+#### L9. A tempo + lock metric panel
+
+Extends #13 and `next_iteration.md` §5 row 5 with the quantities B3/B6 imply, all
+opponent-independent so none can saturate:
+
+- **maneuvers per coin spent**, and free-maneuver yield per unit type;
+- **locked-base fraction** (controlled *and* occupied) and base retention;
+- **coins-to-claim** — economy spent per base gained;
+- `P(bolster | facing a Knight ∧ none of my units bolstered)`. The Knight rule
+  (`only_attackable_when_bolstered`) makes bolstering **mandatory** to attack it, so this is the
+  one conditional where bolster is provably not a tempo loss. §3.7 measures bolster as
+  unconditionally suppressed at `P̄ = 0.029`; this conditional separates "collapsed mode" from
+  "correctly priced" in a way the marginal cannot.
+
+Difficulty: low — counters inside `play_one_game`.
+
+---
+
+### N.4 Suggested order
+
+Not sequenced ahead of `next_iteration.md` §5 rows 2b/3. After those report:
+
+| order | item | why first | cost |
+|---|---|---|---|
+| 1 | **L2** (λ with the critic fix) | rides along with the first training run; without it the shipped critic fix cannot show up | trivial |
+| 2 | **B8** + **L5** + **L8** | two lines, a seed swap, a constant — all three make every later number cleaner | trivial |
+| 3 | **B5**, **B1** | fast independent opponents at hot-path cost, no new machinery | low |
+| 4 | **A2** | largest expected gain per line; readout only, no obs bump, aimed straight at §3.4 | low-mod |
+| 5 | **B3** | the falsifiable read on whether the race framing is right | moderate |
+| 6 | **B2** | interpretable exploitability; subsumes the expensive half of #12 | low-mod |
+| 7 | **L1**, **B4** | 2× data and ~3× rollout throughput; B4 also unlocks L6, L7 and independent ExIt | moderate |
+| 8 | **A1 + A3** together | one `OBS_VERSION` bump buys both | moderate |
+| 9 | **A6**, **A7**, **L3**, **L4** | each depends on something above having reported | moderate |
+| 10 | **A5** | only if A2/A3 leave a gap worth a rebuild | high |
+
+Standing caution for all of it: the header's A/B rule applies unchanged — same `n_batches` both
+sides, distributions over the settled phase, no conclusion from a single run.
+
+---
+
+## Method — turning an observed weakness into a training change
+
+Carried over from `next_steps.md`, where it was written for the human-play loop; it generalizes
+to any observation ("it never bolsters", "it's fragile to a rush", "it's weak vs Cavalry").
+Playing 10 games yourself is only step zero — the value is *discovery*, and discovery is wasted
+without a pipeline that turns each observation into (a) an automated, re-runnable metric and
+(b) the right training lever.
+
+**0. Record every game.** Already shipped: `src/app/play.py` persists finished games via
+`game_record.py`. An unrecorded impression can't be quantified, and the logged positions feed
+everything below.
+
+**1. Convert the observation into an automated probe** — four types, by observation shape:
+
+| Observation shape | Probe | Status |
+|---|---|---|
+| "it never does X" | Counter metric (bolster/recruit/chain/tactic rates) | Mostly emitted by `eval_bucketed.py`; gaps in #13 |
+| "it plays badly against unit/comp Y" | Bucketed metric — per-composition WR conditioned on Y being drafted | Exists (`eval_bucketed.py`) |
+| "it's fragile to strategy Z" | **Scripted exploiter bot** — encode the strategy *you* used to beat it (~30–80 lines); its WR vs the frozen policy is the metric | The panel plan is `docs/independent_opponents.md` Phase 1; first entrant `BolsterBot` measured there |
+| "it blundered *here*" | **Puzzle/scenario suite** from the logged position | #14 |
+
+Human-found strategies are usually trivial to script once discovered — discovery was the hard
+part. Each human win is a free best-response sample, i.e. the poor-man's version of #12.
+
+**2. Classify the cause before picking a lever.** "The agent doesn't do X" has at least five
+distinct causes, and the wrong lever wastes a training run:
+
+| Cause | Diagnostic | Lever |
+|---|---|---|
+| **Can't see it** (obs gap) | Does the *critic* misjudge the same positions? If both nets are blind, the state isn't legible | New obs feature, bundled with the next `OBS_VERSION` bump |
+| **Never tries it** (exploration gap) | Action-frequency logs: was the verb ever sampled early, or dropped before reward could reinforce it? | Entropy floor / count-based verb bonus — **tried and insufficient alone**, `docs/history.md` 2026-07-25 |
+| **Tries it, unrewarded** (credit gap) | Verb sampled early at normal rates, then decays | PBRS term / GAE-λ (retired items 3, 6, 7 — reopen only with a probe backing it) |
+| **Never faced it** (opponent gap) | Do pool opponents ever use or punish the mechanic? (nothing in the repo bolsters) | Pool composition: exploiter panel, #15, meta-Nash weighting (#12) — **the current leading hypothesis**, `docs/independent_opponents.md` |
+| **Can't fit it** (capacity gap) | Everything above ruled out; loss plateaus | Widen the policy — **tried, inconclusive/negative**, retired item 5 |
+
+**3. Fix, then re-measure the probe *and* the full gauntlet.** The probe confirms the targeted
+weakness moved; the gauntlet plus the standing exploiter panel guards against whack-a-mole
+(patching a rush weakness while dropping general Elo). Probes accumulate — every discovered
+weakness stays measured forever.
+
+**Worked example — "it's fragile to an initiative rush."** Cause is almost certainly the
+opponent gap (nothing in the pool rushes), so: script the rush bot, verify it reproduces the
+human result against the frozen policy, add it to the pool at meaningful weight, retrain, watch
+WR-vs-rushbot climb while the gauntlet Elo holds. That is a mini PSRO iteration with a
+hand-coded best response standing in for a trained one — and the rush bot stays a permanent
+gauntlet entrant afterwards.
+
+## Checked and rejected
+
+- **Mirror-symmetry data augmentation.** The base layout is 180°-rotation symmetric (already
+  exploited — C6 ego-rotation) but **not** mirror-symmetric: reflection `(r,q)→(q,r)` maps P1's
+  base (1,0) onto a *neutral* base (0,1) (`board.py` `default_bases`), and hex reflections flip
+  direction handedness. Mirrored positions are not legal Warchest positions, so augmenting with
+  them trains on states outside the game. Recorded so it isn't re-proposed.
+- **More search budget as a strength lever.** `lookahead`@0.3 s/move vs `lookahead`@0.1 measured
+  **42%** — alpha-beta saturates by ~depth 5 here and extra time buys nothing
+  (`docs/independent_opponents.md` Phase-1 result, `docs/bots.md`).
+- **`rich_eval` / durability leaf terms to make a search bot bolster.** Measured net-harmful
+  twice; a depth-bounded leaf can't cash in a long-horizon asset (`docs/bots.md`,
+  `docs/independent_opponents.md`).
+
+---
+
+## Retired items (1–9)
+
+Closed out 2026-08-01. Shipped pieces live in `docs/history.md`; the rest are dropped rather
+than parked — they are all reward/observation/hyperparameter tuning read against a saturated
+`GreedyBot` yardstick, and `docs/independent_opponents.md` §2–3 locates the actual bottleneck
+elsewhere (every training opponent is policy-derived, and *no* bot in the repo bolsters, so
+nothing in the loop ever punishes the blind spots these items were aimed at). Kept as a map
+because code comments and other docs still cite these numbers.
+
+| # | Item | Outcome |
+|---|---|---|
+| 1 | Game-completeness — remaining Phase 5 work | **P5a shipped** (`src/app/eval_bucketed.py`, per-composition WR). P5b (rulebook snake/alternating draft) dropped — tabletop parity with no training value. P5c (freeze a `baseline_tactics` anchor) dropped — the gauntlet's fixed agent field (`services/gauntlet.py`) now provides the fixed comparison point it wanted, and it was written for the long-gone `OBS_VERSION=9` generation. |
+| 2 | Draw-probability observation features (`p_soon`/`p_mean`) | **Shipped** — `obs_encoders/v11.py`, `OBS_VERSION` 10→11. Full record incl. the "why a feature, not a reward" analysis: `docs/history.md` → *Draw-share observation features + capacity/exploration bundle (2026-07-25 to 07-26)*. The owed standalone A/B was never run and is not planned. |
+| 3 | A/B the 2026-07-03 reward + capacity bundle | **Resolved** 2026-07-04 (`docs/experiments.md`): `elo_policy` ~1000→~1500, `wr_vs_greedy_eval` 0→~0.9 — an unambiguous bundle-level win. Per-piece attribution across the three sub-bundles abandoned: the win was clear, and both the reward table and the yardstick have moved on since. |
+| 4 | Re-test a small `CLAIM_BASE_REWARD` | Dropped, never run. Reward micro-tuning measured against a saturated eval; the circular-claim exploit it was hedging (`docs/rewards.md` §2) is also cheaper to leave alone than to re-litigate. |
+| 5 | Widen the policy network | **Shipped** — `hidden_dim` 64→128 (`86d5ccd`), with `critic_hidden_dim` 128→192 in the same window; see `docs/history.md`. The result was confounded with idea 2's `OBS_VERSION=11` bump and came back *worse* on the gauntlet (BT-Elo 923, last of four vs three v10/64-wide checkpoints); the owed pinned-encoder re-test is dropped with the rest of the list. |
+| 6 | Unit / board-presence PBRS | Dropped, never started. It was explicitly gated on ideas 3–5 leaving a measurable tempo gap; the proposal text survives in `docs/rewards.md` § *Unrealized ideas* if the reward axis is ever reopened. |
+| 7 | GAE-λ sweep | **Value changed, never swept** — `lam` 0.95→0.97 shipped bundled (`cf2a9e3`, `419ec07`), see `docs/history.md`. The dedicated single-variable sweep is dropped. |
+| 8 | Tactic/bolster underuse as an exploration problem | **Shipped** — verb-marginal entropy bonus annealed to a non-zero floor (`Policy._verb_marginal_entropy`, `808e72e`), see `docs/history.md`. It did **not** move the blind spots: as of 2026-07-28 the policy still essentially never bolsters and doesn't use unit-specific tactics. That negative result is what reframed the problem as *coverage* (`docs/independent_opponents.md` §2 mechanism 4, §3) — exploration has nothing to reinforce when no opponent ever bolsters or punishes its absence. |
+| 9 | Disambiguate tactic reverse-causation | **Shipped (logging only)** — `tactic_base_leads` in `eval_bucketed.py`, see `docs/history.md`. No conclusion was ever written up, and the question is superseded by the per-behaviour metric panel in `docs/independent_opponents.md` Phase 4 (bolster/tactic/recruit/chain rates as first-class eval signals). |
+
 ---
 
 ### Tier 4 — small / cosmetic
 
 | # | Issue | Difficulty | Effect |
 |---|---|---|---|
-| C18 | `value_single` is called during `.train()` mode at rollout (`_collect_batch`, `ppo.py`); harmless today (no BN/Dropout) but if either is added, Dropout would produce stochastic noisy values during GAE and BatchNorm would compute statistics from a single sample — both silent bugs. Fix: `self._critic.eval()` before the rollout loop, `self._critic.train()` before the update. | trivial | none until BN/dropout |
 | C20 | Eval runs 20 episodes — std error on a 0.49 WR estimate is ~5%. Bump to 50. | low | log readability |
 | C21 | `EloTracker` updates after every eval game — noisy; consider a running average | low | log readability |
+
+**C18** (critic train/eval mode): already fixed — `self._critic.eval()`/`.train()` are toggled around the rollout loop and the update in `ppo.py` (e.g. lines 337/344/391/629/655). No action needed.
 
 **C16** (`iter_minibatches` permutation): already correct — a fresh `np.random.permutation` is generated on each call, so minibatches are uncorrelated across PPO epochs. No action needed.
 
@@ -149,4 +811,24 @@ Standing-rule reminder: measure over ≥10 batches per config, not a single batc
 
 ### Recommended next steps
 
-C8 (LR decay) and C9 (clean true-greedy eval) are **done** — run `ppo_20260630-060400` uses the true greedy bot (`RANDOM_ACTION_PROB=0.0`) and reports an honest ~70% WR. That run's plateau (score/WR decoupling, flat entropy) drove the fixes now recorded in `docs/history.md`. Start at idea 3 above (the owed A/B for the 2026-07-03 bundle) for the current live plan.
+> **Superseded twice.** The live sequencing is now `docs/next_iteration.md` §5 (run the shipped
+> critic fix: rows 2b and 3). The **B/A/L** block above holds the newer proposals and its own
+> order in §N.4. What follows is kept as the record of what this file recommended on 2026-08-01;
+> several of its premises — notably "the policy essentially never bolsters/recruits" — were
+> corrected by `next_iteration.md` §3.3 and §3.7.
+
+**The live sequencing is `docs/independent_opponents.md` §7**, not this file: build the scripted
+exploiter panel, wire it into *both* the PPO pool (fixing the ~100% policy-derived finetune
+schedule) and ExIt data-gen, then add the agreement / per-behaviour guards. Read alongside it:
+**#15** (the independent `LookaheadBot` into the pool) is the cheapest piece of that same fix,
+and **#13** feeds its success criterion (bolster/tactic rates moving off ~0, not just Elo).
+
+After that, in rough order of information per hour: **#12** (exploitability probe — decides
+whether any PSRO investment is justified), **#14** (blunder finder → puzzle suite, which makes
+every future weakness a standing regression test), then the training levers **#16–#19** and the
+cheap owed A/Bs **#20** / **#11 P11c**. **#21** (online play) stays last by design, and **#10** /
+**#22** (action-space work), the parked threat-plane variant, and **C20/C21** are opportunistic —
+pick them up when adjacent work already pays their setup cost (an `OBS_VERSION` bump, an
+action-space rebuild, a parallel-rollout tuning pass).
+
+C8 (LR decay) and C9 (clean true-greedy eval) are **done**; ideas 1–9 are retired (above).

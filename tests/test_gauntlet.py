@@ -1,4 +1,4 @@
-"""Round-robin gauntlet: rating math + end-to-end agent play (docs/next_steps.md Step 1)."""
+"""Round-robin gauntlet: rating math + end-to-end agent play (docs/history.md — measurement infra)."""
 import numpy as np
 import torch
 
