@@ -60,13 +60,38 @@ def _critic_agent_name(path):
     """Short, column-header-safe display name for a lookahead_critic built from `path`.
 
     The report truncates matrix column headers to 6 chars, so distinct critics must
-    differ within the first 6. `.../lookahead_critic_v3.pth` -> `lac_v3`; anything without
-    a `_v{N}` suffix falls back to the (truncated) stem so two arbitrary paths still differ.
+    differ within the first 6. `.../lookahead_critic_v3.pth` -> `lac_v3`;
+    `.../warchest_critic_20260808-0607.pth` -> `c0808_0607` (the run stamp, which is what
+    actually distinguishes two PPO critics).
+
+    Prefer `_critic_agent_names` over calling this directly — a single path cannot know
+    whether its name collides with another in the same field, and this project's own
+    convention (`warchest_critic_<stamp>.pth`) collides on any fixed-length prefix.
     """
-    m = re.search(r'_v(\d+)\.pth$', os.path.basename(path))
+    base = os.path.basename(path)
+    m = re.search(r'_v(\d+)\.pth$', base)
     if m:
         return f'lac_v{m.group(1)}'
-    return 'lac_' + os.path.splitext(os.path.basename(path))[0][:6]
+    # PPO critics are named by run stamp; the stamp is the only distinguishing part, and a
+    # truncated stem ('lac_warche') makes every one of them identical in the report.
+    m = re.search(r'(\d{8})-(\d{4})', base)
+    if m:
+        return f'c{m.group(1)[4:]}_{m.group(2)}'
+    return 'lac_' + os.path.splitext(base)[0][:6]
+
+
+def _critic_agent_names(paths):
+    """Display names for `paths`, guaranteed distinct within the report's 6-char truncation.
+
+    Names index nothing (the results matrix is positional), so a collision is not a
+    correctness bug — it just prints two identical rows, which is useless for the one job
+    this list exists for: comparing critics head to head. Any residual collision is broken
+    by appending an index rather than silently shipping ambiguous output.
+    """
+    names = [_critic_agent_name(p) for p in paths]
+    if len({n[:6] for n in names}) == len(names):
+        return names
+    return [f'{n[:4]}#{i}' for i, n in enumerate(names)]
 
 
 def _build_specs(args):
@@ -111,10 +136,12 @@ def _build_specs(args):
             crit_paths = [latest] if latest else []
         if not crit_paths:
             print(f'  ! skipping lookahead_critic: no checkpoint matching {CRITIC_GLOB}')
-        for critic_path in crit_paths:
+        crit_names = _critic_agent_names(crit_paths)
+        for critic_path, crit_name in zip(crit_paths, crit_names):
             # A single critic keeps the plain 'lookahead_critic' name (back-compat with the
-            # old single-bot default); multiple get versioned lac_v* names to stay distinct.
-            name = 'lookahead_critic' if len(crit_paths) == 1 else _critic_agent_name(critic_path)
+            # old single-bot default); multiple get distinct short names so the report can
+            # actually tell them apart.
+            name = 'lookahead_critic' if len(crit_paths) == 1 else crit_name
             specs.append({'kind': 'lookahead_critic', 'name': name, 'kwargs': {
                 'critic_path': critic_path,
                 'beam_width': args.lookahead_critic_beam_width,

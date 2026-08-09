@@ -578,10 +578,49 @@ cancels in the action comparison and `V(s_{t+1})` enters at γ(1−λ) ≈ 0.03,
 discriminative signal is the realised return** — "λ = 0.97 is accidentally the right setting for a
 critic that cannot rank, and improving the critic buys PPO nothing unless λ drops with it."
 
-The trunk fix has shipped. The paired change has not. Run `critic_v2 × λ ∈ {0.97, 0.90, 0.80}`.
+The trunk fix has shipped (and, 2026-08-09, so has §5 row 6). The paired change has not.
 This is the step that *converts* a repaired critic into policy improvement; without it the repair
 is invisible in the gauntlet and will read as a negative result. Difficulty: trivial (a
 hyperparameter arm). **Should ride along with §5 row 8's first training run.**
+
+**Recommended value: λ = 0.90**, swept as `{0.97 (baseline), 0.90, 0.80}`. The arithmetic:
+
+| λ | γ(1−λ) — the weight on `V(s_{t+1})`, i.e. on sibling ranking | vs today | effective horizon `1/(1−γλ)`, in main-actor decisions |
+|---|---|---|---|
+| 0.97 (today) | 0.0297 | 1× | 25.2 |
+| 0.95 | 0.0495 | 1.7× | 16.8 |
+| **0.90** | **0.0990** | **3.3×** | **9.2** |
+| 0.80 | 0.1980 | 6.7× | 4.8 |
+| 0.70 | 0.2970 | 10× | 3.3 |
+
+Why 0.90 and not lower, given that §1's thesis is "value lives one to two moves ahead":
+
+- **An episode is only ~42 main-actor decisions** (`turns ≈ 85` plies in the logs). At λ = 0.97 the
+  25-decision horizon covers more than half the game, so the advantage is close to plain Monte
+  Carlo and the critic is nearly irrelevant by construction. At 0.90 the horizon is ~9 decisions
+  ≈ 2–3 rounds — enough to span a base-race exchange, short enough that the critic actually
+  arbitrates.
+- **The critic is newly repaired, not yet accurate.** §3.4's row-3 result is a *ranking* win —
+  same-verb pairwise 46.0 % → 55.8 %, tie rate 93 % → 0 % — against a ~61 % best-observed ceiling,
+  and it explicitly notes pooled Pearson `corr` *fell* while the rank metrics rose. Lowering λ
+  trades return variance for critic bias; at ~56 % pairwise accuracy on the hardest bucket, 6.7×
+  (λ = 0.80) is a large bet on a quantity with one measurement behind it. 0.90 is the biggest step
+  that is still clearly resolvable (3.3×) without that bet.
+- **Skip 0.95.** 1.7× is inside the noise this project keeps getting burned by — the standing rule
+  is that a ~0.3 pooled-std difference from one run per side is not signal, and 0.0297 → 0.0495 is
+  not going to clear it. Three arms, well separated, is the better use of the same compute.
+
+Two things that make this cheaper than it looks. Dropping `opp_onehot` (§5 row 6) **does not fight
+it**: the per-opponent offset is constant across a state's siblings and across `V(s_t)`/`V(s_{t+1})`
+within an episode, so it cancels in `δ_t` — removing the input costs the critic nothing where a
+lower λ leans on it. And the run needs no new instrumentation: read `critic_mae` against the return
+std (if it is still ~0.5× the std, the critic is too weak to carry more weight and 0.80 will lose),
+plus the actor gradient norm, plus the usual gauntlet + step-5 conditional metrics.
+
+Gate, in the standing form: all three arms at the same `n_batches`, compared over each run's
+settled phase — and if 0.90 does not beat 0.97 on gauntlet Elo, that is evidence about the critic's
+*absolute* accuracy, not about λ, and the next move is the critic-target A/B (§5 row 2b), not a
+smaller λ.
 
 #### L3. Action-conditional baseline — use the critic where it can actually act
 

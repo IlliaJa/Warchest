@@ -39,6 +39,36 @@ OPP_TYPE_IDX = {'random': 0, 'greedy': 1, 'pool': 2}
 OPP_ONEHOT_SLOT = {**OPP_TYPE_IDX, 'lookahead_critic': OPP_TYPE_IDX['pool'],
                    'puct': OPP_TYPE_IDX['pool']}
 
+# Fine-grained opponent id, used ONLY to group advantage normalisation
+# (`RolloutBuffer.compute_gae(adv_norm='per_opponent')`, docs/next_iteration.md §5 row 6).
+# Deliberately NOT `OPP_ONEHOT_SLOT`: that one collapses the search bots onto `pool`
+# because the critic's one-hot is pinned at 3 for v1/v2 checkpoint compatibility, and
+# collapsing them here would defeat the purpose — the finetune schedule is 75 % `pool` /
+# 25 % `lookahead_critic`, two opponents of genuinely different strength, so grouping them
+# together would leave in the advantage exactly the per-opponent offset this is removing.
+# Not fed to any network, so it is free to grow: adding an entry breaks no checkpoint.
+OPP_GROUP_IDX = {'random': 0, 'greedy': 1, 'pool': 2, 'lookahead_critic': 3, 'puct': 4}
+# Shared bucket for an opponent label nobody registered above. Warned about once per
+# process rather than raised, so adding a bot to the pool cannot kill a running job — but
+# it does mean that bot's advantages are centred together with any other stranger.
+OPP_GROUP_OTHER = len(OPP_GROUP_IDX)
+_warned_opp_groups = set()
+
+
+def opp_group_id(opp_type):
+    """Fine-grained opponent group id for advantage centring. See `OPP_GROUP_IDX`."""
+    idx = OPP_GROUP_IDX.get(opp_type)
+    if idx is None:
+        if opp_type not in _warned_opp_groups:
+            _warned_opp_groups.add(opp_type)
+            logger.warning(
+                f'opponent {opp_type!r} is not in OPP_GROUP_IDX; its advantages will be '
+                f'centred together with every other unregistered opponent. Register it to '
+                f'give it its own group.'
+            )
+        return OPP_GROUP_OTHER
+    return idx
+
 # Opponent families that forward-simulate the full game state and therefore read
 # the live env (`act(env)`, absolute frame) instead of the ego-centric obs the
 # reactive bots consume — see `_opponent_env_action`.
@@ -68,7 +98,11 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
 
     ``steps`` is a dict of parallel per-decision lists for the main actor's transitions
     (arg order matches RolloutBuffer.add_step, minus the deferred value):
-        obs, actions, log_probs, rewards, opp_onehots, privileged
+        obs, actions, log_probs, rewards, opp_onehots, privileged, opp_ids
+
+    ``opp_ids`` is the fine-grained opponent group (`opp_group_id`), constant within an
+    episode and used only to centre advantages per opponent — see `OPP_GROUP_IDX`. It is
+    separate from ``opp_onehots``, which is the 3-wide critic input that `critic_v3` drops.
     The terminal / truncation reward is folded into ``rewards[-1]`` (equivalent to the old
     RolloutBuffer.append_terminal_reward, but scoped to this episode's own last step rather
     than the buffer's global last step — the old cross-episode edge only mattered for a
@@ -301,6 +335,7 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
         'rewards': rew_l,
         'opp_onehots': opp_l,
         'privileged': priv_l,
+        'opp_ids': [opp_group_id(opp_type)] * len(obs_l),
     }
     if collect_dense and aux_boards:
         # Monte-Carlo return-to-go over the main-perspective per-ply reward stream, then

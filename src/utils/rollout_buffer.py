@@ -17,6 +17,7 @@ class RolloutBuffer:
         self._rewards = []
         self._values = []          # stored as Python floats (not tensors)
         self._opp_onehots = []
+        self._opp_ids = []
         self._privileged = []
         self._episode_ends = []
         self.advantages = None
@@ -26,10 +27,16 @@ class RolloutBuffer:
         self._globals = None
         self._masks = None
         self._opp_onehots_arr = None
+        self._opp_ids_arr = None
         self._privileged_arr = None
         self._actions_arr = None
         self._lp_old = None
         self._vals_old = None
+        # Per-opponent-group raw advantage means removed by
+        # compute_gae(adv_norm='per_opponent'); {group_id: mean}. Purely diagnostic — logged
+        # by ppo.py so the size of the bias being removed stays visible per batch. Empty
+        # under adv_norm='global'.
+        self.adv_group_offsets = {}
         # Auxiliary dense-critic-target stream (opponent-decision nodes; see
         # rollout_core.play_episode collect_dense). Value-only: no action/log_prob/advantage,
         # trained by a separate MC-return regression in the critic update. Empty unless the
@@ -42,13 +49,14 @@ class RolloutBuffer:
         self._aux_priv_arr = None
         self._aux_targets_arr = None
 
-    def add_step(self, obs, action, log_prob, reward, opp_onehot, privileged):
+    def add_step(self, obs, action, log_prob, reward, opp_onehot, privileged, opp_id=0):
         self._obs.append(obs)
         self._actions.append(action)
         self._log_probs_old.append(log_prob.detach().cpu())
         self._rewards.append(float(reward))
         self._opp_onehots.append(opp_onehot)
         self._privileged.append(privileged)
+        self._opp_ids.append(int(opp_id))
 
     def add_aux_steps(self, boards, globals_, opp_onehots, privileged, targets):
         """Append one episode's dense auxiliary samples (serial path). Arrays are the
@@ -81,6 +89,7 @@ class RolloutBuffer:
         self._globals = np.stack([o['global'] for o in self._obs])
         self._masks = np.stack([o['valid_action_mask'] for o in self._obs])
         self._opp_onehots_arr = np.stack(self._opp_onehots)
+        self._opp_ids_arr = np.array(self._opp_ids, dtype=np.int64)
         self._privileged_arr = np.stack(self._privileged)
         self._actions_arr = np.array(self._actions, dtype=np.int64)
         self._lp_old = torch.stack(self._log_probs_old)    # cached once; sliced per minibatch
@@ -125,6 +134,7 @@ class RolloutBuffer:
         self._globals = np.concatenate([c['globals'] for c in chunks])
         self._masks = np.concatenate([c['masks'] for c in chunks])
         self._opp_onehots_arr = np.concatenate([c['opp_onehots'] for c in chunks])
+        self._opp_ids_arr = np.concatenate([c['opp_ids'] for c in chunks]).astype(np.int64)
         self._privileged_arr = np.concatenate([c['privileged'] for c in chunks])
         self._actions_arr = np.concatenate([c['actions'] for c in chunks]).astype(np.int64)
         self._lp_old = torch.from_numpy(
@@ -147,7 +157,58 @@ class RolloutBuffer:
         if self._rewards:
             self._rewards[-1] += reward
 
-    def compute_gae(self, gamma, lam, device):
+    # Minimum samples in an opponent group before its own mean is trusted. Below this the
+    # group falls back to the batch mean: a mean estimated from a handful of correlated
+    # steps is mostly noise, and subtracting it would inject bias rather than remove it.
+    MIN_GROUP_SAMPLES = 64
+
+    def _center_per_opponent(self, adv_t):
+        """Subtract each opponent group's own mean advantage. -> (centred, {group: mean})
+
+        Why this exists (docs/next_iteration.md §3.5, §5 row 6). The critic predicts one
+        value function across every opponent in the pool, but the returns are wildly
+        opponent-dependent — win rates 1.000 / 0.825 / 0.525 vs random / greedy / self. A
+        critic that cannot tell them apart therefore under-predicts against weak opponents
+        and over-predicts against strong ones, so `A = G - V` carries a per-opponent
+        *offset*: every action taken against `random` looks good and every action taken
+        against a pool snapshot looks bad, regardless of merit. `critic_v1`/`v2` bought that
+        back with a 3-wide opponent one-hot input, which worked but made the critic's output
+        meaningless to anything outside the training loop. Centring the advantage inside each
+        group removes the same offset where it actually acts — in the policy gradient — and
+        lets the critic go back to being a pure function of the state.
+
+        Deliberately mean-only: the groups are **not** rescaled to unit variance
+        individually. Returns against `random` have far less spread than returns against a
+        snapshot, so per-group z-scoring would amplify the near-deterministic group's noise
+        up to the same weight as the group that carries the real learning signal. The batch
+        keeps one global scale, applied by the caller after centring.
+        """
+        offsets = {}
+        ids = self._opp_ids_arr
+        if ids is None or len(ids) != len(adv_t):
+            return adv_t, offsets  # caller re-centres on the batch mean
+        ids_t = torch.from_numpy(ids)
+        means = torch.full_like(adv_t, float(adv_t.mean()))
+        for gid in torch.unique(ids_t).tolist():
+            mask = ids_t == gid
+            if int(mask.sum()) < self.MIN_GROUP_SAMPLES:
+                continue  # too few to estimate a mean; leave it on the batch mean
+            gmean = adv_t[mask].mean()
+            means[mask] = gmean
+            offsets[int(gid)] = float(gmean)
+        return adv_t - means, offsets
+
+    def compute_gae(self, gamma, lam, device, adv_norm='per_opponent'):
+        """Compute GAE advantages and returns, then normalise the advantages.
+
+        `adv_norm`:
+          * `'per_opponent'` (default) — centre within each opponent group, then scale by
+            one global std. See `_center_per_opponent` for why, and why the scale is shared.
+          * `'global'` — the historical single mean/std over the whole batch. Kept as the
+            A/B baseline; it is what every run before 2026-08-09 did.
+        """
+        if adv_norm not in ('per_opponent', 'global'):
+            raise ValueError(f"adv_norm must be 'per_opponent' or 'global', got {adv_norm!r}")
         adv_chunks = []
         ret_chunks = []
         ep_start = 0
@@ -178,7 +239,22 @@ class RolloutBuffer:
         self.raw_ret_mean = ret_t.mean().item()
         self.raw_ret_std = ret_t.std().item()
 
-        adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+        if adv_norm == 'per_opponent':
+            centered, self.adv_group_offsets = self._center_per_opponent(adv_t)
+        else:
+            centered, self.adv_group_offsets = adv_t, {}
+        # Re-centre the batch. Exactly a no-op when every group cleared MIN_GROUP_SAMPLES
+        # (the within-group deviations already sum to zero), but NOT when a group fell back
+        # to the batch mean: that group keeps its own offset, which leaves the batch mean
+        # non-zero, and a non-zero mean advantage is a uniform push on every sampled action.
+        # Trading it for an equal (tiny) shift shared by all groups is the right way round —
+        # a uniform bias is the ordinary no-baseline case, an opponent-specific one is the
+        # thing this whole function exists to remove.
+        centered = centered - centered.mean()
+        # Scale after centring, not before: removing the between-opponent spread shrinks the
+        # std, and rescaling on the pre-centring value would leave the batch below unit
+        # variance and silently shrink the policy step.
+        adv_t = centered / (centered.std() + 1e-8)
 
         self.advantages = adv_t.to(device)
         self.returns = ret_t.to(device)
@@ -277,6 +353,7 @@ class RolloutBuffer:
         self._rewards.clear()
         self._values.clear()
         self._opp_onehots.clear()
+        self._opp_ids.clear()
         self._privileged.clear()
         self._episode_ends.clear()
         self.advantages = None
@@ -285,10 +362,12 @@ class RolloutBuffer:
         self._globals = None
         self._masks = None
         self._opp_onehots_arr = None
+        self._opp_ids_arr = None
         self._privileged_arr = None
         self._actions_arr = None
         self._lp_old = None
         self._vals_old = None
+        self.adv_group_offsets = {}
         self._aux_parts = []
         self._aux_boards_arr = None
         self._aux_globals_arr = None

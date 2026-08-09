@@ -1,4 +1,4 @@
-"""Critic architecture: v1/v2 selection, checkpoint compatibility, trunk-health guard.
+"""Critic architecture: v1/v2/v3 selection, checkpoint compatibility, trunk-health guard.
 
 Why these exist: the shipped `critic_v1` trunk *died* — every pre-activation of its final
 ReLU went <= 0, so the trunk output was identically zero, `_split_pool` fed the value head a
@@ -11,6 +11,12 @@ These tests pin the three things that must not regress:
   1. every existing (v1) checkpoint still loads, because the gauntlet reconstructs them;
   2. `trunk_health` actually reports a dead conv as 0.0 — it is the guard, so it has to work;
   3. the board-only head's gradient reaches the trunk, which is the entire mechanism.
+
+`critic_v3` then drops the 3-wide opponent one-hot from the head (docs/next_iteration.md §5
+row 6): it moved the output more than the position did, it is constant during finetune, and
+it made the raw value meaningless to every consumer outside training. The offset it carried
+is removed from the *advantage* instead — see `test_rollout_buffer.py` for that half. Pinned
+here: the head really is narrower, v1/v2 still demand their block, and v3 tolerates `None`.
 """
 import numpy as np
 import pytest
@@ -21,7 +27,9 @@ from src.services.environment.warchest_env import WarChestEnv
 from src.services.policy.checkpoint import (
     CRITIC_ARCHS, CURRENT_CRITIC_ARCH, load_critic_checkpoint, save_critic_checkpoint,
 )
-from src.services.policy.policy import CRITIC_ARCH_V1, CRITIC_ARCH_V2, Critic
+from src.services.policy.policy import (
+    CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3, Critic,
+)
 
 DEV = torch.device('cpu')
 HIDDEN = 32  # divisible by CRITIC_GROUPS=8, small enough to build repeatedly
@@ -32,17 +40,17 @@ def _boards(n=16, channels=None):
     return torch.randn(n, ch, 7, 7)
 
 
-def test_v2_is_the_default_and_both_arches_build():
-    assert CURRENT_CRITIC_ARCH == CRITIC_ARCH_V2
-    assert set(CRITIC_ARCHS) == {CRITIC_ARCH_V1, CRITIC_ARCH_V2}
-    assert Critic(DEV, HIDDEN).arch == CRITIC_ARCH_V2
+def test_v3_is_the_default_and_every_arch_builds():
+    assert CURRENT_CRITIC_ARCH == CRITIC_ARCH_V3
+    assert set(CRITIC_ARCHS) == {CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3}
+    assert Critic(DEV, HIDDEN).arch == CRITIC_ARCH_V3
     for arch in CRITIC_ARCHS:
         assert Critic(DEV, HIDDEN, arch=arch).arch == arch
 
 
 def test_unknown_arch_is_rejected():
     with pytest.raises(ValueError, match='unknown critic arch'):
-        Critic(DEV, HIDDEN, arch='critic_v3')
+        Critic(DEV, HIDDEN, arch='critic_v99')
 
 
 def test_v2_requires_hidden_dim_divisible_by_group_count():
@@ -212,3 +220,63 @@ def test_v2_builds_for_every_obs_version_in_the_registry():
         enc = get_encoder(version)
         c = Critic(DEV, HIDDEN, obs_encoder=enc, arch=CRITIC_ARCH_V2)
         assert torch.isfinite(c.board_encoder(_boards(4, enc.board_channels))).all()
+
+
+# --------------------------------------------------------------------------- #
+# critic_v3: the opponent one-hot is gone (docs/next_iteration.md §5 row 6)
+# --------------------------------------------------------------------------- #
+
+def test_v3_head_is_narrower_by_exactly_the_onehot():
+    """The block really is absent, not zeroed — otherwise the head could still use it."""
+    v2 = Critic(DEV, HIDDEN, arch=CRITIC_ARCH_V2)
+    v3 = Critic(DEV, HIDDEN, arch=CRITIC_ARCH_V3)
+    assert v2.uses_opp_onehot and not v3.uses_opp_onehot
+    assert v2.head[0].in_features - v3.head[0].in_features == Critic.OPP_DIM
+
+
+def test_v3_keeps_v2s_groupnorm_trunk_and_board_only_head():
+    """v3 is v2 minus one input block; the trunk fix must ride along unchanged."""
+    v3 = Critic(DEV, HIDDEN, arch=CRITIC_ARCH_V3)
+    assert any(isinstance(m, torch.nn.GroupNorm) for m in v3.board_encoder.modules())
+    assert v3.board_only_head is not None
+    assert torch.isfinite(v3.board_only_value(_boards(4))).all()
+
+
+def _v3_batch(n=8):
+    enc = latest_encoder()
+    return {
+        'board': torch.randn(n, enc.board_channels, 7, 7),
+        'global': torch.randn(n, enc.global_dim),
+        'privileged': torch.randn(n, enc.priv_dim),
+    }
+
+
+def test_v3_ignores_the_onehot_it_is_handed():
+    """Every existing call site still passes one; the value must not depend on it."""
+    c = Critic(DEV, HIDDEN, arch=CRITIC_ARCH_V3).eval()
+    batch = _v3_batch()
+    n = len(batch['board'])
+    with torch.no_grad():
+        base = c.value_batch({**batch, 'opp_onehot': torch.zeros(n, Critic.OPP_DIM)})
+        for slot in range(Critic.OPP_DIM):
+            oh = torch.zeros(n, Critic.OPP_DIM)
+            oh[:, slot] = 1.0
+            assert torch.equal(base, c.value_batch({**batch, 'opp_onehot': oh}))
+        assert torch.equal(base, c.value_batch(batch))  # and it may be omitted outright
+
+
+def test_v1_and_v2_still_require_the_onehot_and_say_so_when_it_is_missing():
+    """A silent zero-fill would make an old checkpoint quietly mis-predict instead of failing."""
+    for arch in (CRITIC_ARCH_V1, CRITIC_ARCH_V2):
+        c = Critic(DEV, HIDDEN, arch=arch)
+        with pytest.raises(ValueError, match='opponent one-hot'):
+            c.value_batch(_v3_batch())
+
+
+def test_v3_state_dict_is_not_interchangeable_with_v2():
+    """Loading a v2 checkpoint as v3 (or vice versa) must fail loudly, not silently reshape."""
+    v2, v3 = Critic(DEV, HIDDEN, arch=CRITIC_ARCH_V2), Critic(DEV, HIDDEN, arch=CRITIC_ARCH_V3)
+    with pytest.raises(RuntimeError):
+        v3.load_state_dict(v2.state_dict())
+    with pytest.raises(RuntimeError):
+        v2.load_state_dict(v3.state_dict())

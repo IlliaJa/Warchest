@@ -173,21 +173,28 @@ def _spearman(a, b):
 def _report_weights(bot):
     """First-order sensitivity of the value head to each input block, scale-corrected.
 
-    `Critic._forward` concatenates [pooled | global | opp_onehot | privileged] and feeds
+    `Critic._head_input` concatenates [pooled | global | opp_onehot | privileged] and feeds
     `head[0]`, so each block owns a contiguous column slice of that layer's weight. A raw
     weight norm is not comparable across blocks (different input scales), so each column
     is multiplied by that input's observed std before the norm is taken.
+
+    `critic_v3` has no `opp_onehot` block (docs/next_iteration.md §5 row 6), so the slices
+    are built from the arch rather than hardcoded — otherwise every block after `global`
+    would be off by OPP_DIM and the report would be silently wrong.
     """
     critic = bot._critic
     w = critic.head[0].weight.detach().cpu().numpy()   # [hidden, head_in]
     hidden = w.shape[0]
-    n_pool = 2 * hidden
-    blocks = [
-        ('board (pooled)', 0, n_pool),
-        ('global', n_pool, n_pool + critic.global_dim),
-        ('opp_onehot', n_pool + critic.global_dim, n_pool + critic.global_dim + critic.OPP_DIM),
-        ('privileged', w.shape[1] - critic.priv_dim, w.shape[1]),
-    ]
+    blocks = []
+    lo = 0
+    for name, dim in (('board (pooled)', 2 * hidden),
+                      ('global', critic.global_dim),
+                      ('opp_onehot', critic.OPP_DIM if critic.uses_opp_onehot else 0),
+                      ('privileged', critic.priv_dim)):
+        if dim:
+            blocks.append((name, lo, lo + dim))
+            lo += dim
+    assert lo == w.shape[1], f'block layout {lo} != head_in {w.shape[1]}'
     return w, blocks
 
 
@@ -258,7 +265,9 @@ def main():
     stds = np.concatenate([
         pooled_std,
         globals_.std(axis=0),
-        np.zeros(bot._critic.OPP_DIM) + 1e-9,  # constant one-hot within a run
+        # Constant one-hot within a run, so its true std is 0; 1e-9 keeps the block in the
+        # layout without letting it dominate. Absent entirely on critic_v3.
+        *([np.zeros(bot._critic.OPP_DIM) + 1e-9] if bot._critic.uses_opp_onehot else []),
         privs.std(axis=0),
     ])
     print('\n1. HEAD SENSITIVITY — ||W[:, block] * std(input)||_F, scale-corrected')

@@ -170,6 +170,10 @@ class LookaheadCriticBot(LookaheadBot):
             — the critic was trained conditioned on this, and there's no
             "unknown opponent" slot to fall back on. `'pool'` (self-play
             snapshots) is the closest analogue to an arbitrary eval opponent.
+            **Ignored by `critic_v3` checkpoints**, which dropped the one-hot
+            precisely because having to pick a slot arbitrarily here made the
+            critic's absolute output meaningless outside training
+            (docs/next_iteration.md §3.5, §5 row 6). Still honoured by v1/v2.
         n_determinizations: independent `_act_once` searches per `act()` call,
             each under a fresh sampled future-draw order, weighted-vote
             combined (see `act()`) — hedges this bot's own single-

@@ -85,6 +85,7 @@ def _worker_loop(worker_id, task_q, result_q, counter, cfg):
             pool.set_weights(**task['weights'])
 
             obs_l, act_l, lp_l, rew_l, opp_l, priv_l = [], [], [], [], [], []
+            oid_l = []
             ends, episode_dicts = [], []
             collect_dense = cfg.get('collect_dense', False)
             aux_parts = []  # per-episode dicts of dense aux samples (collect_dense only)
@@ -106,6 +107,7 @@ def _worker_loop(worker_id, task_q, result_q, counter, cfg):
                 lp_l.extend(float(x) for x in steps['log_probs'])
                 rew_l.extend(steps['rewards'])
                 opp_l.extend(steps['opp_onehots'])
+                oid_l.extend(steps['opp_ids'])
                 priv_l.extend(steps['privileged'])
                 ends.append(len(rew_l))
                 if collect_dense and 'aux_targets' in steps:
@@ -129,6 +131,7 @@ def _worker_loop(worker_id, task_q, result_q, counter, cfg):
                     'log_probs': np.array(lp_l, dtype=np.float32),
                     'rewards': np.array(rew_l, dtype=np.float32),
                     'opp_onehots': np.stack(opp_l),
+                    'opp_ids': np.array(oid_l, dtype=np.int64),
                     'privileged': np.stack(priv_l),
                     'episode_ends': ends,
                     'episode_dicts': episode_dicts,

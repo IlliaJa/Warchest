@@ -67,6 +67,38 @@ def game_state_to_dict(state: GameState) -> dict:
     }
 
 
+def _pending_data_from_json(data):
+    """Restore `(r, q)` coordinate tuples inside a Pending's `data` payload.
+
+    JSON has no tuple type, so every coordinate in `data` round-trips back as a *list* —
+    and coordinates are used as dict keys (`_hex_distances` does `dist = {start: 0}`),
+    which raises `TypeError: unhashable type: 'list'`. `unit_loc` was already converted;
+    `data` was passed through verbatim, so any saved game containing a tactic with a
+    coordinate payload (`origin` for grant_attack/grant_move, `queue` for
+    footman_maneuver) could not be replayed at all.
+
+    Converted by shape rather than by key name, so a new pending kind with a coordinate
+    payload does not silently reintroduce the bug: a 2-element list of ints is a
+    coordinate, a list of those is a list of coordinates, everything else is left alone.
+    """
+    if not data:
+        return data
+
+    def _is_coord(v):
+        return (isinstance(v, list) and len(v) == 2
+                and all(isinstance(x, int) and not isinstance(x, bool) for x in v))
+
+    out = {}
+    for k, v in data.items():
+        if _is_coord(v):
+            out[k] = tuple(v)
+        elif isinstance(v, list) and v and all(_is_coord(x) for x in v):
+            out[k] = [tuple(x) for x in v]
+        else:
+            out[k] = v
+    return out
+
+
 def game_state_from_dict(d: dict) -> GameState:
     board = Board()
     board.board = np.array(d['board_grid'], dtype=int)
@@ -80,7 +112,7 @@ def game_state_from_dict(d: dict) -> GameState:
     if d['pending'] is not None:
         p = d['pending']
         pending = Pending(kind=p['kind'], unit_loc=tuple(p['unit_loc']),
-                          optional=p['optional'], data=p['data'])
+                          optional=p['optional'], data=_pending_data_from_json(p['data']))
 
     def _counters(field):
         return {int(pid): Counter({int(c): n for c, n in counts.items()})

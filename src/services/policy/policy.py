@@ -257,6 +257,7 @@ class Policy(nn.Module):
 
 CRITIC_ARCH_V1 = 'critic_v1'
 CRITIC_ARCH_V2 = 'critic_v2'
+CRITIC_ARCH_V3 = 'critic_v3'
 CRITIC_GROUPS = 8  # GroupNorm groups; must divide both 32 and hidden_dim
 
 
@@ -272,8 +273,8 @@ class Critic(nn.Module):
     `_split_pool`) → [B, 2*Cf]. Concatenate with global features, opp_onehot and
     the privileged vector → scalar value.
 
-    Two architectures, selected by `arch`, because every existing checkpoint is v1
-    and the gauntlet has to keep reconstructing them (docs/history.md):
+    Three architectures, selected by `arch`, because checkpoints of every generation
+    exist on disk and the gauntlet has to keep reconstructing them (docs/history.md):
 
     `critic_v1` — the original `HexConv2d → ReLU` ×3 with no normalisation. **This
     trunk dies.** Measured on the shipped v11 checkpoint: every pre-activation of
@@ -300,13 +301,34 @@ class Critic(nn.Module):
         right mechanism: the `board_solo` probe — same stack, same data, but with no
         globals to fall back on — trains to a 43.2 % alive trunk and pooled
         R^2 0.1846, above a globals-only control's 0.1633.
+
+    `critic_v3` — v2's trunk and auxiliary head, **minus the opponent one-hot**
+    (docs/next_iteration.md §5 row 6). The 3-wide `opp_onehot` block told the critic
+    which opponent family it was facing, and it moved the output more than the
+    position did: `V(start)` spanned 0.747 across the three slots against a 0.44 std
+    of `V` across *positions* (§3.5). That was not a bug in the critic — win rates
+    really are 1.000 / 0.825 / 0.525 vs random / greedy / self — but it has three
+    costs. It is dead weight during finetune (`p_random = p_greedy = 0`, and the
+    search bots are mapped onto the `pool` slot anyway), it makes the raw output
+    meaningless to any consumer outside training (every search bot has to pick a slot
+    arbitrarily, on top of return normalisation), and it lets the head satisfy a large
+    part of the loss without reading the state at all. The opponent-identity offset it
+    was carrying is removed from the *advantage* instead, where it actually mattered:
+    `RolloutBuffer.compute_gae(adv_norm='per_opponent')` centres advantages within
+    each opponent group, so the per-opponent mean cancels out of the policy gradient
+    without the critic needing to know who it is playing. The two changes are a
+    matched pair — dropping the input without the grouped centring would put the
+    opponent bias straight back into the advantage.
+
+    Consequence for consumers: `opp_onehot` is **ignored** by v3 (and may be `None`),
+    so every call site keeps its signature and v1/v2 checkpoints keep working.
     """
 
     OPP_DIM = 3
 
-    def __init__(self, device, hidden_dim=64, *, obs_encoder=None, arch=CRITIC_ARCH_V2):
+    def __init__(self, device, hidden_dim=64, *, obs_encoder=None, arch=CRITIC_ARCH_V3):
         super().__init__()
-        if arch not in (CRITIC_ARCH_V1, CRITIC_ARCH_V2):
+        if arch not in (CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3):
             raise ValueError(f'unknown critic arch {arch!r}')
         # Obs dims (incl. the privileged vector) come from the paired encoder.
         enc = obs_encoder or latest_encoder()
@@ -328,14 +350,18 @@ class Critic(nn.Module):
         else:
             if 32 % CRITIC_GROUPS or hidden_dim % CRITIC_GROUPS:
                 raise ValueError(
-                    f'critic_v2 needs hidden_dim divisible by {CRITIC_GROUPS}, got {hidden_dim}')
+                    f'{arch} needs hidden_dim divisible by {CRITIC_GROUPS}, got {hidden_dim}')
             self.board_encoder = nn.Sequential(
                 self._conv_block(self.board_channels, 32),
                 self._conv_block(32, hidden_dim),
                 self._conv_block(hidden_dim, hidden_dim),
             )
 
-        head_in = 2 * hidden_dim + self.global_dim + self.OPP_DIM + self.priv_dim
+        # v3 drops the opponent one-hot from the head input (see the class docstring).
+        self.uses_opp_onehot = arch != CRITIC_ARCH_V3
+        head_in = 2 * hidden_dim + self.global_dim + self.priv_dim
+        if self.uses_opp_onehot:
+            head_in += self.OPP_DIM
         self.head = nn.Sequential(
             nn.Linear(head_in, hidden_dim),
             nn.ReLU(),
@@ -345,9 +371,9 @@ class Critic(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
-        # v1 checkpoints have no such parameter, so it only exists on v2.
+        # v1 checkpoints have no such parameter, so it only exists on v2 and later.
         self.board_only_head = (nn.Linear(2 * hidden_dim, 1)
-                                if arch == CRITIC_ARCH_V2 else None)
+                                if arch != CRITIC_ARCH_V1 else None)
 
     @staticmethod
     def _conv_block(cin, cout):
@@ -403,10 +429,26 @@ class Critic(nn.Module):
         """Board trunk + flank pool. -> [B, 2*hidden_dim]"""
         return _split_pool(self.board_encoder(board_enc))
 
+    def _head_input(self, pooled, global_feats, opp_onehot, privileged):
+        """Assemble the value head's input, with or without the opponent one-hot.
+
+        `critic_v3` drops the one-hot (class docstring), so it accepts `None` there and
+        ignores anything passed — which is what lets every existing call site keep its
+        signature while v1/v2 checkpoints still load and still receive their block.
+        """
+        if not self.uses_opp_onehot:
+            return torch.cat([pooled, global_feats, privileged], dim=-1)
+        if opp_onehot is None:
+            raise ValueError(
+                f'{self.arch} was trained with the opponent one-hot and cannot be evaluated '
+                f'without one; pass a (B, {self.OPP_DIM}) tensor, or use a critic_v3 '
+                f'checkpoint if you want an opponent-independent value.'
+            )
+        return torch.cat([pooled, global_feats, opp_onehot, privileged], dim=-1)
+
     def _forward(self, board_enc, global_feats, opp_onehot, privileged):
         pooled = self._pooled(board_enc)  # [B, 2*hidden_dim]
-        combined = torch.cat([pooled, global_feats, opp_onehot, privileged], dim=-1)
-        return self.head(combined).squeeze(-1)
+        return self.head(self._head_input(pooled, global_feats, opp_onehot, privileged)).squeeze(-1)
 
     def board_only_value(self, board_enc):
         """Value predicted from the BOARD ALONE. -> [B]  (critic_v2 only.)
@@ -440,12 +482,15 @@ class Critic(nn.Module):
         The critic's own board_encoder is still used (and trained) via value_batch.
         """
         pooled = _split_pool(feat)  # [B, 2*hidden_dim]
-        combined = torch.cat([pooled, global_t, opp_onehot, privileged], dim=-1)
+        combined = self._head_input(pooled, global_t, opp_onehot, privileged)
         return self.head(combined).squeeze(-1).squeeze(0)
 
     def value_batch(self, batch):
         """V(s) for a pre-encoded batch.
 
-        Expects batch keys: board, global, opp_onehot (N,3), privileged (N,PRIV_DIM).
+        Expects batch keys: board, global, privileged (N,PRIV_DIM), plus opp_onehot
+        (N,3) — required by `critic_v1`/`critic_v2`, ignored (and optional) on
+        `critic_v3`.
         """
-        return self._forward(batch['board'], batch['global'], batch['opp_onehot'], batch['privileged'])
+        return self._forward(batch['board'], batch['global'], batch.get('opp_onehot'),
+                             batch['privileged'])

@@ -255,3 +255,42 @@ is one push to restore a trustworthy yardstick before training longer.
 | **Tactic-lead logging (idea 9)** | `eval_bucketed.py` records `tactic_base_leads` — base-lead at every tactic initiation — and prints the reverse-causation vs. execution-gap read for the "tactics correlate with losing" finding (11.5% usage, WR 0.696 with vs 0.915 without). Logging only; no conclusion was ever written up. |
 | **Measured effect (mixed, not attributable)** | The first v11 + `hidden_dim=128` checkpoint (`ckpt_20260727-0506`) ranked **BT-Elo 923 — last of four** in a gauntlet against three prior v10/`hidden_dim=64` checkpoints (1000–1043). The drop was never diagnosed (under-training vs. self-play-pool overfitting vs. the features/width themselves), and the owed re-tests were dropped when the effort moved to `docs/independent_opponents.md`. The same checkpoint is, however, the **strongest** agent in the later 30-round ExIt field (1156.1, beating all 30 of its own distilled descendants — `independent_opponents.md` §1). |
 | **What it did *not* fix** | The blind spots these ideas targeted survived: as of 2026-07-28 the policy still essentially never bolsters and doesn't use unit-specific tactics. That negative result is what produced the coverage diagnosis in `docs/independent_opponents.md` — no opponent in the repo bolsters or punishes its absence, so an exploration bonus alone has nothing to reinforce. |
+
+---
+
+## Critic hygiene: the opponent one-hot dropped, its offset moved to the advantage (2026-08-09)
+
+*Source: `docs/next_iteration.md` §3.5 and §5 row 6. Two changes that only make sense as a pair;
+neither is safe alone. No `OBS_VERSION` bump — this is an arch + advantage change, not an
+observation change. Every prior critic checkpoint still loads (v1 ×4, v2 ×1 on disk).*
+
+**The problem.** `Critic` took a 3-wide opponent one-hot (`random`/`greedy`/`pool`) alongside the
+board, globals and privileged vector. It moved the output more than the position did: `V(start)`
+spanned **0.747** across the three slots against a **0.44** std of `V` across *positions* (§3.5).
+That was not a modelling error — the win rates really are 1.000 / 0.825 / 0.525 against
+random / greedy / self, so a critic blind to the opponent must under-predict against weak ones and
+over-predict against strong ones, and `A = G − V` then carries a per-opponent **offset** that makes
+every action taken against `random` look good and every action against a snapshot look bad,
+whatever the action was. The one-hot bought that back, at three costs: it is dead weight during
+finetune (`p_random = p_greedy = 0`, and the search bots are mapped onto the `pool` slot anyway),
+it made the raw output meaningless to every consumer outside the training loop (each search bot has
+to pick a slot arbitrarily, on top of return normalisation), and it let the head satisfy part of
+the loss without reading the state at all.
+
+| What changed | Detail |
+|---|---|
+| **`critic_v3`** (`policy.py`, now the default) | v2's GroupNorm trunk and board-only auxiliary head, minus the one-hot: `head_in` drops by `OPP_DIM=3`. `Critic.uses_opp_onehot` says which behaviour an instance has; `_head_input` assembles the head vector accordingly, so **every existing call site keeps its signature** — v3 ignores an `opp_onehot` it is handed and accepts `None`, v1/v2 still require one and raise a named error rather than silently zero-filling. A new arch rather than a mutation of v2, because `warchest_critic_20260808-0607.pth` is a v2 checkpoint and it is the one that demonstrated the trunk fix (§3.4). |
+| **Per-opponent advantage centring** (`rollout_buffer.py`) | `compute_gae(adv_norm='per_opponent')`, the new default, subtracts each opponent group's own mean advantage before applying **one shared std**. Deliberately mean-only: returns against `random` have far less spread than returns against a snapshot, so per-group *z-scoring* would amplify the near-deterministic group's noise up to the weight of the group carrying the real signal. `adv_norm='global'` reproduces every pre-2026-08-09 run and is the A/B baseline. |
+| **Why the pair is safe** | The offset is constant across the siblings of a state (the opponent does not change within a decision), so it cancels in the sibling comparison *and* in `δ_t = r_t + γV(s_{t+1}) − V(s_t)` — the ranking work the critic does is untouched by removing it. What the one-hot was actually buying was absolute level, and the advantage is where that level mattered. |
+| **A finer group than the critic ever had** | `rollout_core.OPP_GROUP_IDX` (5 labels + a warned fallback) is **not** `OPP_ONEHOT_SLOT`, which collapses `lookahead_critic`/`puct` onto `pool` for v1/v2 checkpoint compatibility. Finetune is 75 % `pool` / 25 % `lookahead_critic` — two opponents of genuinely different strength — so grouping them together would have left in exactly the offset being removed. The id feeds no network, so adding a label breaks no checkpoint. |
+| **Small-group fallback** | A group below `MIN_GROUP_SAMPLES = 64` keeps the batch mean instead of its own: a mean estimated from a handful of correlated steps is noise, and subtracting it injects bias rather than removing it. The batch is then re-centred so the mean advantage is still exactly 0 — a non-zero mean is a uniform push on every sampled action. |
+| **Visibility** | `adv_group_spread` (max − min of the removed offsets) is logged per batch and to W&B, with the per-opponent offsets printed by name. It is the quantity that justifies the change: how much of the raw advantage was opponent identity rather than action quality. Measured on a 6-episode smoke run at `random`/`greedy` 50/50: **0.37–0.54**, with `random` consistently above `greedy`, i.e. the predicted sign. Pairing `critic_v3` with `adv_norm='global'` logs a warning at startup — that combination removes the offset nowhere. |
+| **Tool fix that rode along** | `eval_privileged_ablation.py` hardcoded the head's block offsets `[pooled \| global \| opp_onehot \| privileged]`. On a v3 head every block after `global` would have been off by 3 and the sensitivity report silently wrong; the layout is now built from the arch and asserted against `head_in`. |
+| **Tests** | `tests/test_rollout_buffer.py` (new, 10 tests) pins the advantage half — offset removal, that groups are *not* individually rescaled, unit std, zero mean under the fallback, `global` still biased, and the group labelling. `tests/test_critic_arch.py` gains 5 v3 tests. Full suite: **181 passed**. |
+
+**Not included, deliberately:** a shared policy/critic encoder with stop-gradient. `next_iteration.md`
+§4 demotes it to a parameter-count optimisation — it measured a wash against the critic's own trunk
+at matched readout, and it would cap the critic at the actor's representation.
+
+**Owed:** the gate is *pooled R² holds ~0.20* (§5 row 6), which needs a training run plus
+`eval_board_value.py fit`. Until that runs, this is an implemented change with no measured effect.

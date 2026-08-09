@@ -585,6 +585,60 @@ stay alive. The critic's trunk feeds two numbers per channel into a head with 29
 non-spatial inputs that already contain the dominant predictor. Even the *healthy* v10 critic
 draws only **14.1 %** of head sensitivity from the board vs **76.2 %** from globals.
 
+#### What the fix bought, measured (2026-08-08) — `critic_v2` trained and scored
+
+First `critic_v2` run: `data/warchest_critic_20260808-0607.pth`, obs v11, hidden 192. Scored
+against the shipped dead critic on `data/la16_labels.pt`, same instrument, same labels.
+
+The trunk is alive and carrying information — the thing the fix existed to do:
+
+| | arch | per-conv alive | `out_std` |
+|---|---|---|---|
+| `20260727-0506` | `critic_v1` | `[0.3876, 0.3568, **0.0000**]` | **0** |
+| `20260808-0607` | `critic_v2` | `[0.4250, 0.2620, 0.1852]` | **0.116** |
+
+**The decisive column is `tied`, not `corr`.** The dead critic could not express a preference
+at all on the pairs the board alone separates; the new one ranks every one of them:
+
+| bucket | n | old tie rate → new | old acc → new | Δ, 95 % CI (state-clustered) |
+|---|---|---|---|---|
+| **board differs, same verb** | 396 | 34 % → **0 %** | **46.0 % → 55.8 %** | **+9.8 pp [+1.3, +18.8] — resolved** |
+| board differs, non-board SAME | 148 | 93 % → **0 %** | 50.3 % → 55.4 % | +5.1 pp [−3.7, +13.9] |
+| all pairs | 2694 | 5 % → **0 %** | 56.9 % → 58.3 % | +1.4 pp [−2.3, +5.4] |
+| board IDENTICAL | 824 | 0 % → 0 % | 59.0 % → 58.9 % | −0.1 pp [−5.1, +4.8] |
+
+Three readings:
+
+- **The gate passed.** Same-verb accuracy came off 46.0 % — which was *below chance*, i.e. the
+  dead critic was actively misleading exactly where position is the only difference — to
+  55.8 %, and the contrast resolves. `top1` rose 30.7 % → **38.7 %** against a 26.5 % chance
+  rate, which is the quantity search consumes directly.
+- **Nothing regressed.** The board-identical bucket (economy choices, where only globals can
+  rank) is unchanged at −0.1 pp. The board pathway was added without costing the globals
+  pathway — the main risk of the aux head, and it did not materialise.
+- **Headroom remains.** The healthy v10 critic scores 61.1 % on the same-verb bucket and
+  Spearman 0.222; `critic_v2` reaches 55.8 % and 0.198. Most of the gap to a healthy critic is
+  closed, not all of it. (v10 is a different obs era and run, so this is a reference point,
+  not a clean comparison.)
+
+**One thing to watch: the new critic's output has much heavier tails.** Pooled `corr` *fell*
+0.184 → 0.069 and `R²` worsened −0.175 → −0.369, while every rank-based metric rose
+(Spearman 0.142 → 0.198, pair-acc 56.9 % → 58.3 %). That is not a ranking regression — it is
+outliers, and the check is direct:
+
+| | kurtosis (3 = normal) | max \|z\| | frac \|z\| > 4 | corr | corr minus top 1 % \|z\| |
+|---|---|---|---|---|---|
+| `critic_v1` | 8.2 | 6.2 | 0.65 % | +0.184 | +0.180 |
+| `critic_v2` | **20.2** | **9.3** | **1.12 %** | +0.069 | **+0.119** |
+
+Dropping the most extreme 1 % of predictions recovers most of v2's Pearson deficit
+(+0.069 → +0.119) and barely moves v1's (+0.180). Pearson measures a *linear* fit and is
+dominated by outliers; Spearman and pairwise accuracy are rank-based and are what
+`PuctBot`/`LookaheadCriticBot` actually consume, so the operative metrics improved. The `R²`
+move is pure calibration, as the tool's own HOW TO READ says. **But the tails are worth
+tracking**: `LookaheadCriticBot` calibrates on the raw value scale, and a 9 σ output could
+distort PUCT. If search behaves oddly after this change, look here first.
+
 **A second failure mode, found while implementing the guard (2026-08-07).** GroupNorm makes
 the absorbing state *unreachable*, which is the point — but it also makes the alive fraction
 a **useless** guard on its own. Force the last conv to a constant −50 and:
@@ -633,6 +687,34 @@ return normalisation (`return_mean = 0.214`, `return_std = 0.690`), so the raw o
 z-score of a *shaped* return, never a win probability. Clean replacement when the critic is
 next touched: group `rollout_buffer.py:181`'s advantage z-scoring by opponent type and drop
 the input.
+
+#### Done 2026-08-09 (§5 row 6) — and why the pair is safe
+
+`critic_v3` (now the default) is v2 minus the one-hot; `RolloutBuffer.compute_gae(adv_norm=
+'per_opponent')` (now the default) subtracts each opponent group's own mean advantage before
+applying one shared std. Full record in `docs/history.md`. Three points worth pinning here,
+because each was a live question while implementing it:
+
+- **Removing the input costs the critic nothing where it ranks.** The offset is constant across
+  the siblings of a state — the opponent does not change within a decision — so it cancels in
+  the sibling comparison *and* in `δ_t = r_t + γV(s_{t+1}) − V(s_t)`. What the one-hot bought
+  was absolute level, and the advantage is the only place that level was doing work. This is
+  also why the change composes with a lower `λ` rather than fighting it (`IDEAS.md` L2).
+- **Mean-only, not per-group z-scoring.** Returns against `random` have far less spread than
+  returns against a snapshot, so rescaling each group to unit variance would hand the
+  near-deterministic group as much gradient weight as the group carrying the real signal. One
+  shared std; per-group means only. Pinned by `tests/test_rollout_buffer.py`.
+- **The grouping is finer than the one-hot ever was.** `OPP_GROUP_IDX` gives
+  `lookahead_critic`/`puct` their own groups, which `OPP_ONEHOT_SLOT` cannot (it collapses them
+  onto `pool` to keep v1/v2 checkpoints loadable). Finetune is 75 % `pool` / 25 %
+  `lookahead_critic`; grouping those together would have left in exactly the offset being
+  removed.
+
+`adv_group_spread` is logged per batch — the max−min of the removed offsets, i.e. how much of
+the raw advantage was opponent identity rather than action quality. A 6-episode smoke run at
+`random`/`greedy` 50/50 measured **0.37–0.54** with `random` above `greedy`, the predicted sign.
+Expect it to shrink in finetune as the pool narrows. **The gate (pooled R² ~0.20) has not been
+run**; this is implemented, not measured.
 
 ### 3.6 The critic is not biased against any verb *(label-dependent)*
 
@@ -744,10 +826,11 @@ Two methodological rules this investigation produced, worth keeping:
 | 1c | ~~Fit `board_solo` properly~~ | done | — | **done 2026-08-07:** pooled R² **0.1846** vs the globals-only control's 0.1633 — the board alone out-predicts every non-board feature. Trunk 43.2 % alive with no globals to hide behind (§3.1a, §3.4) |
 | 2a | ~~**Dump shaped returns** from `ppo.py`'s rollout~~ | done | — | **shipped 2026-08-07:** `--dump-returns-dir`. Writes `round*.npz` with the shaped GAE return under the key `z`, so `eval_board_value.py fit --data` reads it with no code change (verified end to end). Still needs a short run to fill it |
 | 2b | **Critic target A/B** — a `fit` arm on shaped returns vs `z`, scored on `data/la16_labels.pt` (§2 step 2, §3.3b) | hours after a run | no | does the ~2× gap survive at matched `hidden_dim` and data? If yes, ExIt's `MSE(critic, z)` is the single biggest identified defect |
-| 3 | ~~**Critic trunk** — GroupNorm + board-only auxiliary head + health guard~~ | done | — | **shipped 2026-08-07:** `critic_v2` is the default arch; `--critic-arch critic_v1` reproduces the old baseline, `--aux-board-coeff` (default 0.1) weights the board-only head. Guard logs `alive1..3`/`out_std`/`board_aux` per batch to console and W&B and alarms on collapse. 21 regression tests in `tests/test_critic_arch.py`. **Now needs a training run to verify the trunk stays alive** |
+| 3 | ~~**Critic trunk** — GroupNorm + board-only auxiliary head + health guard~~ | done | — | **shipped 2026-08-07, trained and verified 2026-08-08 (§3.4).** Trunk alive (`[0.425, 0.262, 0.185]`, `out_std` 0.116 vs the dead critic's 0.000); tie rate on positional pairs **93 % → 0 %**; same-verb accuracy **46.0 % → 55.8 %**, +9.8 pp CI [+1.3, +18.8]; no regression on economy pairs. `--critic-arch critic_v1` reproduces the old baseline. **Gate met — row closed.** |
+| 3b | **Head-to-head: `critic_v2` vs `critic_v1` in the gauntlet** — the behavioural check the within-state metric cannot give (see the Appendix command) | ~1 h | no | does the ranking gain convert to wins? A 6-game smoke run went 6/6 to `critic_v2`; needs ~200 games before it means anything |
 | 4 | **Quiescence in `LookaheadBot`** (§2 step 3) | 1–2 days | no | board-only tie rate well below 89 %; beats plain `lookahead` head to head; bolster/tactic rates rise without losing WR |
 | 5 | **Conditional metrics** in `eval_bucketed`, baselined on today's checkpoint | hours | no | must exist before any run: `P(bolster \| own unit on my base ∧ stack 1 ∧ enemy in reach ∧ matching coin)`, base retention, steal-after-kill rate, forward progress by unit tier |
-| 6 | **Remaining critic hygiene** — drop `opp_onehot` + per-opponent advantage normalisation, one `critic_v2` arch. Shared encoder + stop-gradient is **not** part of this (§4: demoted to an optimisation) | ½ day | no | pooled R² holds ~0.20 |
+| 6 | ~~**Remaining critic hygiene** — drop `opp_onehot` + per-opponent advantage normalisation~~. Shared encoder + stop-gradient is **not** part of this (§4: demoted to an optimisation) | done | no | **shipped 2026-08-09** as `critic_v3` (default) + `--adv-norm per_opponent` (default); see §3.5 and `docs/history.md`. Landed as a *new* arch, not a mutation of v2 — `warchest_critic_20260808-0607.pth` is v2 and is the checkpoint that proved row 3. 181 tests pass; all five prior critic checkpoints still load. **Gate still open:** pooled R² holds ~0.20, which needs a run + `fit` |
 | 7 | **Conditional-bolster overlay** on `SimGreedyBot` — the never-run clean test of the domain claim | hours | no | paired seeds vs the unmodified bot |
 | 8 | **▶ FIRST TRAINING RUN** — contents decided by 2, 3 and 4 | a run | **YES** | gauntlet Elo holds/rises **and** step-5 conditional metrics move off the floor |
 | 9 | `puct` vs `lookahead` vs the **raw policy** (never run) | ~1 h | no | if search over the critic does not beat the policy guiding it, search contributes nothing. Must run *after* row 3 (the trunk fix): every search result on record used a board-blind leaf |
@@ -761,9 +844,11 @@ the two findings this document was built on (the heuristic as positional referen
 as within-state dead end) both reversed. Quiescence slipped from first to fourth; it is still
 justified, on a narrower argument.
 
-**Both row 2a and row 3 are implemented; what is left is running them.** One training run
-with `--dump-returns-dir` set does double duty: it verifies the trunk stays alive (row 3's
-gate) *and* fills the dataset row 2b needs. Nothing else in this list is blocked.
+**Row 3 is done and its gate is met (§3.4).** The head of the list is now row 2b — the
+critic-target A/B — which needs one PPO run with `--dump-returns-dir` to fill its dataset. If
+the 2026-08-08 run was launched without that flag, the dataset does not exist yet and the
+cheapest way to get it is to set the flag on the next run rather than to run one for it alone.
+Row 3b (head to head) is independent and costs an hour.
 
 **Do not raise `--playouts` below 16 again for any within-state measurement.** Two headline
 conclusions in this document flipped sign on that parameter alone.
@@ -840,8 +925,26 @@ python src/app/eval_board_value.py siblings --labels data/la16_labels.pt \
 # and score the new critic against the dead one on the same labels
 python src/app/eval_board_value.py siblings --labels data/la16_labels.pt \
     --critic-path data/warchest_critic_<new>.pth data/warchest_critic_20260727-0506.pth
-# read `board differs, same verb`: dead v11 scores 46.0%, alive v10 scores 61.1%.
+# read `board differs, same verb` and the `tied` column: dead v11 scores 46.0% at a 34% tie
+# rate, critic_v2 scores 55.8% at 0%, the healthy v10 reference is 61.1%.
 ```
+
+**Head to head in the gauntlet (§5 row 3b)** — the behavioural check the within-state metric
+cannot give. `--lookahead-critic-checkpoints` builds one `LookaheadCriticBot` per path, so the
+two critics play each other with everything else held identical; colours alternate per game:
+
+```bash
+python src/app/gauntlet.py --bots lookahead_critic \
+    --lookahead-critic-checkpoints data/warchest_critic_20260808-0607.pth \
+                                   data/warchest_critic_20260727-0506.pth \
+    --k-games 200 --lookahead-critic-time-budget 0.1
+```
+
+`--k-games` is games **per pair**, so this is 200 games; at 0.1 s/move budget expect roughly
+an hour on 8 workers. se(WR) at 200 games is ~3.5 pp, so read anything inside 50 % ± 7 pp as a
+draw. Agent names come from the run stamp (`c0808_0607` vs `c0727_0506`) — before 2026-08-08
+both would have rendered as the same `lac_warche` column, which made this exact comparison
+unreadable.
 
 ```bash
 python src/app/eval_board_value.py distinguish --games 40 --stride 3

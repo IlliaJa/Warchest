@@ -19,7 +19,7 @@ from src.services.environment.warchest_env import (
 )
 from src.services.environment.game_state import HAND_SIZE
 from src.services.environment.rollout_core import (
-    play_episode, SHAPING_C, C_MAT, OPP_TYPE_IDX,
+    play_episode, SHAPING_C, C_MAT, OPP_TYPE_IDX, OPP_GROUP_IDX,
 )
 from src.services.opponent_pool import OpponentPool
 from src.services.rollout_collector import ParallelRolloutCollector
@@ -38,6 +38,8 @@ from src.utils.elo import EloTracker
 SHAPING_ANNEAL_INIT = 1.0
 SHAPING_ANNEAL_FINAL = 0.1
 SHAPING_ANNEAL_HALF_FRAC = 0.5
+# Reverse of OPP_GROUP_IDX, so the per-opponent advantage offsets log by name.
+OPP_GROUP_NAME = {v: k for k, v in OPP_GROUP_IDX.items()}
 use_wandb = False
 
 logger = logging.getLogger('warchest')
@@ -176,6 +178,18 @@ class PPOTrainer:
             'p_lookahead_critic': hp['p_lookahead_critic_finetune'],
             'p_puct': hp.get('p_puct_finetune', 0.0),
         }
+        # Advantage normalisation (docs/next_iteration.md §5 row 6). 'per_opponent' centres
+        # advantages inside each opponent group, which is what lets `critic_v3` drop the
+        # opponent one-hot without putting the opponent-identity offset back into the policy
+        # gradient — the two are a matched pair. 'global' reproduces every pre-2026-08-09 run.
+        self._adv_norm = hp.get('adv_norm', 'per_opponent')
+        if not critic.uses_opp_onehot and self._adv_norm != 'per_opponent':
+            logger.warning(
+                f'critic arch {critic.arch} has no opponent one-hot but adv_norm='
+                f'{self._adv_norm!r}: nothing removes the per-opponent advantage offset, so '
+                f'actions taken against weak opponents get a systematically positive '
+                f'advantage. Use --adv-norm per_opponent unless this is a deliberate ablation.'
+            )
         self._lookahead_critic_time_budget = hp['lookahead_critic_time_budget']
         self._puct_time_budget = hp.get('puct_time_budget', 0.1)
         # Dense critic targets (docs/IDEAS.md #12): also regress the critic on opponent-
@@ -317,7 +331,8 @@ class PPOTrainer:
                 # --- values + GAE (main process / GPU) ---
                 tv = time.perf_counter()
                 self._compute_values_batched()
-                self._buffer.compute_gae(self._gamma, self._lam, self._device)
+                self._buffer.compute_gae(self._gamma, self._lam, self._device,
+                                         adv_norm=self._adv_norm)
                 self._ret_normalizer.update(self._buffer.returns)
                 self._maybe_dump_returns(batch_num)
                 self._t_value_pass = time.perf_counter() - tv
@@ -445,11 +460,11 @@ class PPOTrainer:
             max_t=self._max_t,
             collect_dense=self._dense_critic,
         )
-        for obs, action, log_prob, reward, opp_onehot, privileged in zip(
+        for obs, action, log_prob, reward, opp_onehot, privileged, opp_id in zip(
             steps['obs'], steps['actions'], steps['log_probs'],
-            steps['rewards'], steps['opp_onehots'], steps['privileged'],
+            steps['rewards'], steps['opp_onehots'], steps['privileged'], steps['opp_ids'],
         ):
-            self._buffer.add_step(obs, action, log_prob, reward, opp_onehot, privileged)
+            self._buffer.add_step(obs, action, log_prob, reward, opp_onehot, privileged, opp_id)
         if self._dense_critic and 'aux_targets' in steps:
             self._buffer.add_aux_steps(
                 steps['aux_boards'], steps['aux_globals'], steps['aux_opp_onehots'],
@@ -889,6 +904,21 @@ class PPOTrainer:
             f'pool={len(self._pool)} turns={avg_turns:.0f} invalid={total_invalid} '
             f't={time.time() - self._batch_start:.2f}s'
         )
+        # Per-opponent advantage offsets (docs/next_iteration.md §5 row 6). `adv_spread` is
+        # the quantity that justifies the whole change: it is how much of the raw advantage
+        # was pure opponent identity rather than action quality. It should be clearly
+        # non-zero in the initial phase (random vs greedy vs pool are very different
+        # opponents) and shrink in finetune as the pool narrows. A spread that stays large
+        # while `adv_norm='global'` means that bias is going straight into the policy
+        # gradient.
+        offsets = self._buffer.adv_group_offsets
+        if offsets:
+            spread = max(offsets.values()) - min(offsets.values())
+            logger.info(
+                f'batch={batch_num} adv_norm={self._adv_norm} adv_spread={spread:.4f} '
+                + ' '.join(f'{OPP_GROUP_NAME.get(g, g)}={m:+.4f}'
+                           for g, m in sorted(offsets.items()))
+            )
         logger.info(
             f'batch={batch_num} score_parts (per-ep mean): '
             f'attack={r_attack:.3f} shaping={r_shaping:.3f} holding={r_holding:.3f} '
@@ -923,6 +953,10 @@ class PPOTrainer:
                 **{k: v for k, v in s.items() if k.startswith('critic_trunk_alive')},
                 'critic_board_aux': s['avg_critic_board_aux'],
                 'advantage_std': self._buffer.raw_adv_std,
+                # How much of the raw advantage was opponent identity rather than action
+                # quality (docs/next_iteration.md §5 row 6). 0.0 under adv_norm='global'.
+                'adv_group_spread': (max(offsets.values()) - min(offsets.values())
+                                     if offsets else 0.0),
                 'avg_turns': avg_turns,
                 'entropy_coeff': self._entropy_coeff,
                 'lr': self._actor_optimizer.param_groups[0]['lr'],
@@ -956,14 +990,24 @@ if __name__ == '__main__':
         help='Weight of the dense auxiliary critic loss (only used with --dense-critic-targets).')
     parser.add_argument(
         '--critic-arch', choices=CRITIC_ARCHS, default=CURRENT_CRITIC_ARCH,
-        help="Critic architecture. 'critic_v2' (default) adds GroupNorm to the board trunk "
-             'and a board-only auxiliary head; the un-normalised critic_v1 trunk provably '
-             'dies (docs/next_iteration.md §3.4). Pass critic_v1 only to reproduce a baseline.')
+        help="Critic architecture. 'critic_v3' (default) is GroupNorm + a board-only "
+             'auxiliary head, minus the opponent one-hot (§5 row 6 — that offset now comes '
+             'out of the advantage instead, see --adv-norm). critic_v2 is the same net WITH '
+             'the one-hot; the un-normalised critic_v1 trunk provably dies '
+             '(docs/next_iteration.md §3.4). Pass an older arch only to reproduce a baseline.')
     parser.add_argument(
         '--aux-board-coeff', type=float, default=0.1,
-        help='Weight of the board-only auxiliary value loss (critic_v2 only). This is what '
+        help='Weight of the board-only auxiliary value loss (critic_v2 and later). This is what '
              'gives the board trunk gradient pressure the main head does not supply; 0 '
              'disables it and lets the trunk drift toward the v1 failure mode.')
+    parser.add_argument(
+        '--adv-norm', choices=('per_opponent', 'global'), default='per_opponent',
+        help="How advantages are normalised. 'per_opponent' (default) subtracts each "
+             'opponent group\'s own mean before applying one shared std, removing the '
+             'per-opponent offset a state-only critic cannot predict (win rates are '
+             '1.000/0.825/0.525 vs random/greedy/self). Pair it with --critic-arch '
+             "critic_v3. 'global' is the historical single mean/std — use it as the A/B "
+             'baseline, or with critic_v1/critic_v2, which carry the one-hot instead.')
     parser.add_argument(
         '--dump-returns-dir', default=None,
         help='If set, dump (critic input -> shaped GAE return) shards here as round*.npz, '
@@ -1092,6 +1136,7 @@ if __name__ == '__main__':
         # auxiliary head, so the trunk cannot enter the ReLU absorbing state and has a
         # gradient source the main head does not give it.
         'critic_arch': cli_args.critic_arch,
+        'adv_norm': cli_args.adv_norm,
         'aux_board_coeff': cli_args.aux_board_coeff,
         'trunk_health_every': 10,
         'dump_returns_dir': cli_args.dump_returns_dir,
