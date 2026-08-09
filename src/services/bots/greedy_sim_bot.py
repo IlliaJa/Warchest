@@ -38,12 +38,8 @@ the cheap obs-only one is kept as the training-loop opponent; this one is the
 gauntlet's `greedy` yardstick.
 """
 import math
-from collections import Counter
 
 from .lookahead_bot import LookaheadBot, _clone_state
-from ..environment.warchest_env import (
-    WarChestEnv, SPATIAL_SIZE, CONTROL_VERB, BOLSTER_VERB, DEPLOY_VERB_BASE, TACTIC_VERB,
-)
 
 
 class SimGreedyBot(LookaheadBot):
@@ -60,7 +56,7 @@ class SimGreedyBot(LookaheadBot):
     _TERMINAL_VALUE = 1e6
 
     def __init__(self, gamma=0.99, shaping_anneal=1.0, see_opponent_hand=True,
-                 rich_eval=False, reply_branching=8, name='greedy'):
+                 rich_eval=False, reply_branching=8, name='greedy', theta=None):
         # max_branching=0 (no cap) / time_budget=0.0 / max_depth=1 are inert here —
         # act() is overridden and drives its own fixed 2-ply-in-turns search, never
         # _minimax — but they keep the parent constructor (which builds _sim_env and
@@ -73,7 +69,7 @@ class SimGreedyBot(LookaheadBot):
         # standing eval bonuses. See docs/bots.md.
         super().__init__(time_budget=0.0, max_branching=0, see_opponent_hand=see_opponent_hand,
                          max_depth=1, gamma=gamma, shaping_anneal=shaping_anneal,
-                         rich_eval=rich_eval, name=name)
+                         rich_eval=rich_eval, name=name, theta=theta)
         # Cap on the opponent's candidate replies considered at the 2nd ply, taken
         # after LookaheadBot's cheap ordering key (attacks/captures first). Only the
         # *reply* is capped — root's own actions are always considered in full, so no
@@ -81,10 +77,9 @@ class SimGreedyBot(LookaheadBot):
         # own choice. The reply only needs to surface the punishing move, which the
         # ordering key ranks first anyway.
         self.reply_branching = reply_branching
-        # Rolling count of which verb class the bot actually committed to, for the
-        # "does it use the whole game now?" validation (docs/bots.md). Never read by
-        # the engine; purely diagnostic.
-        self.usage = Counter()
+        # `usage` / `_classify` are inherited from LookaheadBot (they moved there so both
+        # search depths report the same behaviour profile); this bot's own `act` override
+        # still has to do its own increment, since it never calls the parent's.
 
     def act(self, env) -> int:
         """Return an absolute-frame action id for `env.active_player`.
@@ -215,23 +210,3 @@ class SimGreedyBot(LookaheadBot):
             acc += self._own_action_reward(r) if own else 0.0
         return acc, None
 
-    @staticmethod
-    def _classify(action_id):
-        """Verb class of a committed action, for the usage counter."""
-        if action_id >= SPATIAL_SIZE:
-            kind, _ = WarChestEnv.decode_facedown(action_id)
-            return kind  # 'recruit' / 'claim_initiative' / 'pass' / 'decline'
-        verb, _, _ = WarChestEnv.decode_action(action_id)
-        if 6 <= verb <= 11:
-            return 'attack'
-        if verb == CONTROL_VERB:
-            return 'control'
-        if verb == BOLSTER_VERB:
-            return 'bolster'
-        if DEPLOY_VERB_BASE <= verb < TACTIC_VERB:
-            return 'deploy'
-        if verb == TACTIC_VERB:
-            return 'tactic'
-        if verb <= 5:
-            return 'move'
-        return 'select'

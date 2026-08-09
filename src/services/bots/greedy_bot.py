@@ -3,6 +3,7 @@ from collections import deque
 import numpy as np
 
 from .base import Bot
+from .board_geometry import N_CELLS, UNREACHABLE, distance_to
 from ..environment.warchest_env import (
     BOARD_DIM, SPATIAL_SIZE, N_COIN_TYPES, TACTIC_VERB,
     CONTROL_VERB, BOLSTER_VERB, DEPLOY_VERB_BASE, ROYAL_COIN_IDX,
@@ -80,20 +81,29 @@ class GreedyBot(Bot):
         return verb, cell // BOARD_DIM, cell % BOARD_DIM
 
     def _best_move_toward_base(self, moves, board):
+        """Lowest-id move whose destination is closest to a claimable base.
+
+        One multi-source BFS from every target, then an index per candidate — the
+        original ran a whole-board BFS per candidate move x per target, which is what
+        made this bot as expensive as a policy forward (docs/IDEAS.md Table A). The
+        selection is unchanged, including its tie-break (strict `<` over ascending
+        action ids) and its "no reachable target -> None" behaviour, which the caller
+        reads as "fall through to deploy"; `_bfs` below is kept as the reference
+        implementation both properties are tested against.
+        """
         # Targets: uncontrolled (ch2) or opponent base (ch4)
-        target_mask = (board[2] + board[4]) > 0
-        rows, cols = np.where(target_mask)
-        targets = list(zip(rows.tolist(), cols.tolist()))
-        if not targets:
+        target_mask = ((board[2] + board[4]) > 0).reshape(N_CELLS)
+        if not target_mask.any():
             return None
+        dist = distance_to(target_mask, board[0].reshape(N_CELLS) == 0)
 
         best_action = None
-        best_dist = float('inf')
+        best_dist = UNREACHABLE
         for action in moves:
             verb, r, q = self._decode(action)
             dr, dq = OFFSETS[verb]
-            new_pos = (r + dr, q + dq)
-            d = min(self._bfs(new_pos, t, board) for t in targets)
+            new_pos = (r + dr) * BOARD_DIM + (q + dq)
+            d = dist[new_pos]
             if d < best_dist:
                 best_dist = d
                 best_action = action

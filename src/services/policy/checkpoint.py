@@ -36,12 +36,15 @@ CURRENT_ARCH = 'policy_factored_v1'
 # HexConv+ReLU trunk — the one that dies (docs/next_iteration.md §3.4); `critic_v2` adds
 # GroupNorm plus a board-only auxiliary head; `critic_v3` is v2 minus the opponent
 # one-hot (§5 row 6 — the identity offset moves to grouped advantage normalisation
-# instead). Checkpoints of all three exist on disk (everything before 2026-08-07 is v1,
-# `warchest_critic_20260808-0607.pth` is v2) and the gauntlet must keep reconstructing
-# them, so `Critic` builds any of them on demand and callers pass the loaded `arch`
-# straight through. Never mutate a released arch in place — add the next one.
-CURRENT_CRITIC_ARCH = 'critic_v3'
-CRITIC_ARCHS = ('critic_v1', 'critic_v2', 'critic_v3')
+# instead); `critic_v4` is v3 with the flank-split average readout replaced by a
+# task-relevant gather (docs/IDEAS.md A2) — the 10 fixed base-cell features, masked
+# mean+max over own/opponent unit-occupied cells, and a whole-board mean+max. Checkpoints
+# of all four exist on disk (everything before 2026-08-07 is v1, `warchest_critic_
+# 20260808-0607.pth` is v2) and the gauntlet must keep reconstructing them, so `Critic`
+# builds any of them on demand and callers pass the loaded `arch` straight through.
+# Never mutate a released arch in place — add the next one.
+CURRENT_CRITIC_ARCH = 'critic_v4'
+CRITIC_ARCHS = ('critic_v1', 'critic_v2', 'critic_v3', 'critic_v4')
 # Checkpoints predating the `arch` key are all v1 by definition.
 LEGACY_CRITIC_ARCH = 'critic_v1'
 

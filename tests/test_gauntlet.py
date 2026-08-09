@@ -2,9 +2,11 @@
 import numpy as np
 import torch
 
+import pickle
+
 from src.services.gauntlet import (
-    play_game, round_robin, greedy_sim_agent, random_agent,
-    PolicyAgent, _bradley_terry_elo, _intransitive_fraction,
+    play_game, round_robin, greedy_sim_agent, random_agent, random_eval_agent,
+    build_agent, PolicyAgent, _bradley_terry_elo, _intransitive_fraction,
 )
 from src.services.policy.policy import Policy
 from src.services.environment.obs_encoders import latest_encoder
@@ -72,3 +74,50 @@ def test_round_robin_matrix_and_greedy_beats_random():
     # SimGreedyBot dominates RandomBot, so it should rate strictly higher.
     assert out['ratings']['greedy_sim'] > out['ratings']['random']
     assert 0.0 <= out['intransitive_fraction'] <= 1.0
+
+
+# --------------------------------------------------------------------------- #
+# Episode hook + the B1 random_eval entrant (docs/IDEAS.md B1)
+# --------------------------------------------------------------------------- #
+def test_play_game_calls_new_episode_on_agents_that_have_one():
+    """`RandomEvalBot` resamples θ from this hook; without the call, a resampling entrant
+    would silently play one fixed θ for the whole gauntlet.
+    """
+    class Spy:
+        name = 'spy'
+        calls = 0
+
+        def new_episode(self):
+            Spy.calls += 1
+
+        def act(self, env):
+            return env.get_possible_actions()[0]
+
+    play_game(Spy(), random_agent(), seed=0)
+    assert Spy.calls == 1
+
+
+def test_random_eval_spec_is_picklable_and_rebuilds_the_same_theta():
+    """Parallel gauntlet workers rebuild every agent from its spec, so the spec — not the
+    live bot — has to carry θ. A spec that lost θ would give each worker a different bot
+    under one column header.
+    """
+    theta = {'economy': 6.0, 'pos': 3.0}
+    spec = {'kind': 'random_eval', 'name': 're0eco',
+            'kwargs': {'theta': theta, 'seed': 4, 'reply_branching': 2}}
+    spec = pickle.loads(pickle.dumps(spec))  # what the worker actually receives
+    agent = build_agent(spec, device=torch.device('cpu'))
+    assert agent.name == 're0eco'
+    assert agent.theta['economy'] == 6.0 and agent.theta['pos'] == 3.0
+    assert agent.reply_branching == 2
+    # Pinned, not resampling: the antithetic draft pairing depends on it (see the bot's
+    # module docstring).
+    assert agent.resample_each_episode is False
+    before = dict(agent.theta)
+    agent.new_episode()
+    assert agent.theta == before
+
+
+def test_random_eval_agent_plays_a_full_gauntlet_game():
+    res = play_game(random_eval_agent(seed=1), random_agent(), seed=3)
+    assert res in (0, 1, 2)

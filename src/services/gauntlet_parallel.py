@@ -113,7 +113,8 @@ def _worker_loop(worker_id, task_q, result_q, log_q, agent_specs):
             result_q.put((worker_id, 'ERROR', traceback.format_exc()))
 
 
-def round_robin_parallel(agent_specs, names, *, k_games=20, seed=0, n_workers, tasks=None):
+def round_robin_parallel(agent_specs, names, *, k_games=20, seed=0, n_workers, tasks=None,
+                         paired=False):
     """Parallel equivalent of `gauntlet.round_robin`, given agent specs (not live agents).
 
     `names` must be the display names in the same order `agent_specs` implies
@@ -135,7 +136,7 @@ def round_robin_parallel(agent_specs, names, *, k_games=20, seed=0, n_workers, t
     """
     n = len(agent_specs)
     if tasks is None:
-        tasks = build_task_list(n, k_games=k_games, seed=seed)
+        tasks = build_task_list(n, k_games=k_games, seed=seed, paired=paired)
     tasks = _prioritize(tasks, agent_specs)
 
     ctx = mp.get_context('spawn')

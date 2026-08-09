@@ -175,6 +175,10 @@ class ObsEncoderV11:
     board_channels = BOARD_CHANNELS
     global_dim = GLOBAL_DIM
     priv_dim = PRIV_DIM
+    # Which board-plane channels hold own/opponent unit-stack counts, for readouts
+    # (Critic's A2 gather-pool) that need per-cell occupancy rather than raw features.
+    own_unit_channels = slice(OWN_UNIT_PLANE_BASE, OWN_UNIT_PLANE_BASE + NUM_UNIT_TYPES)
+    opp_unit_channels = slice(OPP_UNIT_PLANE_BASE, OPP_UNIT_PLANE_BASE + NUM_UNIT_TYPES)
 
     def observation_space(self):
         return gym.spaces.Dict({

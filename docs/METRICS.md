@@ -23,6 +23,18 @@ Win rates measured every `eval_every` batches against fixed opponents (RandomBot
 
 ---
 
+### `score_vs_reference_eval` / `wr_vs_reference_eval` / `draw_rate_vs_reference_eval` — vs the previous generation
+
+Result of playing the current policy against a **frozen saved checkpoint**, `eval_episodes` games every `eval_every` batches. The checkpoint is the newest `data/warchest_ppo_*.pth` by mtime unless `--reference-policy` names one, and — this is the part that makes the number mean anything — it is resolved **once at startup**, before the first batch. Resolving it per eval would let checkpoints the run itself saves become its own baseline, which pins the score near 0.5 no matter how much the policy gains. `--no-reference-eval` skips the match; so does a `data/` with no policy checkpoint in it (a first run has nothing to compare against, and the run logs that at startup).
+
+`score_vs_reference_eval` is the one to read: `(wins + 0.5 × draws) / n`, so **0.5 is parity** with the saved generation and above it the current policy is ahead. Prefer it to `wr_vs_reference_eval` — truncations count for neither side and are common in a near-mirror match, so the bare win rate sags as games get longer even when nothing regressed. `draw_rate_vs_reference_eval` is there to tell those two cases apart.
+
+These games are deliberately **not** fed into the Elo tracker: the reference plays nobody but the current policy, so the pair would float freely and drag `elo_policy` off the greedy/random anchor that makes it comparable across runs.
+
+**Trend:** should sit above 0.5 and drift up. Sustained ≤ 0.5 means the run is not beating the checkpoint it started from. Note the baseline differs between runs — the W&B config records it as `reference_policy`, and two runs' numbers are only comparable when that matches.
+
+---
+
 ## Elo metrics
 
 ### `elo_policy` / `elo_greedy` — Elo ratings
@@ -110,12 +122,12 @@ against). A collapse to near 0 *early* still means premature convergence.
 - `entropy_frac` = `entropy / max_entropy` — the decisive-ness ratio. 1.0 = random, target
   ~0.4–0.5 by end of run. This is the number to watch instead of raw entropy.
 
-### `score_attack` / `score_shaping` / `score_holding` / `score_material` / `score_terminal` / `score_other`
+### `score_attack` / `score_shaping` / `score_holding` / `score_material` / `score_terminal` / `score_other` / `score_tempo`
 
 **What it measures:** the per-episode-mean decomposition of `score` into its reward sources
 (attack rewards, base-diff potential shaping `γφ′−φ`, the annealed holding reward, the annealed
-material-PBRS term, terminal win/loss/truncation, and everything else — move penalties etc.).
-The six sum to `score`.
+material-PBRS term, terminal win/loss/truncation, the per-turn tempo cost, and everything else).
+The seven sum to `score`.
 
 **Why it matters:** catches **proxy/objective decoupling** — the failure mode on the
 `ppo_20260630-060400` run (see `docs/history.md`) where `score` rose +50 % while win rate
@@ -124,6 +136,17 @@ stayed flat. If
 farming dense reward instead of learning to win. `score_terminal` should be the component that
 rises over training; watch `score_holding` for stalling (persistently positive + rising
 `avg_turns` = sitting on a lead instead of closing).
+
+**Two changes on 2026-08-09** (`docs/IDEAS.md` L8) that break comparison across that boundary:
+
+- `score_attack` is **~0 by construction** now — `ATTACK_REWARD` was zeroed because material
+  PBRS already pays the box-a-coin event. Read the attack axis off `score_material` instead.
+  The key is kept so older runs stay plottable, not because it still measures anything.
+- `score_tempo` is new: the per-turn tempo cost, peeled out of `score_attack`/`score_other`
+  so it cannot masquerade as either. It is ≈ `-0.002 × (main-actor turns)`, so it doubles as a
+  clean read on **episode length in turns** — and, against `n_decisions`, on how many main-actor
+  clicks were free continuations rather than fresh turns (the gap is exactly the tactic and
+  bonus-maneuver usage that `score_tempo` used to be charged for).
 
 ---
 
@@ -211,3 +234,4 @@ Std of GAE advantages before normalisation. Should be non-zero (> 0.05) — near
 | `entropy` | ~1.8 (≈ max) | decreasing | 0.7 – 0.9 | flat near 1.3, or collapses to 0 early |
 | `wr_vs_random_eval` | 0 | rising | > 0.90 | not rising by batch 50 |
 | `wr_vs_greedy_eval` | 0 | rising | > 0.60 | flat after finetune phase |
+| `score_vs_reference_eval` | < 0.5 | rising past 0.5 | > 0.5 | still ≤ 0.5 late in the run |

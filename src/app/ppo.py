@@ -1,3 +1,4 @@
+import glob
 import logging
 import os
 import sys
@@ -16,12 +17,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 from src.services.policy.policy import Policy, Critic
 from src.services.policy.checkpoint import (
-    save_policy_checkpoint, save_critic_checkpoint, CRITIC_ARCHS, CURRENT_CRITIC_ARCH,
+    save_policy_checkpoint, save_critic_checkpoint, load_policy_checkpoint,
+    CRITIC_ARCHS, CURRENT_CRITIC_ARCH,
 )
-from src.services.environment.warchest_env import (
-    WarChestEnv, WIN_REWARD,
-)
-from src.services.environment.game_state import HAND_SIZE
+from src.services.environment.obs_encoders import get_encoder
+from src.services.environment.warchest_env import WarChestEnv
 from src.services.environment.rollout_core import (
     play_episode, SHAPING_C, C_MAT, OPP_TYPE_IDX, OPP_GROUP_IDX,
 )
@@ -44,9 +44,25 @@ SHAPING_ANNEAL_FINAL = 0.1
 SHAPING_ANNEAL_HALF_FRAC = 0.5
 # Reverse of OPP_GROUP_IDX, so the per-opponent advantage offsets log by name.
 OPP_GROUP_NAME = {v: k for k, v in OPP_GROUP_IDX.items()}
+# Where saved policies live; the eval reference opponent is picked from here.
+POLICY_CKPT_GLOB = 'data/warchest_ppo_*.pth'
 use_wandb = False
 
 logger = logging.getLogger('warchest')
+
+
+def latest_policy_checkpoint(pattern=POLICY_CKPT_GLOB):
+    """Newest saved policy checkpoint, or None if none exist.
+
+    Newest by modification time rather than by filename: the run-final checkpoints
+    happen to sort by their timestamp suffix, but intermediate checkpoints saved
+    mid-run need not, and this is chosen once at startup where a wrong pick would
+    silently mislabel the whole run's eval baseline.
+    """
+    paths = glob.glob(pattern)
+    if not paths:
+        return None
+    return max(paths, key=lambda p: (os.path.getmtime(p), p))
 
 
 class ReturnNormalizer:
@@ -87,6 +103,34 @@ class ReturnNormalizer:
     @property
     def std(self):
         return self._std
+
+
+class ReferenceOpponent:
+    """A frozen policy checkpoint played as a fixed eval yardstick.
+
+    Speaks the `act(obs) -> (action, log_prob, entropy)` bot protocol `_eval_episode`
+    expects, so it drops in beside `GreedyBot`/`RandomBot` with no special-casing.
+
+    `encoder` is set only when the checkpoint was trained under an *older* obs version
+    than the env is emitting: the checkpoint's input layers are sized to its own
+    encoder, so the env's observation is not a valid input for it and has to be
+    re-derived (which is exactly what the gauntlet's `PolicyAgent` does). When the
+    versions match this stays None and the env's already-computed obs is used as-is —
+    re-encoding it would be pure waste in a loop that runs `eval_episodes` games.
+    """
+
+    def __init__(self, policy, *, path, obs_version, encoder=None, env=None):
+        self.policy = policy
+        self.path = path
+        self.obs_version = obs_version
+        self.name = os.path.splitext(os.path.basename(path))[0]
+        self._encoder = encoder
+        self._env = env
+
+    def act(self, obs):
+        if self._encoder is not None:
+            obs = self._encoder.encode(self._env)
+        return self.policy.act(obs)
 
 
 def setup_run_logger(run_id: str) -> None:
@@ -167,13 +211,14 @@ class PPOTrainer:
         self._print_every = hp['print_every']
         self._eval_every = hp.get('eval_every', 10)
         self._eval_episodes = hp.get('eval_episodes', 20)
-        self._wr_finetune_threshold = hp['wr_random_finetune_threshold']
+        self._wr_finetune_threshold = hp['wr_greedy_finetune_threshold']
         self._opp_weights_initial = {
-            'p_random': hp['p_random_initial'],
+            'p_random': hp.get('p_random_initial', 0.0),
             'p_greedy': hp['p_greedy_initial'],
             'p_pool': hp['p_pool_initial'],
             'p_lookahead_critic': hp['p_lookahead_critic_initial'],
             'p_puct': hp.get('p_puct_initial', 0.0),
+            'p_random_eval': hp.get('p_random_eval_initial', 0.0),
         }
         self._opp_weights_finetune = {
             'p_random': hp['p_random_finetune'],
@@ -181,6 +226,7 @@ class PPOTrainer:
             'p_pool': hp['p_pool_finetune'],
             'p_lookahead_critic': hp['p_lookahead_critic_finetune'],
             'p_puct': hp.get('p_puct_finetune', 0.0),
+            'p_random_eval': hp.get('p_random_eval_finetune', 0.0),
         }
         # Advantage normalisation (docs/next_iteration.md §5 row 6). 'per_opponent' centres
         # advantages inside each opponent group, which is what lets `critic_v3` drop the
@@ -196,6 +242,7 @@ class PPOTrainer:
             )
         self._lookahead_critic_time_budget = hp['lookahead_critic_time_budget']
         self._puct_time_budget = hp.get('puct_time_budget', 0.1)
+        self._random_eval_reply_branching = hp.get('random_eval_reply_branching', 2)
         # Dense critic targets (docs/IDEAS.md #12): also regress the critic on opponent-
         # decision nodes via an auxiliary MC-return loss, on top of the unchanged main GAE
         # targets. Off by default — an opt-in experiment; the aux loss is scaled by
@@ -232,13 +279,16 @@ class PPOTrainer:
         self._pool = OpponentPool(
             max_size=hp.get('pool_max_size', 20),
             snapshot_every=hp.get('pool_snapshot_every', 15),
-            p_random=hp['p_random_initial'],
+            p_random=hp.get('p_random_initial', 0.0),
             p_greedy=hp['p_greedy_initial'],
             p_pool=hp['p_pool_initial'],
             p_lookahead_critic=hp['p_lookahead_critic_initial'],
             lookahead_critic_time_budget=hp['lookahead_critic_time_budget'],
             p_puct=hp.get('p_puct_initial', 0.0),
             puct_time_budget=hp.get('puct_time_budget', 0.1),
+            p_random_eval=hp.get('p_random_eval_initial', 0.0),
+            random_eval_seed=hp.get('rollout_seed', 0),
+            random_eval_reply_branching=hp.get('random_eval_reply_branching', 2),
         )
         self._buffer = RolloutBuffer()
         self._greedy_bot = GreedyBot()
@@ -248,11 +298,22 @@ class PPOTrainer:
         self._wr_vs_greedy = deque(maxlen=100)
         self._wr_vs_lookahead_critic = deque(maxlen=100)
         self._wr_vs_puct = deque(maxlen=100)
+        self._wr_vs_random_eval = deque(maxlen=100)
 
         # pre-computed once; actor-side params are needed for separate gradient clipping
         self._actor_side_params = list(self._policy.parameters())
 
         self._ret_normalizer = ReturnNormalizer()
+
+        # Frozen previous-generation policy the eval phase plays against, so a run answers
+        # "is this policy better than the last one I saved?" directly instead of only
+        # "how does it do against greedy/random?" — which both saturate long before the
+        # policy stops improving. Loaded ONCE here, before the first batch, from a path
+        # resolved once at startup (see `latest_policy_checkpoint`): re-globbing at every
+        # eval call would start picking up checkpoints THIS run wrote, making the baseline
+        # a moving target that reports ~50 % forever no matter how much the policy gains.
+        self._eval_reference = None
+        self._init_reference_opponent(hp.get('reference_policy_path'))
 
         # batch-temporary; written by _collect_batch, read by _log_batch
         self._batch_eps: list = []
@@ -396,6 +457,7 @@ class PPOTrainer:
                 lookahead_critic_time_budget=self._lookahead_critic_time_budget,
                 puct_time_budget=self._puct_time_budget,
                 collect_dense=self._dense_critic,
+                random_eval_reply_branching=self._random_eval_reply_branching,
             )
 
     def _submit_parallel(self, batch_num: int):
@@ -737,6 +799,52 @@ class PPOTrainer:
     # Evaluation
     # ------------------------------------------------------------------
 
+    def _init_reference_opponent(self, path):
+        """Load the frozen checkpoint the eval phase plays against.
+
+        `path` is resolved by the caller (`latest_policy_checkpoint()` unless overridden)
+        and passing None disables the reference match entirely. A checkpoint that cannot
+        be rebuilt with the current code — an old arch, incompatible dims — downgrades to
+        a warning rather than killing the run: the reference is a measurement, and losing
+        it is not a reason to lose the training.
+        """
+        if path is None:
+            logger.info(
+                '[eval] no reference policy: eval runs against greedy/random only. '
+                f'(nothing matched {POLICY_CKPT_GLOB}, or it was disabled explicitly)'
+            )
+            return
+        try:
+            meta = load_policy_checkpoint(path, map_location=self._device)
+            encoder = get_encoder(meta['obs_version'])
+            ref = Policy(device=self._device, hidden_dim=meta['hidden_dim'],
+                         obs_encoder=encoder).to(self._device)
+            ref.load_state_dict(meta['state_dict'])
+        except Exception as e:
+            logger.warning(
+                f'[eval] could not load reference policy {path!r}: {e}. Eval runs against '
+                f'greedy/random only; pass --reference-policy to point at a loadable one.'
+            )
+            return
+        ref.eval()
+        for p in ref.parameters():
+            p.requires_grad_(False)
+        env_version = self._env._obs_encoder.version
+        self._eval_reference = ReferenceOpponent(
+            ref,
+            path=path,
+            obs_version=meta['obs_version'],
+            encoder=encoder if meta['obs_version'] != env_version else None,
+            env=self._env,
+        )
+        logger.info(
+            f'[eval] reference opponent = {path} '
+            f'(obs v{meta["obs_version"]}, hidden_dim={meta["hidden_dim"]})'
+            + ('' if meta['obs_version'] == env_version else
+               f' — re-encoding the env at v{meta["obs_version"]} for its turns, the env '
+               f'emits v{env_version}')
+        )
+
     def _maybe_eval(self, batch_num: int):
         if batch_num % self._eval_every != 0:
             return
@@ -745,6 +853,9 @@ class PPOTrainer:
         self._critic.eval()
         greedy_wins = 0
         random_eval_wins = 0
+        ref_wins = 0
+        ref_losses = 0
+        ref_draws = 0
 
         for _ in range(self._eval_episodes):
             main_pid = np.random.choice([1, 2])
@@ -767,6 +878,19 @@ class PPOTrainer:
             else:
                 self._elo.draw('policy', 'random')
 
+            if self._eval_reference is not None:
+                # Deliberately NOT fed into self._elo: the reference plays nobody but the
+                # current policy, so the pair would float freely and drag elo_policy off
+                # the greedy/random anchor it is comparable across runs by. The score
+                # below is the whole signal, and it needs no rating system.
+                outcome = self._eval_episode(self._eval_reference, main_pid)
+                if outcome == 'win':
+                    ref_wins += 1
+                elif outcome == 'lose':
+                    ref_losses += 1
+                else:
+                    ref_draws += 1
+
         self._policy.train()
         self._critic.train()
 
@@ -774,23 +898,42 @@ class PPOTrainer:
         elo_grdy = self._elo.rating('greedy')
         elo_rnd = self._elo.rating('random')
         wr_random_eval = random_eval_wins / self._eval_episodes
+        wr_greedy_eval = greedy_wins / self._eval_episodes
 
-        if wr_random_eval >= self._wr_finetune_threshold:
+        if wr_greedy_eval >= self._wr_finetune_threshold:
             self._pool.set_weights(**self._opp_weights_finetune)
         else:
             self._pool.set_weights(**self._opp_weights_initial)
 
+        # Score, not win rate, is the "is this policy better than the saved one" number:
+        # truncations count for neither side and are common in a near-mirror match, so a
+        # bare win rate sags as games get longer even when nothing regressed. 0.5 is
+        # parity with the reference; above it the current policy is ahead.
+        ref_stats = {}
+        if self._eval_reference is not None:
+            n = self._eval_episodes
+            ref_stats = {
+                'wr_vs_reference_eval': ref_wins / n,
+                'score_vs_reference_eval': (ref_wins + 0.5 * ref_draws) / n,
+                'draw_rate_vs_reference_eval': ref_draws / n,
+            }
+
         logger.info(
             f'[eval] batch={batch_num} '
-            f'wr_greedy={greedy_wins / self._eval_episodes:.3f} '
+            f'wr_greedy={wr_greedy_eval:.3f} '
             f'wr_random={wr_random_eval:.3f} '
             f'elo_policy={elo_pol:.0f} elo_greedy={elo_grdy:.0f}'
+            + (f' | vs {self._eval_reference.name}: '
+               f'score={ref_stats["score_vs_reference_eval"]:.3f} '
+               f'({ref_wins}W/{ref_losses}L/{ref_draws}D)'
+               if self._eval_reference is not None else '')
         )
         if use_wandb:
             wandb.log({
                 'elo_policy': elo_pol,
-                'wr_vs_greedy_eval': greedy_wins / self._eval_episodes,
+                'wr_vs_greedy_eval': wr_greedy_eval,
                 'wr_vs_random_eval': wr_random_eval,
+                **ref_stats,
             })
 
     def _eval_episode(self, opp, main_pid) -> str:
@@ -828,12 +971,19 @@ class PPOTrainer:
                 self._wr_vs_lookahead_critic.append(int(ep['outcome'] == 'win'))
             elif ep['opp_type'] == 'puct':
                 self._wr_vs_puct.append(int(ep['outcome'] == 'win'))
+            elif ep['opp_type'] == 'random_eval':
+                # One number over the whole θ family, not per playstyle: each episode draws
+                # its own θ, so this is the win rate against a *distribution* of opponents.
+                # A drop here is coverage arriving, not a regression.
+                self._wr_vs_random_eval.append(int(ep['outcome'] == 'win'))
 
         wr_pool = float(np.mean(self._wr_vs_pool)) if self._wr_vs_pool else 0.0
         wr_greedy = float(np.mean(self._wr_vs_greedy)) if self._wr_vs_greedy else 0.0
         wr_lookahead = (float(np.mean(self._wr_vs_lookahead_critic))
                         if self._wr_vs_lookahead_critic else 0.0)
         wr_puct = float(np.mean(self._wr_vs_puct)) if self._wr_vs_puct else 0.0
+        wr_random_eval = (float(np.mean(self._wr_vs_random_eval))
+                          if self._wr_vs_random_eval else 0.0)
 
         s = update_stats
         avg_turns = float(np.mean([ep['turns'] for ep in self._batch_eps]))
@@ -852,6 +1002,7 @@ class PPOTrainer:
         r_material = float(np.mean([ep['r_material'] for ep in self._batch_eps]))
         r_terminal = float(np.mean([ep['r_terminal'] for ep in self._batch_eps]))
         r_other = float(np.mean([ep['r_other'] for ep in self._batch_eps]))
+        r_tempo = float(np.mean([ep['r_tempo'] for ep in self._batch_eps]))
         # entropy ceiling: mean over all main-player decisions of log(n_legal).
         # ent_frac = entropy / max_entropy makes "how decisive" readable without mental math.
         tot_dec = sum(ep['n_decisions'] for ep in self._batch_eps)
@@ -932,7 +1083,7 @@ class PPOTrainer:
             f'batch={batch_num} score_parts (per-ep mean): '
             f'attack={r_attack:.3f} shaping={r_shaping:.3f} holding={r_holding:.3f} '
             f'material={r_material:.3f} terminal={r_terminal:.3f} other={r_other:.3f} '
-            f'anneal={self._shaping_anneal:.3f}'
+            f'tempo={r_tempo:.3f} anneal={self._shaping_anneal:.3f}'
         )
         logger.info(
             f'batch={batch_num} bolster_per_ep={bolster_per_ep:.3f} '
@@ -946,6 +1097,7 @@ class PPOTrainer:
                 'wr_vs_greedy_train': wr_greedy,
                 'wr_vs_lookahead_critic_train': wr_lookahead,
                 'wr_vs_puct_train': wr_puct,
+                'wr_vs_random_eval_train': wr_random_eval,
                 'actor_loss': s['avg_actor'],
                 'critic_loss': s['avg_critic'],
                 'approx_kl': s['avg_kl'],
@@ -979,6 +1131,7 @@ class PPOTrainer:
                 'score_material': r_material,
                 'score_terminal': r_terminal,
                 'score_other': r_other,
+                'score_tempo': r_tempo,
                 'shaping_anneal': self._shaping_anneal,
                 'bolster_per_ep': bolster_per_ep,
                 'bolster_fully_available_per_ep': bolster_fully_available_per_ep,
@@ -1001,11 +1154,14 @@ if __name__ == '__main__':
         help='Weight of the dense auxiliary critic loss (only used with --dense-critic-targets).')
     parser.add_argument(
         '--critic-arch', choices=CRITIC_ARCHS, default=CURRENT_CRITIC_ARCH,
-        help="Critic architecture. 'critic_v3' (default) is GroupNorm + a board-only "
-             'auxiliary head, minus the opponent one-hot (§5 row 6 — that offset now comes '
-             'out of the advantage instead, see --adv-norm). critic_v2 is the same net WITH '
-             'the one-hot; the un-normalised critic_v1 trunk provably dies '
-             '(docs/next_iteration.md §3.4). Pass an older arch only to reproduce a baseline.')
+        help="Critic architecture. 'critic_v4' (default) is critic_v3 with the flank-average "
+             'readout replaced by a gather at the 10 fixed base cells plus masked mean+max '
+             'over own/opponent unit cells and the whole board (docs/IDEAS.md A2), aimed at '
+             'the sibling-pair ties in docs/next_iteration.md §3.4. critic_v3 is the same net '
+             'with the flank-average pool; it and critic_v2 also drop/keep the opponent '
+             'one-hot (§5 row 6 — that offset now comes out of the advantage instead, see '
+             '--adv-norm). The un-normalised critic_v1 trunk provably dies (§3.4). Pass an '
+             'older arch only to reproduce a baseline.')
     parser.add_argument(
         '--aux-board-coeff', type=float, default=0.1,
         help='Weight of the board-only auxiliary value loss (critic_v2 and later). This is what '
@@ -1026,8 +1182,27 @@ if __name__ == '__main__':
              'opponent group\'s own mean before applying one shared std, removing the '
              'per-opponent offset a state-only critic cannot predict (win rates are '
              '1.000/0.825/0.525 vs random/greedy/self). Pair it with --critic-arch '
-             "critic_v3. 'global' is the historical single mean/std — use it as the A/B "
+             "critic_v3/critic_v4. 'global' is the historical single mean/std — use it as the A/B "
              'baseline, or with critic_v1/critic_v2, which carry the one-hot instead.')
+    parser.add_argument(
+        '--p-random-eval-finetune', type=float, default=0.0,
+        help='Share of finetune-phase episodes played against the B1 randomised-coefficient '
+             'family (docs/IDEAS.md B1): a SimGreedyBot whose 8 leaf-evaluator coefficients '
+             'are redrawn every episode, giving a continuum of policy-independent playstyles '
+             'for ~18 ms/move. Off by default. The finetune schedule is otherwise ~100 %% '
+             'policy-derived (p_random = p_greedy = 0), which is the self-play collapse '
+             'docs/independent_opponents.md diagnoses; this is the cheap lever against it. '
+             'The share is taken out of p_pool, not added on top.')
+    parser.add_argument(
+        '--reference-policy', default=None,
+        help='Policy checkpoint the eval phase plays the current policy against, so a run '
+             'reports whether it beat the last saved generation rather than only how it '
+             f'does against greedy/random. Default: the newest {POLICY_CKPT_GLOB} by mtime. '
+             'Resolved ONCE at startup — checkpoints this run saves later can never become '
+             'their own baseline. Pass --no-reference-eval to skip the match.')
+    parser.add_argument(
+        '--no-reference-eval', action='store_true',
+        help='Skip the frozen-checkpoint eval opponent (saves eval_episodes games per eval).')
     parser.add_argument(
         '--dump-returns-dir', default=None,
         help='If set, dump (critic input -> shaped GAE return) shards here as round*.npz, '
@@ -1048,12 +1223,18 @@ if __name__ == '__main__':
 
     environment = WarChestEnv(save_game_history=False, debug_mode=False)
 
-    # The main player empties its full hand each round, so its lifetime action count
-    # is about max_rounds * coins-per-round.
-    holding_reward_rate = (
-        WIN_REWARD
-        / ((environment.winning_base_count - 1) * (environment.max_rounds * HAND_SIZE))
-        * 0.8  # 0.8 is a safety margin so worst-case holding never exceeds WIN_REWARD
+    # Sized against the measured main-actor turn count, not the max_rounds worst case —
+    # see WarChestEnv.default_holding_reward_rate and docs/IDEAS.md L8.
+    holding_reward_rate = environment.default_holding_reward_rate()
+
+    # Pin the eval baseline before a single batch runs, and log it. Deciding this here
+    # (rather than inside the eval loop) is what makes the number mean "better than the
+    # generation I started from" once intermediate checkpoints are being written to
+    # data/ during the run — otherwise the run would progressively re-baseline onto its
+    # own recent output and the score would sit at ~0.5 by construction.
+    reference_policy_path = (
+        None if cli_args.no_reference_eval
+        else (cli_args.reference_policy or latest_policy_checkpoint())
     )
 
     hp = {
@@ -1116,17 +1297,16 @@ if __name__ == '__main__':
         # relative balance (×0.85). It is a search-based, critic-guided opponent
         # (eval-scoped by design) so it runs at a small per-move budget in training —
         # see lookahead_critic_time_budget below and docs/bots.md.
-        'p_random_initial': 0.34,
-        'p_greedy_initial': 0.17,
-        'p_pool_initial': 0.34,
-        'p_lookahead_critic_initial': 0.15,
+        'p_greedy_initial': 0.4,
+        'p_pool_initial': 0.30,
+        'p_lookahead_critic_initial': 0.30,
         # opponent sampling weights — fine-tune phase (random removed from training).
         # Greedy is a small fixed anchor; the rest is self-play against the wide-skill
         # pool, with lookahead_critic holding the same 15% slice.
         'p_random_finetune': 0.00,
         'p_greedy_finetune': 0.00,
-        'p_pool_finetune': 0.75,
-        'p_lookahead_critic_finetune': 0.25,
+        'p_pool_finetune': 0.5,
+        'p_lookahead_critic_finetune': 0.3,
         # per-move search budget for the lookahead_critic training opponent. Small on
         # purpose: at its own 0.5s eval default a 15%-sampled search opponent would
         # dominate rollout wall-clock. 0.1s keeps it a distinct, tougher opponent
@@ -1139,10 +1319,27 @@ if __name__ == '__main__':
         # (e.g. 0.15, trimming the others) to train against it, and note each of its
         # moves runs a real 0.1s search — heavier than lookahead_critic per move.
         'p_puct_initial': 0.00,
-        'p_puct_finetune': 0.00,
+        'p_puct_finetune': 0.2,
         'puct_time_budget': 0.1,
-        # win-rate vs random that triggers the phase switch
-        'wr_random_finetune_threshold': 0.90,
+        # RandomEvalBot — the B1 randomised-coefficient family (docs/IDEAS.md B1), OFF by
+        # default pending the coverage measurement it is supposed to buy. Unlike every
+        # other entry here it is not one opponent: θ is redrawn per episode, so the slice
+        # is a distribution over policy-independent playstyles (recruit-economy, bolster
+        # brawler, turtle, base racer, ...) that self-play provably cannot generate. It
+        # needs no checkpoint and costs SimGreedyBot time (~18 ms/move at
+        # reply_branching=2), an order of magnitude under lookahead_critic's — so a slice
+        # here is cheap in a way the other search opponents are not. Give it a share of
+        # the *finetune* phase (where p_random = p_greedy = 0 and the schedule is ~100 %
+        # policy-derived — the collapse docs/independent_opponents.md diagnoses) rather
+        # than the initial one, which already has `random` for coverage.
+        'p_random_eval_initial': 0.00,
+        'p_random_eval_finetune': cli_args.p_random_eval_finetune,
+        # 2nd-ply reply cap for that bot; the base SimGreedyBot uses 8. Only the opponent's
+        # reply is capped, never the bot's own action set, so no verb is pruned from its
+        # choice — see SimGreedyBot.reply_branching.
+        'random_eval_reply_branching': 2,
+        # win-rate vs greedy that triggers the phase switch
+        'wr_greedy_finetune_threshold': 0.90,
         # self-play pool cadence: snapshot rarely so the max_size-slot pool spans a wide
         # skill range (~pool_max_size * pool_snapshot_every batches) rather than near-copies.
         'pool_max_size': 20,
@@ -1160,6 +1357,9 @@ if __name__ == '__main__':
         'aux_board_coeff': cli_args.aux_board_coeff,
         'trunk_health_every': 10,
         'dump_returns_dir': cli_args.dump_returns_dir,
+        # Frozen checkpoint the eval phase plays against (None => that match is skipped).
+        # Already resolved above, on purpose — see the comment there.
+        'reference_policy_path': reference_policy_path,
     }
     logger.info(f'hyperparameters={hp}')
 
@@ -1177,6 +1377,9 @@ if __name__ == '__main__':
                 'learning_rate': hp['lr_actor'],
                 'gamma': hp['gamma'],
                 'lam': hp['lam'],
+                # Which checkpoint `score_vs_reference_eval` is scored against — the metric
+                # is meaningless when comparing two runs that used different baselines.
+                'reference_policy': hp['reference_policy_path'],
             }
         )
         logger.info(f'wandb_run={run.url}')

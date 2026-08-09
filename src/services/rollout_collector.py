@@ -61,7 +61,13 @@ def _worker_loop(worker_id, task_q, result_q, counter, cfg):
                         p_random=1.0, p_greedy=0.0, p_pool=0.0, p_lookahead_critic=0.0,
                         lookahead_critic_time_budget=cfg['lookahead_critic_time_budget'],
                         lookahead_critic_device='cpu', p_puct=0.0,
-                        puct_time_budget=cfg.get('puct_time_budget', 0.1), puct_device='cpu')
+                        puct_time_budget=cfg.get('puct_time_budget', 0.1), puct_device='cpu',
+                        p_random_eval=0.0,
+                        # Per-worker θ stream (docs/IDEAS.md B1). Without the offset every
+                        # worker would replay the *same* sequence of sampled playstyles, so
+                        # a batch would cover a handful of θ instead of one per episode.
+                        random_eval_seed=seed,
+                        random_eval_reply_branching=cfg.get('random_eval_reply_branching', 2))
 
     def claim_episode():
         # Atomic decrement of the shared remaining-episode counter (dynamic load balancing:
@@ -168,7 +174,8 @@ class ParallelRolloutCollector:
     """
 
     def __init__(self, n_workers, *, policy_hidden_dim, pool_max_size, seed_base,
-                 lookahead_critic_time_budget=0.1, puct_time_budget=0.1, collect_dense=False):
+                 lookahead_critic_time_budget=0.1, puct_time_budget=0.1, collect_dense=False,
+                 random_eval_reply_branching=2):
         self._ctx = mp.get_context('spawn')
         self._n = n_workers
         self._task_qs = [self._ctx.Queue() for _ in range(n_workers)]
@@ -182,6 +189,7 @@ class ParallelRolloutCollector:
             'lookahead_critic_time_budget': lookahead_critic_time_budget,
             'puct_time_budget': puct_time_budget,
             'collect_dense': collect_dense,
+            'random_eval_reply_branching': random_eval_reply_branching,
         }
         for wid in range(n_workers):
             p = self._ctx.Process(

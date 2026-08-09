@@ -17,7 +17,7 @@ Turn-based hex-grid strategy game with a reinforcement learning agent (PPO + GAE
 - [RL algorithms](docs/rl_algorithms.md) — GAE, PPO, DQN, and alternatives with Warchest-specific trade-offs
 - [Metrics reference](docs/METRICS.md) — W&B metrics explained: ideal ranges, trends, warning signs
 - [Web agent](docs/web_agent.md) — design for driving warchestonline.com with a trained checkpoint via Playwright (not yet implemented; `config/web_agent.sample.toml` is the sketch)
-- [Bots](docs/bots.md) — non-learned/search-based bots overview; `LookaheadCriticBot` bugs found, fixes, and experiment log
+- [Bots](docs/bots.md) — non-learned/search-based bots overview; `LookaheadCriticBot` bugs found, fixes, and experiment log. Also **§ `RandomEvalBot` — the θ family (2026-08-09, IDEAS.md B1)**: `HeuristicEvaluator` now takes an 8-dim coefficient vector `theta` (default bit-identical to the pre-θ evaluator), and `RandomEvalBot` samples it. Measured 4–5× behaviour spread over a re-seeded control, but only 2 of the 6 promised archetypes are real (`tempo`/`progress` are inert), `durability` produces a **turtle** not a bolster brawler and is what actually collapsed the old `rich_eval` bundle, and a 9-agent gauntlet is **fully transitive** — diverse, not mutually orthogonal
 - [Search under uncertainty](docs/search_under_uncertainty.md) — what is actually hidden (3-way coin partition), why single-determinization search is flawed (strategy fusion / non-locality), and the belief/IS-MCTS/CFR fix list. §8 holds the 2026-08-02 measurement that **closed** the belief track (seeing the opponent's hand is worth ~0) and, in passing, found the **v11 critics' spatial trunk is dead**
 
 ## Quick orientation
@@ -29,7 +29,10 @@ src/
       obs_encoders/   versioned observation encoders (v10.py + registry); env delegates encoding
     policy/         actor-critic neural network (Policy + Critic)
       checkpoint.py   checkpoint (de)serialization with obs-version + arch metadata
-    bots/           Bot ABC, RandomBot, GreedyBot
+    bots/           Bot ABC, RandomBot, GreedyBot, search bots
+      evaluation.py   shared HeuristicEvaluator + the 8-dim `theta` coefficient
+                      vector and its sampler (docs/IDEAS.md B1)
+      random_eval_bot.py  SimGreedyBot with sampled theta — the opponent family
     opponent_pool.py  weighted opponent sampler (random / greedy / pool snapshots)
     gauntlet.py     round-robin agents + Bradley-Terry/Elo ratings + transitivity
   app/
@@ -43,6 +46,9 @@ src/
                         bot (cheat vs blind, paired arms) — docs/search_under_uncertainty.md §8
     eval_privileged_ablation.py  is the Critic actually reading its privileged features,
                         and is its spatial trunk alive at all — §8.2
+    eval_theta_family.py  does the B1 sampled-θ evaluator family actually produce
+                        different bots — verb-profile spread vs a re-seeded control,
+                        plus --sweep KEY to move one coefficient at a time
     eval_move_agreement.py  do the cheating and blind PuctBot teachers pick different
                         moves (the thing ExIt actually distills) — §8.3
     policy_viz.py   export policy graph to TensorBoard

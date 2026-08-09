@@ -250,18 +250,26 @@ hot path" means.
 | `Critic.value_single`, 192 | 0.85 ms | |
 | `Critic.value_batch(64)`, 192 | 0.37 ms/state | batching buys only ~2× on CPU |
 | `RandomBot.act(obs)` | 0.008 ms | |
-| `GreedyBot.act(obs)` | **0.83 ms** | *as expensive as a policy forward* — see below |
+| `GreedyBot.act(obs)` | ~~**0.83 ms**~~ → **0.04 ms** | *was as expensive as a policy forward* — **fixed 2026-08-09**, see below |
+| `ThreatAwareGreedyBot.act(obs)` | **0.11 ms** | added 2026-08-09 (B5) |
 | `SimGreedyBot.act(env)` | 18.0 ms | ~21× a policy forward |
 | `LookaheadBot.act(env)` @0.02 s | 20.6 ms | |
 | `LookaheadBot.act(env)` @0.1 s | 104 ms | ~121× a policy forward; ~10–12 k nodes/s |
 
 Two readings that are not obvious from the rows:
 
-- **The obs-only "cheap" bot is not cheap.** `GreedyBot` costs the same as a 128-wide policy
-  forward, because `_best_move_toward_base` runs a fresh whole-board BFS for *every candidate move
-  × every target base* — a product of two quantities that both grow as the game opens up.
-  Anything built to replace it should run **one multi-source BFS** and index it, which is linear
-  in candidates and lands comfortably under 0.3 ms. Applies directly to B3 and B5.
+- **The obs-only "cheap" bot is not cheap** — *was not; fixed 2026-08-09.* `GreedyBot` cost the
+  same as a 128-wide policy forward, because `_best_move_toward_base` ran a fresh whole-board BFS
+  for *every candidate move × every target base* — a product of two quantities that both grow as
+  the game opens up. The prescription written here ("**one multi-source BFS**, indexed, linear in
+  candidates, comfortably under 0.3 ms") has now been applied **to `GreedyBot` itself**:
+  `0.90 ms → 0.04 ms`, **~23×**, on a metric proven identical cell-by-cell and an action choice
+  proven identical over 500+ real decision states (`tests/test_greedy_bot_speed.py`, which keeps
+  the original as the reference implementation — the bot is a training-pool opponent and the
+  yardstick every historical number is quoted against, so *no* behaviour change was admissible).
+  The BFS now lives in `bots/board_geometry.py`; B3 should import it rather than re-derive it.
+  Consequence for Table C: the `greedy` share of rollout opponent cost is now negligible, and a
+  policy forward is **~20×** an obs-only opponent rather than ~1×.
 - The env-taking rows are backed out of complete games (4–5 games each, the bot moving on ~half
   the plies) as `2·(ms_per_ply − env) − opponent`, not read off one probe state: a single state's
   `legal_at_root` swings a search bot's node count and reachable depth by an order of magnitude.
@@ -325,6 +333,33 @@ Cost: SimGreedy speed (~18 ms/move, Table A), so this needs either a small pool 
 family is working if bolster/recruit/tactic/initiative rates *span a wide range* across θ, and
 failing if every θ collapses onto the same profile. Difficulty: low.
 
+> **IMPLEMENTED AND MEASURED, 2026-08-09.** `evaluation.py` takes `theta`, `RandomEvalBot` is
+> the sampled-θ `SimGreedyBot`, `src/app/eval_theta_family.py` is the harness, and
+> `OpponentPool(p_random_eval=)` / `ppo.py --p-random-eval-finetune` are the wiring (default
+> **0.0** — the coverage is measured, the training benefit is not). Full write-up:
+> `docs/bots.md` § *`RandomEvalBot` — the θ family*. Four things the measurement changed
+> about the proposal above:
+>
+> 1. **The gate passes, with a control.** "A wide range across θ" is not evidence by itself —
+>    any 16-game sample produces a range. Against the *same* bot re-seeded, the spread ratio
+>    (mean pairwise total-variation distance between verb profiles) is **4.0x** vs `greedy_sim`
+>    and **5.1x** vs `lookahead_critic`. Bolster and recruit span 25–40x the noise floor.
+> 2. **Only two of the six named archetypes exist.** Per-dial sweeps: `economy` buys recruit
+>    0.02 → 0.19 nearly free; `pos` buys the racer. **`tempo` and `progress` are inert** —
+>    claim_initiative moved 0.126 → 0.133 across a 0…20 tempo sweep, because that verb's rate
+>    is set by the rules, not the evaluation. There is no "tempo/initiative bot" in this class.
+> 3. **`durability` is a trap, and it rewrites the `rich_eval` post-mortem.** It does not make
+>    a bolster brawler: bolster saturates at 0.087 by weight 0.5 while `pass` climbs 0.11 →
+>    0.65 and the win rate goes 0.75 → 0.19 → 0.00. The paragraph above blames `economy` for
+>    the `rich_eval` collapse (following `docs/bots.md`); per-dial, economy is the *cheap* one
+>    and durability is what kills the bot. `THETA_RANGES` caps durability at 1.0 as a result —
+>    which cut unhealthy arms 4/8 → 1/8 on fresh θ seeds, at the cost of 6.7x → 4.0x spread,
+>    almost all of it the `pass` column.
+> 4. **"Independent" is half-delivered.** A 9-agent gauntlet (k=12) is **fully transitive**:
+>    the arms straddle `greedy_sim` over ~375 Elo but none counters another. They are
+>    independent of the *policy* — nothing learned is in the loop — and that is the state
+>    coverage `independent_opponents.md` §3 asks for, but they are not a diverse threat model.
+
 #### B2. θ-search as an automated best-response oracle — a cheaper, *interpretable* #12
 
 Given B1, run CMA-ES or plain random search over the 8-dim θ to maximise win rate against the
@@ -337,6 +372,14 @@ as #12 — best θ ≥ ~65 % ⇒ a real exploitable hole and PSRO-style weightin
 gauntlet entrant and a free curriculum signal (L7). Difficulty: low-moderate. **This supersedes
 the expensive half of #12** — keep #12's RL-BR arm only if the θ family turns out to be too
 narrow a policy class to find anything.
+
+> **DEPRIORITISED by B1's measurement, 2026-08-09.** It is too narrow a policy class. In the
+> B1 gauntlet every one of six sampled θ scored **0.00–0.08** against `ckpt_20260808-0607`,
+> and *unmodified* `greedy_sim` scored 0.17. Six draws are not CMA-ES, but they bound where a
+> search would start: the binding constraint is the `SimGreedyBot` class, not the coefficients
+> inside it, and no reweighting of a 2-ply leaf gets from 0.08 to the 65 % decision threshold.
+> Re-scope this onto a stronger base bot (`LookaheadBot`, or B4's distilled net) before
+> spending the 2 CPU-hours, or fall back to #12's RL-BR arm.
 
 #### B3. `RaceBot` — the archetype the game's own rules say is strongest, and nobody plays it
 
@@ -398,6 +441,9 @@ concrete budget. Difficulty: moderate.
 
 #### B5. `ThreatAwareGreedy` — a sub-millisecond prophylaxis bot the encoder already feeds for free
 
+**Built 2026-08-09 (`src/services/bots/threat_greedy_bot.py`, gauntlet kind `threat_greedy`). The
+cost half replicated; the strength half did not — see § Measured below before citing this item.**
+
 v11 board planes **38–43** are graded own/enemy threat hit-counts per cell, and the globals carry
 `own_at_risk` / `opp_at_risk`. **No bot reads any of them** — every existing obs-only bot predates
 those planes.
@@ -408,6 +454,50 @@ whose incoming hits ≥ its stack; (3) claim / park; (4) march; (5) deploy. That
 domain claim — *you attack so that your unit is not attacked* — instantiated as an opponent, at a
 cost that permits any pool weight. It also punishes the specific thing the policy is suspected of
 doing (hanging material) without needing anyone to prove that first. Difficulty: low.
+
+##### B5 § Measured (2026-08-09)
+
+**Cost: the technique replicated; the *advantage* did not survive the same day.**
+`ThreatAwareGreedyBot.act(obs)` costs **0.11 ms**, under the 0.3 ms target, via the mechanism this
+section named — one multi-source BFS over 49 cells instead of a whole-board BFS per candidate move
+× per target. But the obvious follow-up was to apply that same BFS to `GreedyBot`, which took it
+from 0.90 ms to **0.04 ms** (~23×, behaviour bit-identical — see Table A's amended note). So the
+new bot is now **~2.7× more expensive** than the baseline it was meant to undercut. What B5
+actually bought was the *technique*, and the technique's biggest payer was the old bot.
+
+**Strength: no effect.** 1600 games vs `greedy_fast`, colours balanced: **0.515 ± 0.024** — the
+interval contains 0.5. In the four-bot gauntlet (k=40/pair) it ranks top of the non-search field
+(BT 897 vs `greedy_fast` 876, `greedy_sim` 871) and is still crushed by `lookahead_critic`
+(0.03, BT 1357). Reading the threat planes is worth, in playing strength, approximately nothing.
+
+**The ladder as written in this item loses 0.26 to `greedy_fast`.** Three separate corrections,
+each measured, each pointing the same way — *the threat model is worst-case over the opponent's
+entire hidden pool, so "covered" is nearly everywhere, and any rule that lets "covered" outrank
+tempo hands over the race*:
+
+| symptom | what the literal reading does | fix | worth |
+|---|---|---|---|
+| rung 2 above rung 3 | the unit standing on a claimable base is exactly the unit the opponent covers, so it retreats instead of claiming — `claim_base` falls 12.7 % → 9.3 % of decisions | claim before un-hang | +0.15 |
+| safety-first march | every cell near a base reads as covered, so the march walks away from the win condition | park, then distance, then safety | ~0 once the above lands |
+| safety filter on lethal blows | the planes count the hits of the unit the blow removes, so a stack-1 unit refuses every even trade | a lethal blow is always taken | +0.037 |
+
+**Ablations vs `greedy_fast`** (120–400 games each, shared seeds): dropping the **un-hang rung
+entirely changes the win rate by 0.000**; dropping the Pikeman-counter guard is worth **−0.017**
+(i.e. nominally *better* without it); never attacking costs **−0.167**. So of the whole
+prophylaxis apparatus, the part that measurably matters is the part that attacks. The
+`own_at_risk` / `opp_at_risk` globals are still unread by anything.
+
+**What this does and does not unblock — nothing, on the current evidence.** It does not satisfy
+B8's requirement: an opponent that ties `greedy_fast` is not strong *relative to this policy*, and
+after per-opponent advantage centring its episodes would contribute near-noise. Nor is it a
+throughput win any more, now that `GreedyBot` carries the same BFS. There is currently **no reason
+to give it pool weight** — it is kept as a gauntlet entrant and as the worked example that the
+threat planes, consumed this way, are worth ~0. The unblock is still **B2** or **B3**.
+
+For B3: its cost target ("*below* `GreedyBot`'s measured 0.83 ms, because one multi-source BFS
+replaces its per-move × per-target BFS") is now demonstrated rather than predicted, but the bar it
+must clear has moved with it — `board_geometry.distance_to` is the piece to import, and 0.04 ms is
+the number to beat.
 
 #### B6. Tempo-multiplier archetypes, chosen by what the roster actually encodes
 
@@ -437,12 +527,39 @@ killer-move heuristic, is a standard 3–5×: `lookahead` at 20–30 ms/move. Wo
 but **worth less than B4**, which is two orders of magnitude and whose artifact is reused four
 ways. Difficulty: moderate.
 
-#### B8. Pool hygiene that costs two lines
+#### B8. Pool hygiene — **half of this was wrong, corrected 2026-08-09**
 
-Whatever else lands, reserve **≥20–30 % of the *finetune* schedule for non-policy-derived
-opponents**. Today it is 0 %. Argued in `independent_opponents.md` §2 and §5, still not done.
-Route new heuristic bots onto the existing `greedy` one-hot slot via `OPP_ONEHOT_SLOT` — do not
-widen `OPP_TYPE_IDX`, it breaks every critic checkpoint. Difficulty: trivial.
+*As written this item said "reserve ≥20–30 % of the finetune schedule for non-policy-derived
+opponents" and called it trivial, as though **weight** were the constraint. It is not, and the
+error is worth keeping visible: there is nothing in the repo worth giving that weight to.*
+
+**The independence half is blocked, not trivial.** Every independent bot here loses to the
+current policy — `greedy_fast` ~100 %, `greedy_sim` mid-tier (BT 1124 vs `lookahead` 1318),
+and `BolsterBot` was measured at **42.5 % against this exact checkpoint**
+(`independent_opponents.md`, Phase-1 result). Giving 20 % of finetune to an opponent you beat
+buys little, and it is worse than it looks now that advantages are centred per opponent (§5
+row 6): a group whose returns have little spread contributes near-noise *after* centring, so
+those episodes cost full rollout time and move the gradient barely at all. The unblock is an
+opponent that is strong **relative to this policy** — i.e. **B2** (θ best-response search,
+which manufactures an exploiter rather than hoping a generic bot is strong) or **B3**
+(`RaceBot`). Do not re-propose "add weight to the existing bots"; that is this item's mistake.
+
+**The half that survives has nothing to do with independence.** The `lookahead_critic` slice is
+a bad trade on its own terms: it is board-blind (`lookahead_critic_v4.pth`, `alive3 = 0.0`,
+`out_std = 0.0`), the policy beats it **95 %** by end of run (`wr_lookahead` 0.04 → 0.95 over
+`ppo_20260807-203528`), and it costs **~4.2 s/episode against ~36 ms for a pool snapshot** —
+roughly two-thirds of all rollout compute for a quarter of the episodes. Cutting
+`p_lookahead_critic_finetune` 0.25 → 0.10 (into `p_pool`) takes opponent cost from ~69 s to
+~29 s per batch, i.e. ~1500 batches in ~6 h instead of ~9.5 h, with no new bot and no new
+tests. The measured trajectory argues for annealing it (hard opponent early — `wr` 0.04 at
+batch 10 — free wins late) rather than a flat cut. Difficulty: trivial, and it is a *throughput*
+change, so it neither helps nor hurts the coverage problem above.
+
+If a bot is ever added: route heuristic entrants onto the existing `greedy` one-hot slot via
+`OPP_ONEHOT_SLOT` (do not widen `OPP_TYPE_IDX`, it breaks every v1/v2 critic checkpoint), give
+it its own `OPP_GROUP_IDX` entry or its advantages land in the warned fallback bucket, add it to
+`_SEARCH_OPP_TYPES` if it is `act(env)` — and fix the hardcoded `opp_type` if/elif chain in
+`ppo.py::_log_batch`, which silently drops the win rate of any opponent it does not know about.
 
 ---
 
@@ -485,6 +602,19 @@ Note carefully how this differs from a tested-and-unresolved idea: `board_xy` is
 nothing resolving (§3.1a). A **task-relevant gather at the 10 cells that define the win condition**
 is a different hypothesis, not a re-run of that one. Cheapest large change here — readout only,
 no trunk change, no obs version bump. Difficulty: low-moderate.
+
+**Shipped 2026-08-09 as `critic_v4`** (now `CURRENT_CRITIC_ARCH`, `src/services/policy/policy.py`),
+built on v3's trunk and aux head. Implements the mean+max form of "attention-pooled as a set" for
+units rather than padded per-unit tokens: `_gathered_pool` concatenates the 10 fixed base-cell
+features (from `Board.default_bases`, symmetric under the P2 ego-rotation so one constant index
+set covers both players), masked mean+max over own/opponent unit-occupied cells (occupancy read
+off the *input* board's unit-stack planes via new `ObsEncoder.own_unit_channels`/
+`opp_unit_channels`, since the trunk output no longer carries per-cell occupancy), and a
+whole-board mean+max — `[B, 16·hidden]` vs. `_split_pool`'s `[B, 2·hidden]`. Policy's
+`facedown_head`/`verb_head` still use `_split_pool` (out of scope here). `value_from_features`
+cannot support it (no raw board) and now raises rather than silently pooling wrong. 42 tests in
+`tests/test_critic_arch.py`; the actual §3.4 gate — does the tie rate drop further than v3's
+93 %→0 % — still needs a run through `eval_board_value.py`/`eval_privileged_ablation.py`.
 
 #### A3. FiLM the globals into the trunk instead of broadcasting 245 constant planes into the head
 
@@ -663,16 +793,65 @@ Both are one-line potentials in `play_episode`, both A/B-able, both policy-invar
 low. Note this reopens the reward axis that #6 retired — deliberately, and on a different basis
 (a rule, not a tuning intuition).
 
-#### L5. Antithetic (mirrored) game pairs everywhere a number is reported
+#### L5. Antithetic game pairs — **tried, measured, and it does not work. 2026-08-09**
 
-Every eval and gauntlet number is confounded by draft luck: 1820 × 495 asymmetric matchups and
-~11-round games. Play each matchup **twice with sides swapped under the same seed** and average
-the pair. Free variance reduction on every measurement this project takes.
+*Kept in full because the reasoning was good and the result was still negative; this is the
+kind of item that gets re-proposed every six months otherwise.*
 
-The case for it is this project's own history: every methodological rule in `next_iteration.md`
-§4 was bought by a conclusion that later reversed, and most of those reversals were a small
-difference read against a large variance. Draft asymmetry is the one remaining large,
-*removable* variance source that nothing currently controls for. Difficulty: low.
+**The premise is true.** Every eval and gauntlet number is confounded by draft luck — 1820 × 495
+asymmetric matchups over ~11-round games. Measured: same deterministic bot (`greedy_fast`) on
+both sides, 300 paired games with the two compositions swapped between seats, **the same
+composition won both games 190/300 = 63.3 % ± 2.8 pp**. Chance is 50 %, so ~**27 % of decisive
+games are settled by the draft alone**.
+
+**The algebra is also right.** Writing `p` for the true win rate and `D` for the draft advantage
+(mean 0, variance σ²_d): two unpaired games give `Var = 2p(1−p)`, because the draft variance is
+absorbed into the Bernoulli marginal. A pair sharing a draft has the *opposite* sign of `D` for a
+given agent, so `Var = 2p(1−p) − 2σ²_d` — strictly lower, by twice the draft variance per pair.
+And the swap is free: `play_game` seeds the global RNG before `env.reset()`, `set_init_state`
+draws the whole 4/4 disjoint draft from it, so two games at the same seed open identically and a
+composition is bound to a *seat*.
+
+**It still fails, and the reason is worth keeping.** The reduction requires the two games of a
+pair to be **negatively correlated**. They are not:
+
+| field | within-pair outcome correlation |
+|---|---|
+| `greedy_fast` vs `greedy_sim` (heterogeneous) | **r = −0.003 ± 0.082** (150 pairs) |
+| `ckpt_20260725` vs `ckpt_20260808` (homogeneous) | **r = −0.005 ± 0.082** (150 pairs) |
+
+`|r| < 0.16` at 95 % in both. The 63.3 % was measured with one **deterministic bot playing
+itself**, where the composition is the only thing that can decide. Real gauntlet entrants
+*differ*, and policy agents **sample** their actions rather than taking an argmax — so an
+identical opening diverges on the first ply and the shared draft stops propagating. The
+mechanism never engages.
+
+Two direct variance checks confirm nothing either way, which is itself instructive: ratio
+**1.29** (`greedy_fast` vs `greedy_sim`, n=120) and **0.77** (two checkpoints, n=120) — ~1.4 σ
+each, in *opposite* directions. That is what two draws of a noisy statistic centred on 1.0 look
+like. **Do not cite either number.**
+
+**What shipped:** `build_task_list(paired=...)` / `--paired-drafts`, **off by default**, so every
+previously recorded gauntlet number stays reproducible bit-for-bit at its seed. Kept as an opt-in
+only for a field of deterministic entrants, where the argument may still hold — untested.
+
+**What *did* survive, on a different argument.** A forced-draft archetype bot could never have
+used the swap: its composition follows the **agent**, not the seat, so it is the *treatment*, not
+a nuisance draw, and averaging over it would destroy what is being measured. Its control is
+**common random numbers across arms**, and that shipped and is on by default:
+`eval_bolster.build_draft_list` generates the full 4/4 draft up front and pins *both* sides, with
+`--draft-seed` / `--dump-drafts` / `--drafts`. A shared `--seed` nearly achieved this already, but
+only by relying on every arm consuming the RNG in exactly the same order — which breaks silently
+the moment a bot's constructor or the env's reset changes. This is a robustness fix, not a
+variance claim, so it needs no measurement to justify.
+
+**Two facts recorded so they are not re-derived.** The seats are exactly symmetric — the base
+layout is 180°-rotation symmetric (`(1,0)→(5,6)`, `(4,1)→(2,5)`, every neutral base maps onto
+another) and `set_init_state` draws `initiative_owner` independently of player id — so the colour
+balancing the gauntlet and `eval_bolster.py` already do buys essentially nothing. And *variance
+reduction schemes must be validated on the estimator you actually use*: this one was derived on a
+model of the game, verified on a bot playing itself, and failed on the real field. Pinned by
+`tests/test_paired_drafts.py` (14 tests).
 
 #### L6. Supervised warm start
 
@@ -694,17 +873,51 @@ and it targets *exploitable* weakness rather than merely *low-win-rate* weakness
 the same thing, and only the first one costs games against a real opponent. Difficulty:
 low-moderate.
 
-#### L8. Reward hygiene the tempo reading exposes
+#### L8. Reward hygiene the tempo reading exposes — **IMPLEMENTED 2026-08-09**
 
-`MOVE_NEG_REWARD_PER_TURN = -0.002` is charged at seven call sites in `warchest_env.py`, including
-the tactic continuations (`:1655`, `:1707`, `:1728`, `:1772`, `:1841`). So a Berserker chain, a
-Footman double maneuver and a Swordsman bonus move each pay the penalty **again per maneuver** —
-in a game whose central currency is maneuvers-per-coin (B6), the per-step cost is charged against
-exactly the mechanics the policy never uses. Charge it per **coin spent** instead, or zero it.
+`MOVE_NEG_REWARD_PER_TURN = -0.002` was charged at seven call sites in `warchest_env.py`, five of
+them tactic continuations. So a Berserker chain, a Footman double maneuver and a Swordsman bonus
+move each paid the penalty **again per maneuver** — in a game whose central currency is
+maneuvers-per-coin (B6), the per-step cost was charged against exactly the mechanics the policy
+never uses. Charge it per **coin spent** instead, or zero it.
 
 Joins the two hygiene items `next_iteration.md` §4 already lists: zero `ATTACK_REWARD = 0.02`
 (double-pays what material PBRS covers), and re-derive `holding_reward_rate` from ~37 real
 main-actor turns rather than the assumed 150. Difficulty: trivial.
+
+**What shipped** (`docs/rewards.md` §1 carries the full write-up):
+
+1. **Tempo cost per turn, not per maneuver.** `MOVE_NEG_REWARD_PER_TURN` → `TURN_TEMPO_REWARD`,
+   added once in `_apply_action` at the point the turn advances. That is "per coin spent from
+   hand" by construction, and it is exactly-once by construction rather than by keeping seven
+   sites in sync — the property that made the old version drift. All seven maneuver sites now
+   return 0.0. Two consequences worth naming: the charge is a **constant across every option a
+   turn offers**, so it cannot distort the choice *within* a turn (it prices only elapsed turns);
+   and the Swordsman's free post-attack move no longer costs strictly more than declining it.
+   The Berserker's stack-paid extras stay uncharged deliberately — they cost *material*, which
+   material PBRS already prices, so a tempo charge on top would be the same double-pay this item
+   is about. `Action.tempo_cost` carries the term separately so `LookaheadBot` and the score
+   decomposition can subtract it without pattern-matching on the reward value.
+2. **`ATTACK_REWARD` 0.02 → 0.0.** `score_attack` is now ~0 by construction; read the attack
+   axis off `score_material`. New `score_tempo` bucket keeps the decomposition honest (it would
+   otherwise have landed in `score_attack`, which would have looked like attack reward).
+3. **`holding_reward_rate` 0.001067 → 0.004324 (4.05×).** Divisor is now
+   `TYPICAL_MAIN_TURNS = 37`, sourced from converged runs (~78 plies in
+   `logs/ppo_20260807-203528.log`, about half the main actor's) rather than the `max_rounds *
+   HAND_SIZE = 150` worst-case bound no episode reaches. `WarChestEnv.default_holding_reward_rate()`
+   is now the single source for `ppo.py` and `LookaheadBot`, which previously duplicated the
+   formula. The trade: the old "accumulated holding can never exceed a win" bound is gone (see
+   `rewards.md` for why that is close to unreachable, and what to do if it bites).
+
+`tests/test_reward_hygiene.py` pins once-per-turn per mechanism — plain move, Cavalry tactic,
+Footman double maneuver, Berserker chain, Swordsman bonus move — plus no charge on a winning or
+invalid action. The property is invisible in gameplay, so nothing else would catch a regression.
+
+**Not yet measured.** All three are reward-scale changes: `score`, returns and `critic_mae` are
+**not** comparable across this boundary, only win rate and the gauntlet are. Change 3 in
+particular strengthens a **non-PBRS** term 4×, which is the one term that genuinely can move the
+optimum — it is the plausible regression here, and the one to look at first if the next run's
+`avg_turns` rises with a flat win rate (sitting on a lead, `METRICS.md`).
 
 #### L9. A tempo + lock metric panel
 
@@ -730,12 +943,12 @@ Not sequenced ahead of `next_iteration.md` §5 rows 2b/3. After those report:
 
 | order | item | why first | cost |
 |---|---|---|---|
-| 1 | **L2** (λ with the critic fix) | rides along with the first training run; without it the shipped critic fix cannot show up | trivial |
-| 2 | **B8** + **L5** + **L8** | two lines, a seed swap, a constant — all three make every later number cleaner | trivial |
-| 3 | **B5**, **B1** | fast independent opponents at hot-path cost, no new machinery | low |
-| 4 | **A2** | largest expected gain per line; readout only, no obs bump, aimed straight at §3.4 | low-mod |
+| 1 | ~~**L2**~~ (λ with the critic fix) | rides along with the first training run; without it the shipped critic fix cannot show up. **Shipped 2026-08-09** — `--lam` default is 0.90 | trivial |
+| 2 | **B8** + ~~**L5**~~ + ~~**L8**~~ | two lines, a seed swap, a constant — all three make every later number cleaner. **L8 shipped 2026-08-09**; it changes the reward scale, so it must land on the *same* side of any A/B boundary as B8/L5. **L5 shipped (and rejected) 2026-08-09** — `--paired-drafts`/`--draft-seed` landed, but the variance-reduction premise measured false on real fields; only B8's throughput half is still open | trivial |
+| 3 | **B5**, ~~**B1**~~ | fast independent opponents at hot-path cost, no new machinery. **B1 shipped 2026-08-09** (measured: 4–5x behaviour spread over the re-seed noise floor, fully transitive field, 2 of 6 promised archetypes real). What is left of it is one A/B: `--p-random-eval-finetune 0.15` against a baseline run, on the *training* benefit the coverage is supposed to buy | low |
+| 4 | ~~**A2**~~ | largest expected gain per line; readout only, no obs bump, aimed straight at §3.4. **Shipped 2026-08-09** as `critic_v4` — the §3.4 gate (does the tie rate drop further than v3's) still needs a run | low-mod |
 | 5 | **B3** | the falsifiable read on whether the race framing is right | moderate |
-| 6 | **B2** | interpretable exploitability; subsumes the expensive half of #12 | low-mod |
+| 6 | ~~**B2**~~ | ~~interpretable exploitability; subsumes the expensive half of #12~~ **Deprioritised 2026-08-09** — B1 measured the class ceiling at 0.00–0.08 vs the current policy (`greedy_sim` itself: 0.17), so a θ search cannot reach the 65 % decision threshold. Re-scope onto a stronger base bot first | low-mod |
 | 7 | **L1**, **B4** | 2× data and ~3× rollout throughput; B4 also unlocks L6, L7 and independent ExIt | moderate |
 | 8 | **A1 + A3** together | one `OBS_VERSION` bump buys both | moderate |
 | 9 | **A6**, **A7**, **L3**, **L4** | each depends on something above having reported | moderate |

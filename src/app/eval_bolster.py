@@ -7,11 +7,30 @@ itself (the draft happens before it acts). Plays `--games` games with balanced c
 (bot as P1 half, P2 half) and reports the bot's win rate plus a verb-usage breakdown, so
 "does it actually bolster / use the Berserker chain?" is visible alongside the win rate.
 
+**Drafts are an explicit, dumpable list** (docs/IDEAS.md L5). The gauntlet's antithetic
+trick — replay a draft with the seats swapped so each side plays both compositions — does
+not apply here: the bot's composition is pinned by construction, so it is the *treatment*,
+not a nuisance draw, and averaging over it would destroy the thing being measured. The
+control that does apply is common random numbers **across arms**: every arm faces the same
+list of drafts. A shared `--seed` almost achieved that already, but only by accident — it
+relies on every arm consuming the RNG in exactly the same order, which silently breaks the
+moment a bot's constructor or the env's reset changes. Generating the full 4/4 draft up
+front and pinning *both* sides makes it explicit and robust, and `--dump-drafts` /
+`--drafts` pins it across code versions too.
+
+Colour balancing is kept, though it is close to free: the base layout is exactly
+180-degree-rotation symmetric and `set_init_state` draws the initiative owner independently
+of player id, so there is no first-player advantage to cancel.
+
     python src/app/eval_bolster.py --games 60 --opponent lookahead
     python src/app/eval_bolster.py --games 60 --opponent lookahead --key-units 8      # berserker-only
     python src/app/eval_bolster.py --games 60 --opponent greedy_sim
+    # identical drafts across two arms, provably:
+    python src/app/eval_bolster.py --games 60 --opponent lookahead --dump-drafts d.json
+    python src/app/eval_bolster.py --games 60 --opponent policy    --drafts d.json
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -22,6 +41,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 import numpy as np
 
 from src.services.environment.warchest_env import WarChestEnv
+from src.services.environment.roster import UNIT_IDS
+from src.services.environment.game_state import UNITS_PER_PLAYER
 from src.services.bots.bolster_bot import BolsterBot, KEY_UNIT_IDS
 import glob
 import torch
@@ -49,13 +70,42 @@ def _build_opponent(name, *, time_budget, policy_path=None):
     raise SystemExit(f'unknown opponent {name!r}')
 
 
-def play_game(bot, opp, bot_pid, force_units, *, seed, max_turns=2000):
-    """One game. `bot` plays as `bot_pid`; its composition is forced to `force_units`.
+def build_draft_list(n_games, key_units, *, seed):
+    """`n_games` full drafts as (bot_composition, opp_composition) tuples.
+
+    Both sides are fully determined here rather than left to `set_init_state`'s RNG, so
+    the same list can be replayed by any arm regardless of what else consumes randomness
+    (see the module docstring). `key_units` are always in the bot's four; the remaining
+    slots on both sides are drawn from the rest of the roster, disjoint as the real draft
+    requires.
+    """
+    key = list(dict.fromkeys(int(u) for u in key_units))  # de-dup, keep order
+    if len(key) > UNITS_PER_PLAYER:
+        raise SystemExit(f'--key-units has {len(key)} units, more than the {UNITS_PER_PLAYER} '
+                         f'a player drafts')
+    rng = np.random.default_rng(seed)
+    pool = [u for u in UNIT_IDS if u not in key]
+    drafts = []
+    for _ in range(n_games):
+        fill = rng.choice(pool, size=2 * UNITS_PER_PLAYER - len(key), replace=False)
+        fill = [int(u) for u in fill]
+        bot_comp = tuple(key + fill[:UNITS_PER_PLAYER - len(key)])
+        opp_comp = tuple(fill[UNITS_PER_PLAYER - len(key):])
+        drafts.append((bot_comp, opp_comp))
+    return drafts
+
+
+def play_game(bot, opp, bot_pid, bot_comp, opp_comp, *, seed, max_turns=2000):
+    """One game. `bot` plays as `bot_pid`; BOTH compositions are pinned.
+
     Returns (result, turns) where result is 'win'/'loss'/'draw' from the bot's view.
+    Pinning both sides (not just the bot's) is what makes the draft identical across
+    arms — otherwise the opponent's four are redrawn from whatever RNG state the arm
+    happens to be in.
     """
     env = WarChestEnv(save_game_history=False)
     np.random.seed(seed)
-    env.reset(options={'force_units': {bot_pid: list(force_units)}})
+    env.reset(options={'force_units': {bot_pid: list(bot_comp), 3 - bot_pid: list(opp_comp)}})
     agents = {bot_pid: bot, 3 - bot_pid: opp}
 
     for t in range(max_turns):
@@ -87,18 +137,43 @@ def main():
     ap.add_argument('--pure', action='store_true',
                     help='Disable the archetype controller (pure LookaheadBot + forced draft baseline).')
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--draft-seed', type=int, default=None,
+                    help='Seed for the draft list (default: --seed). Two arms sharing this '
+                         'face identical drafts; see the module docstring.')
+    ap.add_argument('--drafts', default=None,
+                    help='Replay a draft list dumped by --dump-drafts, instead of generating '
+                         'one. Guarantees identical drafts across arms even if the code that '
+                         'consumes randomness has changed in between.')
+    ap.add_argument('--dump-drafts', default=None,
+                    help='Write the generated draft list here as JSON, to replay with --drafts.')
     args = ap.parse_args()
 
     bot = BolsterBot(build_target=args.build_target, time_budget=args.bot_time_budget,
                      max_branching=args.max_branching, archetype=not args.pure)
     opp = _build_opponent(args.opponent, time_budget=args.time_budget, policy_path=args.policy_path)
 
+    if args.drafts:
+        with open(args.drafts) as fh:
+            drafts = [(tuple(b), tuple(o)) for b, o in json.load(fh)]
+        if len(drafts) < args.games:
+            raise SystemExit(f'{args.drafts!r} holds {len(drafts)} drafts, fewer than '
+                             f'--games {args.games}')
+    else:
+        drafts = build_draft_list(
+            args.games, args.key_units,
+            seed=args.seed if args.draft_seed is None else args.draft_seed)
+    if args.dump_drafts:
+        with open(args.dump_drafts, 'w') as fh:
+            json.dump([[list(b), list(o)] for b, o in drafts], fh)
+        print(f'wrote {len(drafts)} drafts to {args.dump_drafts}')
+
     results = Counter()
     turns = []
     t0 = time.perf_counter()
     for g in range(args.games):
         bot_pid = 1 if g % 2 == 0 else 2   # alternate colors
-        res, n = play_game(bot, opp, bot_pid, args.key_units, seed=args.seed + g)
+        bot_comp, opp_comp = drafts[g]
+        res, n = play_game(bot, opp, bot_pid, bot_comp, opp_comp, seed=args.seed + g)
         results[res] += 1
         turns.append(n)
         if (g + 1) % 10 == 0:

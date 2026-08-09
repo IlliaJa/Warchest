@@ -17,6 +17,14 @@ row 6): it moved the output more than the position did, it is constant during fi
 it made the raw value meaningless to every consumer outside training. The offset it carried
 is removed from the *advantage* instead — see `test_rollout_buffer.py` for that half. Pinned
 here: the head really is narrower, v1/v2 still demand their block, and v3 tolerates `None`.
+
+`critic_v4` then replaces `_split_pool`'s flank average with a task-relevant gather
+(docs/IDEAS.md A2): the 10 fixed base-cell features, masked mean+max over own/opponent
+unit-occupied cells, and a whole-board mean+max. Pinned here: the base gather reads exactly
+the 10 cells in `Board.default_bases`, the unit pools match a hand-computed mean/max over the
+occupied cells (and fall back to zero with nobody on the board yet), the pool is 16x hidden
+width instead of 2x, and `value_from_features` — which never receives the raw board needed for
+occupancy — refuses rather than silently pooling the wrong thing.
 """
 import numpy as np
 import pytest
@@ -28,7 +36,7 @@ from src.services.policy.checkpoint import (
     CRITIC_ARCHS, CURRENT_CRITIC_ARCH, load_critic_checkpoint, save_critic_checkpoint,
 )
 from src.services.policy.policy import (
-    CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3, Critic,
+    CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3, CRITIC_ARCH_V4, Critic, _BASE_CELLS,
 )
 
 DEV = torch.device('cpu')
@@ -40,10 +48,10 @@ def _boards(n=16, channels=None):
     return torch.randn(n, ch, 7, 7)
 
 
-def test_v3_is_the_default_and_every_arch_builds():
-    assert CURRENT_CRITIC_ARCH == CRITIC_ARCH_V3
-    assert set(CRITIC_ARCHS) == {CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3}
-    assert Critic(DEV, HIDDEN).arch == CRITIC_ARCH_V3
+def test_v4_is_the_default_and_every_arch_builds():
+    assert CURRENT_CRITIC_ARCH == CRITIC_ARCH_V4
+    assert set(CRITIC_ARCHS) == {CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3, CRITIC_ARCH_V4}
+    assert Critic(DEV, HIDDEN).arch == CRITIC_ARCH_V4
     for arch in CRITIC_ARCHS:
         assert Critic(DEV, HIDDEN, arch=arch).arch == arch
 
@@ -280,3 +288,120 @@ def test_v3_state_dict_is_not_interchangeable_with_v2():
         v3.load_state_dict(v2.state_dict())
     with pytest.raises(RuntimeError):
         v2.load_state_dict(v3.state_dict())
+
+
+# --------------------------------------------------------------------------- #
+# critic_v4: the flank-average pool is replaced by a task-relevant gather (A2)
+# --------------------------------------------------------------------------- #
+
+def test_v4_has_exactly_ten_base_cells_matching_board_default_bases():
+    from src.services.environment.board import Board
+    all_cells = {cell for cells in Board.default_bases.values() for cell in cells}
+    assert len(_BASE_CELLS) == 10
+    assert set(_BASE_CELLS) == all_cells
+
+
+def test_v4_pool_is_16x_hidden_vs_2x_for_earlier_archs():
+    v3 = Critic(DEV, HIDDEN, arch=CRITIC_ARCH_V3)
+    v4 = Critic(DEV, HIDDEN, arch=CRITIC_ARCH_V4)
+    assert v3.pool_width == 2 * HIDDEN
+    assert v4.pool_width == 16 * HIDDEN
+    assert v4.head[0].in_features - v3.head[0].in_features == 14 * HIDDEN
+    assert v4.board_only_head.in_features == 16 * HIDDEN
+
+
+def test_v4_also_drops_the_opponent_onehot_like_v3():
+    assert not Critic(DEV, HIDDEN, arch=CRITIC_ARCH_V4).uses_opp_onehot
+
+
+def test_v4_base_gather_reads_exactly_the_ten_fixed_cells():
+    """A hand-built feature map where each cell's value is its own (row, col) id."""
+    enc = latest_encoder()
+    c = Critic(DEV, HIDDEN, obs_encoder=enc, arch=CRITIC_ARCH_V4)
+    feat = torch.zeros(2, HIDDEN, 7, 7)
+    for r in range(7):
+        for q in range(7):
+            feat[:, :, r, q] = r * 7 + q
+    board_enc = torch.zeros(2, enc.board_channels, 7, 7)  # no units anywhere
+    pooled = c._gathered_pool(board_enc, feat)
+    base = pooled[:, :10 * HIDDEN].reshape(2, HIDDEN, 10)
+    expected = torch.tensor([r * 7 + q for r, q in _BASE_CELLS], dtype=torch.float32)
+    assert torch.allclose(base[:, 0, :], expected.expand(2, -1))
+
+
+def test_v4_unit_pool_matches_a_hand_computed_mean_and_max():
+    enc = latest_encoder()
+    c = Critic(DEV, HIDDEN, obs_encoder=enc, arch=CRITIC_ARCH_V4)
+    feat = torch.zeros(1, HIDDEN, 7, 7)
+    for r in range(7):
+        for q in range(7):
+            feat[:, :, r, q] = r * 7 + q
+    board_enc = torch.zeros(1, enc.board_channels, 7, 7)
+    own_cells, opp_cells = [(0, 0), (3, 3)], [(6, 6)]
+    for r, q in own_cells:
+        board_enc[0, enc.own_unit_channels.start, r, q] = 1.0
+    for r, q in opp_cells:
+        board_enc[0, enc.opp_unit_channels.start, r, q] = 1.0
+    pooled = c._gathered_pool(board_enc, feat)
+    w = 10 * HIDDEN
+    own_mean, own_max, opp_mean, opp_max = (
+        pooled[:, w:w + HIDDEN], pooled[:, w + HIDDEN:w + 2 * HIDDEN],
+        pooled[:, w + 2 * HIDDEN:w + 3 * HIDDEN], pooled[:, w + 3 * HIDDEN:w + 4 * HIDDEN],
+    )
+    own_vals = torch.tensor([r * 7 + q for r, q in own_cells], dtype=torch.float32)
+    opp_vals = torch.tensor([r * 7 + q for r, q in opp_cells], dtype=torch.float32)
+    assert torch.allclose(own_mean[0], own_vals.mean().expand(HIDDEN))
+    assert torch.allclose(own_max[0], own_vals.max().expand(HIDDEN))
+    assert torch.allclose(opp_mean[0], opp_vals.mean().expand(HIDDEN))
+    assert torch.allclose(opp_max[0], opp_vals.max().expand(HIDDEN))
+
+
+def test_v4_unit_pool_falls_back_to_zero_with_nobody_on_the_board():
+    """Before deploy, own/opp occupancy is empty — must not propagate -inf/NaN."""
+    enc = latest_encoder()
+    c = Critic(DEV, HIDDEN, obs_encoder=enc, arch=CRITIC_ARCH_V4)
+    feat = torch.randn(3, HIDDEN, 7, 7)
+    board_enc = torch.zeros(3, enc.board_channels, 7, 7)
+    pooled = c._gathered_pool(board_enc, feat)
+    w = 10 * HIDDEN
+    unit_block = pooled[:, w:w + 4 * HIDDEN]
+    assert torch.equal(unit_block, torch.zeros_like(unit_block))
+    assert torch.isfinite(pooled).all()
+
+
+def test_v4_global_pool_matches_plain_mean_and_max_over_the_whole_board():
+    enc = latest_encoder()
+    c = Critic(DEV, HIDDEN, obs_encoder=enc, arch=CRITIC_ARCH_V4)
+    feat = torch.randn(4, HIDDEN, 7, 7)
+    board_enc = torch.zeros(4, enc.board_channels, 7, 7)
+    pooled = c._gathered_pool(board_enc, feat)
+    w = 10 * HIDDEN + 4 * HIDDEN
+    glob_mean, glob_max = pooled[:, w:w + HIDDEN], pooled[:, w + HIDDEN:w + 2 * HIDDEN]
+    assert torch.allclose(glob_mean, feat.mean(dim=(-2, -1)))
+    assert torch.allclose(glob_max, feat.flatten(2).max(dim=-1).values)
+
+
+def test_v4_board_only_head_gradient_reaches_the_trunk():
+    c = Critic(DEV, HIDDEN, arch=CRITIC_ARCH_V4)
+    loss = ((c.board_only_value(_boards()) - torch.randn(16)) ** 2).mean()
+    loss.backward()
+    first_conv = next(m for m in c.board_encoder.modules() if isinstance(m, torch.nn.Conv2d))
+    assert first_conv.weight.grad is not None
+    assert float(first_conv.weight.grad.abs().sum()) > 0
+
+
+def test_v4_refuses_value_from_features_since_it_has_no_raw_board():
+    enc = latest_encoder()
+    c = Critic(DEV, HIDDEN, arch=CRITIC_ARCH_V4)
+    feat = torch.randn(1, HIDDEN, 7, 7)
+    glob, priv = torch.randn(1, enc.global_dim), torch.randn(1, enc.priv_dim)
+    with pytest.raises(NotImplementedError, match='raw board'):
+        c.value_from_features(feat, glob, None, priv)
+
+
+def test_v4_state_dict_is_not_interchangeable_with_v3():
+    v3, v4 = Critic(DEV, HIDDEN, arch=CRITIC_ARCH_V3), Critic(DEV, HIDDEN, arch=CRITIC_ARCH_V4)
+    with pytest.raises(RuntimeError):
+        v4.load_state_dict(v3.state_dict())
+    with pytest.raises(RuntimeError):
+        v3.load_state_dict(v4.state_dict())

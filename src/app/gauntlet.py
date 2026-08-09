@@ -21,8 +21,10 @@ import sys
 # Make `import src...` work when run as `python src/app/gauntlet.py` from the root.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
+import numpy as np
 import torch
 
+from src.services.bots.evaluation import sample_theta, theta_tag, format_theta
 from src.services.gauntlet import round_robin, build_agent
 from src.services.gauntlet_parallel import round_robin_parallel
 
@@ -116,6 +118,28 @@ def _build_specs(args):
         specs.append({'kind': 'greedy_sim', 'name': 'greedy_sim'})
     if 'greedy_fast' in args.bots:
         specs.append({'kind': 'greedy_fast', 'name': 'greedy_fast'})
+    if 'threat_greedy' in args.bots:
+        specs.append({'kind': 'threat_greedy', 'name': 'threat_greedy'})
+    # The two θ-family kinds (docs/IDEAS.md B1) differ only in their base search bot, so
+    # they share one entrant-building loop. `--random-eval-n` separate entrants, one pinned
+    # θ each, named `re<i><tag>` / `la<i><tag>` — 6 chars, exactly the report's column
+    # width, and distinct by index even when two draws share a dominant term. Seeds are
+    # `--random-eval-seed + i`, so the same pair of flags reproduces the same field; both
+    # kinds draw the same θ at the same seed, which is what makes them comparable.
+    for kind, prefix, extra in (
+        ('random_eval', 're', {'reply_branching': args.random_eval_reply_branching}),
+        ('random_eval_lookahead', 'la', {'time_budget': args.random_eval_time_budget,
+                                         'max_branching': args.random_eval_max_branching}),
+    ):
+        if kind not in args.bots:
+            continue
+        for i in range(args.random_eval_n):
+            seed = args.random_eval_seed + i
+            theta = sample_theta(np.random.default_rng(seed))
+            name = f'{prefix}{i}{theta_tag(theta)}'
+            specs.append({'kind': kind, 'name': name,
+                          'kwargs': {'seed': seed, 'theta': theta, **extra}})
+            print(f'  {name}: {format_theta(theta)}')
     if 'random' in args.bots:
         specs.append({'kind': 'random', 'name': 'random'})
     if 'lookahead' in args.bots:
@@ -268,8 +292,9 @@ def main():
     parser = argparse.ArgumentParser(description='Warchest round-robin gauntlet.')
     parser.add_argument('--bots', nargs='+',
                         default=['policy', 'greedy_sim', 'lookahead', 'lookahead_critic', 'policy_critic'],
-                        choices=['policy', 'greedy_sim', 'greedy_fast', 'random', 'lookahead',
-                                 'lookahead_critic', 'policy_critic', 'round_critic', 'puct'],
+                        choices=['policy', 'greedy_sim', 'greedy_fast', 'threat_greedy', 'random',
+                                 'lookahead', 'lookahead_critic', 'policy_critic', 'round_critic',
+                                 'puct', 'random_eval', 'random_eval_lookahead'],
                         help='Participant kinds to include in the field. Default: '
                              'policy greedy_sim lookahead lookahead_critic policy_critic. "policy" '
                              'loads checkpoints per --checkpoints (or the data/*.pth glob); '
@@ -282,6 +307,14 @@ def main():
     parser.add_argument('--k-games', type=int, default=20,
                         help='Games per pair (colors balanced). Default 20.')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument(
+        '--paired-drafts', action='store_true',
+        help='Replay each draft once per color instead of drawing a fresh one per game '
+             '(docs/IDEAS.md L5). OFF by default because it was measured and does not help: '
+             'the variance reduction needs the two games of a pair to be negatively '
+             'correlated, and they measure r = -0.00 +/- 0.08 both for a heterogeneous and a '
+             'homogeneous field. Kept for a field of deterministic entrants, where the '
+             'argument may still hold.')
     parser.add_argument('--lookahead-time-budget', type=float, default=0.1,
                         help='Per-move search budget in seconds, for LookaheadBot.')
     parser.add_argument('--lookahead-max-branching', type=int, default=8,
@@ -311,6 +344,23 @@ def main():
                              'branching cap, time budget and blind flag are shared with the '
                              '--lookahead-critic-* options (both bots run the same search). '
                              'Also supplies puct\'s prior policy.')
+    parser.add_argument('--random-eval-n', type=int, default=6,
+                        help='Number of sampled-θ RandomEvalBot entrants (docs/IDEAS.md B1), '
+                             'one pinned θ each, when "random_eval" is in --bots. Default 6.')
+    parser.add_argument('--random-eval-seed', type=int, default=0,
+                        help='Base seed for the θ draws; entrant i uses seed+i. Same flag '
+                             'pair = same field.')
+    parser.add_argument('--random-eval-reply-branching', type=int, default=8,
+                        help='Opponent replies examined at the 2nd ply by each RandomEvalBot '
+                             '(SimGreedyBot knob). Lower is cheaper; 2 is the setting B1 '
+                             'suggests for the training hot path. Default 8 (the base bot\'s). '
+                             'random_eval only.')
+    parser.add_argument('--random-eval-time-budget', type=float, default=0.1,
+                        help='Per-move search budget for each random_eval_lookahead entrant '
+                             '(the same θ family on the alpha-beta search, ~6x the per-move '
+                             'cost of random_eval). Default 0.1.')
+    parser.add_argument('--random-eval-max-branching', type=int, default=8,
+                        help='Branching cap per search node for random_eval_lookahead.')
     parser.add_argument('--puct-c', type=float, default=1.5,
                         help='PUCT exploration constant, for PuctBot (higher = trust the '
                              'policy prior / explore breadth longer). Default 1.5.')
@@ -357,10 +407,12 @@ def main():
     print(f'Field ({len(specs)}): ' + ', '.join(names))
     print(f'Playing {args.k_games} games/pair ...')
     if args.n_workers <= 1:
-        out = round_robin(agents, k_games=args.k_games, seed=args.seed)
+        out = round_robin(agents, k_games=args.k_games, seed=args.seed,
+                          paired=args.paired_drafts)
     else:
         print(f'Using {args.n_workers} parallel worker processes (CPU-only evaluation).')
         out = round_robin_parallel(specs, names, k_games=args.k_games, seed=args.seed,
+                                   paired=args.paired_drafts,
                                     n_workers=args.n_workers)
     _print_report(out)
 

@@ -38,11 +38,11 @@ the fixes below, all vs the same opponent:
 Two real bugs found and fixed along the way, not just tuning:
 
 1. **Reward reuse regressed before it helped.** The env's reward is split across two
-   places — `Action.reward` (win/loss/attack/invalid/`MOVE_NEG_REWARD_PER_TURN`) and
+   places — `Action.reward` (win/loss/attack/invalid/`TURN_TEMPO_REWARD`) and
    `rollout_core.py`'s PBRS/holding terms. The original leaf potential only replayed the
    PBRS half. Accumulating the *full* `Action.reward` along the search path (gamma-
    discounted, added to the PBRS potential at the leaf) is a more faithful reuse of what
-   the policy is actually trained to maximize — but reusing `MOVE_NEG_REWARD_PER_TURN`
+   the policy is actually trained to maximize — but reusing the tempo term
    verbatim made things worse, not better (25%→10%), because that term only makes sense
    paired with a long horizon and a bootstrapped critic that can see the eventual payoff
    of advancing; a short, critic-free search only sees the immediate -0.002 cost and

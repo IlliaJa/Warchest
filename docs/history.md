@@ -306,3 +306,81 @@ nothing in it is individually attributable — recorded here so it is not later 
 `--lam 0.97` reproduces the prior behaviour for a baseline arm. **Trap:** λ also determines the
 critic's regression target (`returns = GAE advantage + values`), so `critic_mae` is *not*
 comparable across λ arms — it should fall at 0.90 simply because the target is more bootstrapped.
+
+---
+
+## Reward hygiene: tempo per turn, `ATTACK_REWARD` zeroed, holding rate re-derived (2026-08-09)
+
+`docs/IDEAS.md` L8, which bundled its own item with the two `next_iteration.md` §4 had been
+carrying since 2026-07-03. All three are one-line-scale changes; none of them is measured yet.
+
+**The tempo cost was charged per maneuver, not per turn.** `MOVE_NEG_REWARD_PER_TURN = -0.002`
+sat at seven `warchest_env.py` call sites, five of them tactic continuations, so a Berserker
+chain, a Footman double maneuver and a Swordsman bonus move each paid it *again per maneuver*.
+In a game whose currency is maneuvers-per-coin that taxed precisely the mechanics that buy extra
+maneuvers — and the sharpest edge was that the Swordsman's *free* post-attack move cost strictly
+more than declining it. The penalty was already known to be mis-scoped from the other direction:
+`LookaheadBot` had to special-case it out of its search accumulation (`_own_action_reward`,
+`docs/lookahead_bot_plan.md`) because a depth-bounded search only ever sees the cost.
+
+| What changed | Detail |
+|---|---|
+| **`TURN_TEMPO_REWARD`** (renamed from `MOVE_NEG_REWARD_PER_TURN`) | added once in `_apply_action`, at the point the turn advances. That is "once per coin spent from hand" by construction, and exactly-once by construction rather than by keeping seven sites in sync — which is how the old version drifted in the first place. All seven maneuver sites now return `0.0`. Never charged on a game-ending move, an invalid action, or a mid-tactic continuation. |
+| **Why it cannot distort a decision** | every option a turn offers now pays the identical amount, so the charge is a constant *within* a decision and cancels out of the comparison. It prices elapsed turns and nothing else, which is all it was ever meant to do. |
+| **The Berserker's stack-paid extras stay uncharged** | deliberately. They cost *material*, which material PBRS already prices; a tempo charge on top would be the same double-pay this whole item is about. |
+| **`Action.tempo_cost`** | new field carrying the charge separately (already included in `reward`). `LookaheadBot._own_action_reward` now subtracts it instead of comparing the reward against the constant — equality stopped identifying the term once it rides on top of every turn-ending reward rather than standing alone on plain moves. |
+| **`ATTACK_REWARD` 0.02 → 0.0** | it fired on the same box-a-coin event as material PBRS and is non-telescoping, so the two double-paid every attack (flagged 2026-07-03, deferred then to keep that change set minimal). Kept as a named constant so the A/B back is one line. `score_attack` is now ~0 by construction — read the attack axis off `score_material`. |
+| **`score_tempo`** | new decomposition bucket. Without it the tempo cost would have landed in `score_attack`, which — with `ATTACK_REWARD` at 0 — would have made a pure tempo count look like attack reward. Doubles as a clean read on episode length in turns, and against `n_decisions` on how many main-actor clicks were free continuations. |
+| **`holding_reward_rate` 0.001067 → 0.004324 (4.05×)** | the divisor was `max_rounds * HAND_SIZE = 150`, the absolute worst case on main-actor turns. Converged runs settle near 78 plies (`turns=` in `logs/ppo_20260807-203528.log`), about half the main actor's, hence `TYPICAL_MAIN_TURNS = 37` — matching the ~37 in `next_iteration.md` §3. Sizing a per-turn rate on a bound no episode reaches made the term ~4× weaker than its own design intent in every game actually played, so it was not the mechanism the base-flip fix assumed. |
+| **One source for the rate** | `WarChestEnv.default_holding_reward_rate()`. `ppo.py` and `LookaheadBot` had duplicated the formula, and `LookaheadBot`'s copy also hardcoded `1.0` for `WIN_REWARD`. |
+| **Tests** | `tests/test_reward_hygiene.py` (new, 9 tests) pins once-per-turn *per mechanism* — plain move, Cavalry tactic, Footman double maneuver, Berserker chain, Swordsman bonus move (including that taking it costs the same as declining) — plus no charge on a winning or invalid action, `ATTACK_REWARD == 0`, and the holding-rate sizing property. Full suite: **190 passed**. |
+
+**The trade taken on the holding rate.** The old 0.8 factor was described as a safety margin
+guaranteeing accumulated holding could never exceed `WIN_REWARD`. That guarantee is gone: an
+unusually long game at a sustained 5-base lead can now accumulate more than a win. It is close to
+unreachable — a 5-base lead is one claim from ending the game — and `shaping_anneal` decays this
+term to a 0.1 floor over the first half of a run. If it does bite, cap the accumulation rather
+than restoring the 150; restoring it just re-creates a term that is 4× weaker than designed.
+
+**Owed, and the thing to watch.** All three changes move the reward scale, so `score`, returns and
+`critic_mae` are **not** comparable across this date — only win rate and the gauntlet are. The
+holding rate is the one to watch: it is the sole surviving **non-PBRS** term, the only one that
+can genuinely move the optimum, and it just got 4× stronger. The predicted failure mode is the
+one `METRICS.md` already names — `avg_turns` rising with a flat win rate, i.e. sitting on a lead
+instead of closing. The two tempo/attack changes are hygiene and should be close to neutral.
+
+---
+
+## Draft pairing: tried and rejected; explicit draft lists for forced-draft evals (2026-08-09)
+
+*Source: `docs/IDEAS.md` L5. Measurement infrastructure only — no training-loop change. Recorded
+as a **negative result with a working implementation left opt-in**, because the reasoning was
+sound and will otherwise be re-proposed.*
+
+**The premise, measured first.** Same deterministic bot (`greedy_fast`) on both sides, 300 paired
+games with the two compositions swapped between seats: the same composition won **both** games
+190/300 = **63.3 % ± 2.8 pp**. So ~**27 % of decisive games are settled by the draft alone**.
+Replaying each draft once per colour should therefore cancel it — with `p` the true win rate and
+`D` the draft advantage, two unpaired games give `Var = 2p(1−p)` and a mirrored pair gives
+`2p(1−p) − 2·Var(D)`.
+
+**Why it does not work.** The reduction needs the two games of a pair to be negatively
+correlated. Measured on 150 pairs each: `greedy_fast` vs `greedy_sim` **r = −0.003 ± 0.082**, and
+`ckpt_20260725` vs `ckpt_20260808` **r = −0.005 ± 0.082**. The 63.3 % was measured with one
+deterministic bot playing *itself*, where composition is the only thing that can decide; real
+entrants differ and policy agents **sample** their actions, so an identical opening diverges on
+the first ply and the shared draft never propagates. Two direct variance checks landed at ratio
+1.29 and 0.77 (n=120 each) — ~1.4 σ in opposite directions, i.e. noise. Neither should be cited.
+
+| What changed | Detail |
+|---|---|
+| **`build_task_list(paired=...)`**, default **off** | Consecutive colour-swapped games share a seed instead of taking a fresh one. Threaded through `round_robin` and `round_robin_parallel`; exposed as `--paired-drafts`. Off by default, so every gauntlet number recorded before this date stays reproducible bit-for-bit at its seed — the change costs nothing and is available if a future field of deterministic entrants wants it. An odd `k_games` leaves one unpartnered trailing game, which still consumes its seed so the next matchup cannot silently reuse that draft. |
+| **`eval_bolster.build_draft_list`** — **kept on** | A forced-draft bot cannot use the swap in any case: its composition follows the *agent*, not the seat, so it is the treatment rather than a nuisance draw. Its control is common random numbers **across arms**, so the harness now generates the full 4/4 draft up front and pins **both** sides via `force_units`, with `--draft-seed`, `--dump-drafts` and `--drafts`. A shared `--seed` nearly achieved this already, but only by relying on every arm consuming the RNG in the same order — which breaks silently when a bot's constructor or the env's reset changes. This is a robustness fix, not a variance claim. Verified by dump-then-replay: identical W/L/D. |
+| **Seat balancing: measurably pointless, kept anyway** | The base layout is exactly 180°-rotation symmetric (`(1,0)→(5,6)`, `(4,1)→(2,5)`, every neutral base maps onto another) and `set_init_state` draws `initiative_owner` independently of player id — there is no first-player advantage to cancel. It costs nothing, so it stays. |
+| **Tests** | `tests/test_paired_drafts.py`, 14 tests. They pin the *schedule* and the env property it depends on (*same seed ⇒ same draft*, without which `paired=True` would silently be a no-op) — deliberately **not** a variance claim. Also pinned: the default is unpaired, seeds never collide across matchups, and the odd-`k` trailing game. Full suite: **204 passed**. |
+
+**Method note worth keeping.** This scheme was derived from a model of the game, verified on a bot
+playing *itself*, and then failed on the real field — the third time in this project that a
+quantity measured on a degenerate proxy did not transfer (cf. `next_iteration.md` §4's
+"reliability is not validity"). **Validate a variance-reduction scheme on the estimator you
+actually use, not on a simplified stand-in.**

@@ -34,7 +34,7 @@ import torch
 torch.set_num_threads(1)  # match the rollout workers; see module docstring
 
 from src.services.environment.warchest_env import WarChestEnv
-from src.services.bots import GreedyBot, RandomBot
+from src.services.bots import GreedyBot, RandomBot, ThreatAwareGreedyBot
 from src.services.policy.policy import Policy, Critic
 
 
@@ -184,8 +184,10 @@ def table_a(args):
     # full games, using the obs bots' direct cost as the opponent term.
     random_ms, _ = _obs_bot_cost(RandomBot(), args.fast_games)
     greedy_ms, n_states = _obs_bot_cost(GreedyBot(), args.fast_games)
+    threat_ms, _ = _obs_bot_cost(ThreatAwareGreedyBot(), args.fast_games)
     print(f'RandomBot.act(obs)                   {random_ms:8.3f} ms   ({n_states} real states)')
     print(f'GreedyBot.act(obs)                   {greedy_ms:8.3f} ms   ({n_states} real states)')
+    print(f'ThreatAwareGreedyBot.act(obs)        {threat_ms:8.3f} ms   ({n_states} real states)')
 
     from src.services.bots.greedy_sim_bot import SimGreedyBot
     sim_ms, _, _ = _per_move_cost(SimGreedyBot(), True, args.sim_games, greedy_ms, step_ms)

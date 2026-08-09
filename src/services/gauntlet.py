@@ -22,8 +22,10 @@ import numpy as np
 from .environment.warchest_env import WarChestEnv
 from .environment.obs_encoders import get_encoder, latest_encoder
 from .bots.greedy_bot import GreedyBot
+from .bots.threat_greedy_bot import ThreatAwareGreedyBot
 from .bots.greedy_sim_bot import SimGreedyBot
 from .bots.bolster_bot import BolsterBot
+from .bots.random_eval_bot import RandomEvalBot, RandomEvalLookaheadBot
 from .bots.random_bot import RandomBot
 from .bots.lookahead_bot import LookaheadBot
 from .bots.lookahead_critic_bot import LookaheadCriticBot
@@ -90,6 +92,27 @@ def greedy_sim_agent(name='greedy_sim', encoder=None, **kwargs):
     return SimGreedyBot(name=name, **kwargs)
 
 
+def random_eval_agent(name=None, encoder=None, *, theta=None, seed=0, **kwargs):
+    """`RandomEvalBot` — a `SimGreedyBot` with sampled leaf coefficients (docs/IDEAS.md B1).
+
+    Speaks `act(env)` + `.name` directly, like the other simulation bots. θ is **pinned**
+    here (`resample_each_episode` is left at its default False): the gauntlet's antithetic
+    draft pairing only cancels if the same agent plays both games of a pair, and a column
+    of the report is only interpretable if it names one playstyle. Per-episode resampling
+    belongs to the training pool — see `OpponentPool`.
+    """
+    return RandomEvalBot(theta=theta, seed=seed, name=name, **kwargs)
+
+
+def random_eval_lookahead_agent(name=None, encoder=None, *, theta=None, seed=0, **kwargs):
+    """`RandomEvalLookaheadBot` — the same θ family on the alpha-beta search (IDEAS.md B1).
+
+    ~6x the per-move cost of `random_eval` (IDEAS.md Table A), for a base bot that beats
+    `SimGreedyBot` 0.79. θ is pinned here for the same reason as `random_eval_agent`.
+    """
+    return RandomEvalLookaheadBot(theta=theta, seed=seed, name=name, **kwargs)
+
+
 def bolster_agent(name='bolster', encoder=None, **kwargs):
     """BolsterBot — the Berserker/Priest bolster-archetype exploiter
     (docs/independent_opponents.md). Speaks `act(env)` + `.name` directly, like the
@@ -107,6 +130,14 @@ def greedy_fast_agent(name='greedy_fast', encoder=None):
     that `greedy_sim` is the heavier simulation bot.
     """
     return HeuristicAgent(name, GreedyBot(), encoder)
+
+
+def threat_greedy_agent(name='threat_greedy', encoder=None):
+    """`ThreatAwareGreedyBot` — obs-only like `greedy_fast`, but reading the threat
+    planes (docs/IDEAS.md B5). Same cost class as GreedyBot, so it is a like-for-like
+    comparison: the only thing that changed is what the bot looks at.
+    """
+    return HeuristicAgent(name, ThreatAwareGreedyBot(), encoder)
 
 
 def random_agent(name='random', encoder=None):
@@ -183,8 +214,14 @@ def build_agent(spec, *, device):
         return greedy_sim_agent(spec['name'], **spec.get('kwargs', {}))
     if kind == 'bolster':
         return bolster_agent(spec['name'], **spec.get('kwargs', {}))
+    if kind == 'random_eval':
+        return random_eval_agent(spec.get('name'), **spec.get('kwargs', {}))
+    if kind == 'random_eval_lookahead':
+        return random_eval_lookahead_agent(spec.get('name'), **spec.get('kwargs', {}))
     if kind == 'greedy_fast':
         return greedy_fast_agent(spec['name'])
+    if kind == 'threat_greedy':
+        return threat_greedy_agent(spec['name'])
     if kind == 'random':
         return random_agent(spec['name'])
     if kind == 'lookahead':
@@ -220,6 +257,14 @@ def play_game(agent_p1, agent_p2, *, seed=None, max_turns=2000):
         np.random.seed(seed)
     env.reset()
     agents = {1: agent_p1, 2: agent_p2}
+    # Episode-boundary hook for agents that carry per-episode state (`RandomEvalBot`
+    # resamples θ here). Duck-typed — most agents don't define it. Called *after*
+    # `env.reset()` so a hook that touches the global RNG cannot shift the draft this
+    # game's seed just pinned.
+    for agent in (agent_p1, agent_p2):
+        hook = getattr(agent, 'new_episode', None)
+        if hook is not None:
+            hook()
 
     for _ in range(max_turns):
         pid = env.active_player
@@ -239,7 +284,7 @@ def play_game(agent_p1, agent_p2, *, seed=None, max_turns=2000):
 # --------------------------------------------------------------------------- #
 # Round-robin + ratings
 # --------------------------------------------------------------------------- #
-def build_task_list(n, *, k_games, seed):
+def build_task_list(n, *, k_games, seed, paired=False):
     """Deterministic `(i, j, game_seed, p1_is_i)` tasks for an n-agent round-robin.
 
     Pair order (`itertools.combinations`) and per-pair game/seed/color order are
@@ -247,6 +292,38 @@ def build_task_list(n, *, k_games, seed):
     exact same seed to the exact same pairing regardless of dispatch order —
     which is what lets a parallel run reproduce a sequential run's result matrix
     bit-for-bit at a given seed (see `gauntlet_parallel.py`).
+
+    `paired` makes each color swap replay the previous game's draft: `play_game` seeds
+    the global RNG before `env.reset()` and `set_init_state` draws the whole 4/4
+    disjoint draft from it, so two games at the same seed open identically, and
+    swapping which agent sits in seat 1 makes each agent play both compositions.
+
+    **It defaults OFF, because it was measured and it does not work here**
+    (docs/IDEAS.md L5). The idea was sound on paper — writing `p` for the true win rate
+    and `D` for the draft advantage, two unpaired games give `Var = 2p(1-p)` while a
+    pair that flips the sign of `D` gives `2p(1-p) - 2*Var(D)`. And the draft really
+    does decide games: with the *same* deterministic bot on both sides and the
+    compositions swapped, the same composition won both games **63.3 %** of the time
+    (190/300, se 2.8 pp).
+
+    But the variance reduction needs the two games of a pair to be **negatively
+    correlated**, and they are not. Measured on 150 pairs each:
+    `greedy_fast` vs `greedy_sim` **r = -0.003 +/- 0.082**, and two policy checkpoints
+    **r = -0.005 +/- 0.082**. The mechanism never engages, because the 63.3 % was
+    measured with one deterministic bot playing itself — in a real gauntlet the
+    entrants differ, and policy agents *sample* their actions, so an identical opening
+    diverges on the first ply and the shared draft stops propagating. Two direct
+    variance checks (n=120 each) came out at ratio 1.29 and 0.77, i.e. ~1.4 sigma in
+    opposite directions: noise, not an effect.
+
+    So `paired=True` is kept as an opt-in for a field of deterministic entrants, where
+    the argument may still hold, and is off by default so every previously recorded
+    gauntlet number stays reproducible bit-for-bit at its seed.
+
+    Note it could never have applied to a forced-draft archetype bot
+    (`eval_bolster.py`) in any case: there the composition is pinned to the *agent*
+    rather than the seat, so it is the treatment rather than a nuisance draw, and the
+    control is common random numbers across arms instead.
     """
     tasks = []
     rng_seed = seed
@@ -254,6 +331,12 @@ def build_task_list(n, *, k_games, seed):
         for g in range(k_games):
             # Alternate colors: even games i=P1, odd games j=P1.
             tasks.append((i, j, rng_seed, g % 2 == 0))
+            # Paired: hold the seed across the odd game so it replays the even game's
+            # draft with the seats swapped, then advance. Unpaired: advance every game.
+            rng_seed += (g % 2) if paired else 1
+        # An odd k_games leaves a trailing unpartnered game; it still consumed a seed,
+        # so advance past it or the next pair would silently reuse that draft.
+        if paired and k_games % 2:
             rng_seed += 1
     return tasks
 
@@ -303,7 +386,7 @@ def _finalize_report(names, wins, games, results=None):
     }
 
 
-def round_robin(agents, *, k_games=20, seed=0, tasks=None):
+def round_robin(agents, *, k_games=20, seed=0, tasks=None, paired=False):
     """Play every pair K games with balanced colors.
 
     Returns a dict with agent names, the wins/games/win-rate matrices (wins counts
@@ -312,7 +395,8 @@ def round_robin(agents, *, k_games=20, seed=0, tasks=None):
 
     `tasks` overrides the default all-pairs schedule with an explicit
     `[(i, j, game_seed, p1_is_i), ...]` list — for experiments that need a specific
-    pairing/seed layout rather than a round-robin (`k_games`/`seed` are then unused).
+    pairing/seed layout rather than a round-robin (`k_games`/`seed`/`paired` are then
+    unused). `paired` is the antithetic-draft schedule; see `build_task_list`.
     """
     n = len(agents)
     names = [a.name for a in agents]
@@ -321,7 +405,7 @@ def round_robin(agents, *, k_games=20, seed=0, tasks=None):
     results = []
 
     if tasks is None:
-        tasks = build_task_list(n, k_games=k_games, seed=seed)
+        tasks = build_task_list(n, k_games=k_games, seed=seed, paired=paired)
     for i, j, game_seed, p1_is_i in tasks:
         if p1_is_i:
             res = play_game(agents[i], agents[j], seed=game_seed)

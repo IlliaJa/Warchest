@@ -52,11 +52,11 @@ from collections import Counter
 import numpy as np
 
 from ..environment.warchest_env import (
-    WarChestEnv, SPATIAL_SIZE, LOSS_REWARD, MOVE_NEG_REWARD_PER_TURN,
+    WarChestEnv, SPATIAL_SIZE, LOSS_REWARD,
     CONTROL_VERB, BOLSTER_VERB, DEPLOY_VERB_BASE, TACTIC_VERB,
     RECRUIT_ACTION, CLAIM_INITIATIVE_ACTION, PASS_ACTION, DECLINE_ACTION,
 )
-from ..environment.game_state import HAND_SIZE, Pending
+from ..environment.game_state import Pending
 from ..environment.board import Board
 from ..environment.cell_ids import (
     CONTROLLED_BASE_PLAYER_1_CELL_ID, CONTROLLED_BASE_PLAYER_2_CELL_ID,
@@ -173,7 +173,7 @@ class LookaheadBot:
 
     def __init__(self, time_budget=0.1, max_branching=8, see_opponent_hand=True,
                  max_depth=40, gamma=0.99, shaping_anneal=1.0, rich_eval=False,
-                 name='lookahead'):
+                 name='lookahead', theta=None):
         self.time_budget = time_budget
         self.max_branching = max_branching
         self.see_opponent_hand = see_opponent_hand
@@ -189,21 +189,28 @@ class LookaheadBot:
         # lookahead scored only 20% vs the same bot with rich=False; see
         # docs/bots.md). Off also reproduces the exact old `_leaf_potential`
         # formula, which LookaheadCriticBot's value-scale calibration depends on.
+        # `theta` (docs/IDEAS.md B1) re-weights all eight coefficients at once and subsumes
+        # `rich_eval`; theta=None keeps the historical rich_eval behaviour exactly, and
+        # passing both raises rather than silently letting one win.
         self._evaluator = HeuristicEvaluator(shaping_anneal=shaping_anneal,
-                                             enable_new_terms=rich_eval)
+                                             enable_new_terms=rich_eval, theta=theta)
         # A plain rules-engine instance reused across act() calls purely for forward
         # simulation — never exposed to or stepped by the caller.
         self._sim_env = WarChestEnv(save_game_history=False)
         self._sim_env._draw_one = types.MethodType(_determinized_draw_one, self._sim_env)
         self._sim_env._sim_draw_queues = {1: [], 2: []}
         # docs/rewards.md: holding_reward = rate * (my_bases - opp_bases), fired every
-        # main-actor ply. Derived from env constants only, same formula as ppo.py.
-        self._holding_reward_rate = (
-            1.0 / ((self._sim_env.winning_base_count - 1)
-                   * (self._sim_env.max_rounds * HAND_SIZE)) * 0.8
-        )
+        # main-actor ply. Shared derivation with ppo.py, so the two cannot drift.
+        self._holding_reward_rate = self._sim_env.default_holding_reward_rate()
         # Diagnostics from the most recent act() call (docs/lookahead_bot_plan.md).
         self.last_stats = {}
+        # Rolling count of which verb class this bot actually committed to — the "does it
+        # use the whole game?" check (docs/bots.md), and the behaviour profile the θ-family
+        # measurement reads (src/app/eval_theta_family.py). Lives here rather than on
+        # SimGreedyBot so both search depths report it the same way. Never read by the
+        # engine; purely diagnostic. Forced moves (one legal action) are deliberately not
+        # counted — the profile is what the bot *chose*, not what the rules left it.
+        self.usage = Counter()
 
     def act(self, env) -> int:
         """Return an absolute-frame action id for `env.active_player`."""
@@ -240,7 +247,29 @@ class LookaheadBot:
             'legal_at_root': len(legal),
             'best_value': best_val,
         }
+        self.usage[self._classify(best_action)] += 1
         return best_action
+
+    @staticmethod
+    def _classify(action_id):
+        """Verb class of a committed action, for the `usage` counter."""
+        if action_id >= SPATIAL_SIZE:
+            kind, _ = WarChestEnv.decode_facedown(action_id)
+            return kind  # 'recruit' / 'claim_initiative' / 'pass' / 'decline'
+        verb, _, _ = WarChestEnv.decode_action(action_id)
+        if 6 <= verb <= 11:
+            return 'attack'
+        if verb == CONTROL_VERB:
+            return 'control'
+        if verb == BOLSTER_VERB:
+            return 'bolster'
+        if DEPLOY_VERB_BASE <= verb < TACTIC_VERB:
+            return 'deploy'
+        if verb == TACTIC_VERB:
+            return 'tactic'
+        if verb <= 5:
+            return 'move'
+        return 'select'
 
     # ------------------------------------------------------------------
     # Setup
@@ -371,19 +400,21 @@ class LookaheadBot:
 
     @staticmethod
     def _own_action_reward(result):
-        """`result.reward`, minus the tiny per-move step penalty.
+        """`result.reward`, minus the tiny per-turn tempo cost.
 
-        `MOVE_NEG_REWARD_PER_TURN` only makes sense against a long horizon plus a
+        `TURN_TEMPO_REWARD` only makes sense against a long horizon plus a
         bootstrapped value function that can see the eventual payoff of advancing
         (the trained policy has a critic for this). This search has neither and is
         depth-bounded to a handful of plies, so accumulating it verbatim makes
         "don't move" look better than "advance to fight" — the opposite of what a
         nudge against stalling is meant to do once the offsetting long-run reward
         falls outside the search horizon.
+
+        Read off `tempo_cost` rather than compared against the constant: since the
+        cost moved to the turn boundary it rides on top of every turn-ending reward
+        instead of standing alone on plain moves, so equality no longer identifies it.
         """
-        if result.reward == MOVE_NEG_REWARD_PER_TURN:
-            return 0.0
-        return result.reward
+        return result.reward - result.tempo_cost
 
     def _legal_from(self, state):
         self._sim_env.set_state(state)

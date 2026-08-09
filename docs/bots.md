@@ -113,6 +113,126 @@ part of the net-harmful `rich_eval` bundle left off by default.
 
 ---
 
+## `RandomEvalBot` — the θ family (2026-08-09, `IDEAS.md` B1)
+
+`HeuristicEvaluator` now takes **θ**, an 8-dim vector of multipliers on its coefficients
+(`base material pos risk durability economy tempo progress`; `evaluation.THETA_KEYS`).
+`RandomEvalBot` is `SimGreedyBot` with θ sampled instead of fixed — B1's proposal that a
+*continuum* of policy-independent playstyles is one constructor argument away, rather than
+the four hand-written archetypes `independent_opponents.md` Phase 1 plans.
+
+`theta=LEGACY_THETA` (the default everywhere) is **bit-identical** to the pre-θ evaluator
+and `RICH_THETA` to the old `rich_eval=True`, so `LookaheadCriticBot`'s value-scale
+calibration — moment-matched to that exact distribution — is untouched.
+`tests/test_random_eval_bot.py` pins both, plus a whole game of identical action choices.
+
+### The measuring instrument
+
+`src/app/eval_theta_family.py`. B1's stated test is "the gate verbs span a wide range
+across θ", but a range across θ is not evidence on its own — any 16-game sample of a
+stochastic bot produces one. So every run also plays a **control**: blocks of the *default*
+θ that differ only in which games they played. The headline is the ratio of mean pairwise
+total-variation distance between verb profiles, treatment over control. Treatment arms
+share common random numbers (the same drafts) while control blocks do not, so the control's
+noise floor is if anything over-estimated — the asymmetry runs against the family.
+
+### Result 1: the family is real (vs `greedy_sim`, 8 θ x 16 games, θ-seed 100)
+
+| | mean pairwise TV |
+|---|---|
+| across θ | **0.252** |
+| across seed (default θ) | 0.063 |
+| ratio | **4.0x** (gate: ≥ 2) |
+
+Gate-verb ranges, control range in brackets: bolster **0.003–0.143** [0.006], recruit
+**0.008–0.200** [0.005], claim_initiative 0.094–0.155 [0.020], tactic 0.044–0.084 [0.041].
+So bolster and recruit span ~25–40x the noise floor; **tactic does not move at all** and
+claim_initiative barely does. Against `lookahead_critic` the ratio is **5.1x** and recruit
+spans 0.000–0.366 — the family's behaviour is opponent-dependent, as it should be.
+
+### Result 2: the dials are not interchangeable — and two are traps
+
+Sampled arms differ in all eight coordinates at once, so they show *that* some θ are
+degenerate, never *which dial* did it. `--sweep KEY` moves one dial over `LEGACY_THETA`
+(vs `greedy_sim`, 16 games/rung; WR se ≈ 0.12, so read only the large moves):
+
+| dial | what it actually does | win-rate cost |
+|---|---|---|
+| **economy** | recruit **0.02 → 0.19** by weight 0.5, flat to 12; also kills passing (0.11 → 0.006) | ~none out to 8 (0.62 → 0.56) |
+| **durability** | **not a bolster brawler — a turtle.** bolster saturates at 0.087 by weight 0.5 then *falls*; `pass` climbs **0.11 → 0.34 → 0.65** | **ruinous**: 0.75 → 0.19 at weight 0.5, → **0.00** at ≥ 2 |
+| **pos** | below 1.0 the bot wanders: move 0.39 → 0.53, turns 100 → 167 | 0.69 → 0.28 at weight 0 |
+| **tempo** | **inert.** claim_initiative 0.126 → 0.133 across 0…20 | none |
+| **progress** | **inert.** every column flat across 0…8 | none |
+
+Mechanism for durability (hypothesis, consistent with every rung): the term rewards
+*keeping units alive*, and the surest way to keep a unit alive is never to use it.
+Bolstering helps a little and needs a matching coin; passing always works.
+
+**This refines the `rich_eval` negative result above.** That measurement turned all four
+new terms on at once and blamed `economy` ("spam recruit"). Per-dial, economy is the one
+term that buys its intended verb nearly for free; **durability is what collapses the bot**.
+The bundle's verdict stands — do not turn `rich_eval` on — but the reason recorded for it
+was wrong.
+
+### Result 3: retuning the ranges on that evidence
+
+`THETA_RANGES` was cut where the sweeps say (durability 12 → **1.0**, pos floored at 0.5
+and never zeroed, tempo 20 → 8), then **re-measured on fresh θ seeds** so the fix is not
+fitted to the draws that motivated it:
+
+| | before | after |
+|---|---|---|
+| unhealthy arms (WR < 0.10 or pass > 0.25) | **4/8** | **1/8** |
+| spread ratio | 6.7x | 4.0x |
+| `pass` range across arms | 0.616 | 0.298 |
+| bolster / recruit range | 0.236 / 0.284 | 0.140 / 0.191 |
+
+The lost spread is almost entirely the `pass` column — the degenerate direction — while
+the two verbs B1 cares about survive at 23–38x the control range.
+
+### Result 4: diverse, but not *independent* (gauntlet, k=12, seed 0)
+
+Field: 6 sampled θ + `greedy_sim` + `lookahead_critic` + `ckpt_20260808-0607`.
+
+```
+BT: ckpt 1378 > lookahead_critic 1252 > re1pos 1069 > greedy_sim 1008 > re0rsk 955
+    > re3ini 943 > re4dur 909 > re2bas 791 > re5bas 695
+Intransitive-triple fraction: 0.000  (fully transitive)
+```
+
+Two things to take from this:
+
+- The arms **straddle** the `greedy_sim` yardstick over ~375 Elo — `re1pos` beats it 0.67.
+  The family is a strength ladder, not a pile of punching bags, and sampling θ is not a
+  strict weakening of the default θ.
+- **Zero intransitivity.** The arms differ in *behaviour* (TV 4–5x) but sit on a single
+  strength axis; none is a rock-paper-scissors counter to another. B1's "independent
+  opponents" is therefore half-delivered: independent of the *policy* (nothing learned is
+  in the loop) but not mutually orthogonal. Their value is state-distribution coverage,
+  exactly as `independent_opponents.md` §3 frames it — not a diverse threat model.
+
+### Result 5: a caution for B2 (θ-search as a best-response oracle)
+
+Every θ arm scores **0.00–0.08** against `ckpt_20260808-0607`, and unmodified `greedy_sim`
+scores 0.17. B2 proposes CMA-ES over θ to find a best response, with "best θ ≥ 65 % ⇒ a
+real exploitable hole". Six random draws are not a search, but they bound the starting
+point: the ceiling here is the **`SimGreedyBot` class**, not the coefficients inside it, and
+that class is ~0.17 against the current policy. B2 should be re-scoped (search over a
+stronger base bot) or deprioritised — optimising θ cannot reach 65 % from 0.08.
+
+### Wiring
+
+`OpponentPool(p_random_eval=...)` holds one instance and calls `new_episode()` per
+episode, so the slice is a *distribution* over playstyles rather than one opponent;
+`ppo.py --p-random-eval-finetune` takes its share out of `p_pool` (the finetune schedule is
+otherwise ~100 % policy-derived). **Default 0.0** — the coverage claim above is measured,
+the training benefit is not. `random_eval` gets its own `OPP_GROUP_IDX` advantage group and
+shares the `greedy` critic one-hot slot. In the gauntlet (`--bots random_eval`) θ is
+**pinned** per entrant: the schedule is antithetic, and a bot that changed playstyle
+between the two games of a pair would break the draft cancellation it exists for.
+
+---
+
 ## LookaheadCriticBot
 
 Beam search: at every node, every legal move (capped by `max_branching`,
@@ -302,6 +422,27 @@ latter two from the gauntlet CLI now defaults to 5 regardless of their own
 class defaults — pre-existing coupling, unchanged by this investigation.
 
 **Why the determinization vote didn't help:** at this bot's fixed 0.5s budget it's already depth-starved relative to `LookaheadBot`'s alpha-beta (see "structural improvements" above) — every split tested, even a lopsided 80/20 two-way one, took real depth away from the primary search, and the resulting hedge against a single unlucky future-draw sample never recovered what that lost depth cost. This is the classic Perfect-Information-Monte-Carlo determinization-averaging technique, and it's a legitimate lever *in general* — it just isn't a net win at a budget this tight. `LookaheadCriticBot.n_determinizations` is left in the code (default `1`, i.e. off) rather than removed, in case a future eval run uses a meaningfully larger `--lookahead-critic-time-budget`, where the primary search would stop being the bottleneck and a hedge could pay for itself.
+
+### Reward-hygiene changes that reach into the search (2026-08-09, `IDEAS.md` L8)
+
+Two of the three L8 changes land inside `LookaheadBot`'s own value model, so every
+win rate recorded in the experiment log below predates them:
+
+- **`_holding_reward_rate` is 4.05× larger** (0.001067 → 0.004324) — the bot now reads
+  `WarChestEnv.default_holding_reward_rate()` rather than duplicating the formula, and
+  the formula's divisor was re-derived on the measured turn count. This term accumulates
+  per ply along the search path, so a base lead is worth ~4× more inside the search than
+  it was. Still an order of magnitude below the leaf's base term (`SHAPING_C * diff *
+  winning_base_count` ≈ 0.3 per base), so the expected effect is small — but it is a
+  behaviour change, not a no-op, and `LookaheadCriticBot` inherits it.
+- **`ATTACK_REWARD` is 0.0**, so the accumulated path reward no longer pays for attacks
+  at all; the material axis reaches the search only through `HeuristicEvaluator`'s
+  `C_MAT` term at the leaf.
+
+The tempo cost is *not* a change here: `_own_action_reward` already excluded it (that
+exclusion was worth 25 % → 40 %, below), and it still does — now by reading the new
+`Action.tempo_cost` field instead of comparing the reward against the constant, which
+stopped identifying the term once it moved to the turn boundary.
 
 ### Known limitation, not fixed
 

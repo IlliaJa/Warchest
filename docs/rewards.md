@@ -19,14 +19,16 @@ This doc is organised in four parts:
 |---|---|
 | Win (6 bases controlled) | +1.0 |
 | Claim base | 0.0 |
-| Attack | +0.02 |
+| Attack | 0.0 |
 | Truncation — base lead | 0.0 |
 | Truncation — tied bases | −0.5 |
 | Truncation — base deficit | −1.0 (proportional, see below) |
 | Invalid action attempt | −0.02 |
-| Any move | −0.002 |
+| Any completed turn (tempo) | −0.002 |
 
-Constants are defined at the top of `src/services/environment/warchest_env.py`. Raw environment rewards are augmented with potential-based shaping (base-diff **and** material), a holding reward, and per-run **annealing** of the holding + material terms in `src/app/ppo.py` before being stored in the rollout buffer. Every move costs the same step penalty regardless of destination — directional pull toward bases is handled entirely by shaping and the holding reward.
+Constants are defined at the top of `src/services/environment/warchest_env.py`. Raw environment rewards are augmented with potential-based shaping (base-diff **and** material), a holding reward, and per-run **annealing** of the holding + material terms in `src/app/ppo.py` before being stored in the rollout buffer. The tempo cost is charged once per *turn* — equivalently, once per coin spent from hand — not once per action; directional pull toward bases is handled entirely by shaping and the holding reward.
+
+> **Updated 2026-08-09 (`docs/IDEAS.md` L8).** Three hygiene changes shipped together. (1) The step penalty moved from "every move-shaped result" to the turn boundary, so a turn that produces several maneuvers pays it once. (2) `ATTACK_REWARD` 0.02 → **0.0**, since material PBRS pays the same box-a-coin event. (3) `holding_reward_rate` re-derived on the measured main-actor turn count instead of the `max_rounds` worst case, ~**4.05×** stronger. All three are reward-scale changes, so `score`, `critic_mae` and returns are **not** comparable across this boundary; win rate and the gauntlet are.
 
 > **Implemented 2026-07-03.** Material PBRS, linear annealing of the holding + material shaping (1.0 → 0.1 over the first half of the run), a base-diff-proportional truncation reward (C17), and a widened **critic-only** trunk (`critic_hidden_dim=128`, policy left at 64) all shipped together. Rationale and cross-project grounding: [decision.md](decision.md) (2026-07-03) and this doc's [What is discussed](#R4-what-is-discussed) below. A/B still owed against the pre-change baseline — see [IDEAS.md](IDEAS.md) #R3.
 
@@ -64,7 +66,7 @@ Design rationale & caveats:
 - **Exploit safety.** `boxed` is monotonic per player, but PBRS is policy-invariant for *any* state function, so there is no farming loop (unlike a raw per-kill bonus, which the circular-claiming precedent warns against). Uses only `GameState.boxed` — no BFS, negligible cost.
 - **Over-shaping caveat.** The `ppo_20260630-060400` run analysis found the agent already *over-optimizes* dense shaping relative to winning (score climbed while win rate stayed flat — see `docs/history.md`). This term is still worth it because (a) it is proper PBRS, unlike the non-telescoping holding reward that is the likelier decoupling culprit; (b) material advantage is **strongly win-correlated**, so it points the dense signal at something that predicts wins. This is the main reason it is annealed (see below) and A/B'd, not stacked blind.
 
-> **Note — `ATTACK_REWARD` was intentionally kept, not subsumed.** Folding the raw `ATTACK_REWARD = 0.02` into this term is the recommended next move — it fires on the same box-a-coin event and is non-telescoping. That swap was **not** made in this pass to keep the change set to exactly what was requested; both currently fire. Flagged for the A/B (see `IDEAS.md` #R3): zero `ATTACK_REWARD` and re-measure so attacks aren't double-paid.
+> **Note — `ATTACK_REWARD` is now subsumed (2026-08-09, `IDEAS.md` L8).** It fired on the same box-a-coin event as this term and was non-telescoping, so the two double-paid every attack. `ATTACK_REWARD = 0.0` as of this change; the constant is kept named so the A/B back to 0.02 is a one-line edit. Flagged since 2026-07-03, when it was left in to keep that change set to exactly what was requested. Note that `r_attack` / `score_attack` are consequently ~0 by construction now — they no longer measure anything, and the attack axis should be read off `score_material` instead.
 
 ### Shaping annealing
 
@@ -84,11 +86,13 @@ Applied by the training loop alongside shaping:
 
 ```python
 holding_reward = holding_reward_rate * (my_bases - opp_bases)
-holding_reward_rate = WIN_REWARD / ((winning_base_count - 1) * (max_rounds * HAND_SIZE)) * 0.8
-                    = 1.0 / (5 * (50 * 3)) * 0.8 = 1.0 / 750 * 0.8 ≈ 0.001067
+holding_reward_rate = WIN_REWARD / ((winning_base_count - 1) * TYPICAL_MAIN_TURNS) * 0.8
+                    = 1.0 / (5 * 37) * 0.8 = 1.0 / 185 * 0.8 ≈ 0.004324
 ```
 
-Fires every agent turn proportional to the current base lead. Incentivises defending claimed bases and breaks the base-flip exploit (two policies claiming the same bases in a loop), where potential shaping alone produces near-zero net reward per cycle. The 0.8 factor is a safety margin ensuring worst-case accumulated holding (`0.001067 * 5 * 150 = 0.8`) never exceeds `WIN_REWARD = 1.0`. `max_rounds * HAND_SIZE` is used as the worst-case bound on main-actor turns per episode. `holding_reward_rate` is derived from env constants at script startup so it stays valid if `max_rounds`, `HAND_SIZE`, or `winning_base_count` change.
+Fires every agent turn proportional to the current base lead. Incentivises defending claimed bases and breaks the base-flip exploit (two policies claiming the same bases in a loop), where potential shaping alone produces near-zero net reward per cycle. The 0.8 factor sizes the term so that holding the largest sub-winning lead for a whole episode is worth `0.8 * WIN_REWARD` — i.e. meaningful, but never rivalling a win. Single source of truth: `WarChestEnv.default_holding_reward_rate()`, read by both `ppo.py` and `LookaheadBot` so the two cannot drift, and derived from env constants at startup so it stays valid if `winning_base_count` changes.
+
+> **Divisor re-derived 2026-08-09 (`IDEAS.md` L8), 0.001067 → 0.004324, a 4.05× increase.** The old divisor was `max_rounds * HAND_SIZE = 150`, the *absolute worst case* on main-actor turns per episode. Real episodes do not run that long: converged PPO runs settle around 78 plies (`turns=` in `logs/ppo_20260807-203528.log`), roughly half of them the main actor's, which is where `TYPICAL_MAIN_TURNS = 37` comes from and matches the ~37 in `next_iteration.md` §3. Sizing a per-turn rate on a bound no game reaches made the term ~4× weaker than its own stated design intent in every game actually played — so it was not, in practice, the mechanism the base-flip fix assumed it was. The trade is deliberate: the *bound* property ("accumulated holding can never exceed a win") is given up, since an unusually long game at a sustained 5-base lead can now accumulate more than `WIN_REWARD`. That combination is close to unreachable — a 5-base lead is one claim from ending the game — and `shaping_anneal` decays this term to a 0.1 floor over the first half of a run regardless. If it does bite, cap the accumulation rather than restoring the 150.
 
 Shaping and holding are complementary: shaping delivers an immediate, one-step credit signal at the claim action; holding creates persistent per-turn pressure that requires no bootstrapping. The holding reward is **not** potential-based (it does not telescope), so unlike `SHAPING_C` it genuinely *changes* the optimal policy — rewarding grabbing an early lead and stalling rather than closing the game — which is the likeliest single contributor to the `ppo_20260630-060400` decoupling above. Two fixes were weighed: **(a) remove it outright** and lean on base-diff PBRS + critic bootstrapping (the AlphaZero/TD-Gammon stance), risking the base-flip exploit it was added to kill in the first place; or **(b) anneal its coefficient toward a small floor** (the OpenAI Five stance) — keep the early-training tie-break benefit, remove the late-training distortion, and stay reversible/cheap to A/B against removal later. **(b) was chosen** as the lower-risk first try.
 
@@ -106,8 +110,9 @@ else:                           # tie or deficit
 
 ### Implementation notes
 
-- Every move returns `MOVE_NEG_REWARD_PER_TURN = -0.002` regardless of destination. The binary approach rewards (`MOVE_ON_BASE_REWARD`, `MOVE_NEAR_BASE_REWARD`) were removed: they created a bias toward neutral bases over enemy bases (which are strategically more valuable), and the holding reward + shaping now provide all directional pull needed.
-- `ATTACK_REWARD = 0.02` is paid on every successful attack (kept small so a game's worth of attacks cannot rival `WIN_REWARD = 1.0`). Tracked separately in the training loop as `r_attack` / `score_attack` for logging, but it is a plain per-action reward, not shaping. (See the material-shaping note above: flagged for zeroing now that material PBRS pays the same event.)
+- `TURN_TEMPO_REWARD = -0.002` is added in `_apply_action`, on the action that ends the turn — never on a mid-tactic continuation, never on a game-ending move, and never twice. Because every option a turn offers pays the identical amount, it is a constant *within* a decision and cannot distort the choice among options; it prices only elapsed turns. The `Action.tempo_cost` field carries the charge separately so consumers that price tempo themselves (the score decomposition, `LookaheadBot`'s depth-bounded search) can subtract it. The binary approach rewards (`MOVE_ON_BASE_REWARD`, `MOVE_NEAR_BASE_REWARD`) were removed earlier: they created a bias toward neutral bases over enemy bases (which are strategically more valuable), and the holding reward + shaping now provide all directional pull needed.
+  - **Why it moved (2026-08-09, `IDEAS.md` L8).** It used to hang off seven call sites, five of them tactic continuations, so a Berserker chain, a Footman double maneuver and a Swordsman bonus move each paid it *again per maneuver*. In a game whose currency is maneuvers-per-coin that taxed exactly the mechanics that buy extra maneuvers — and the sharpest edge was the Swordsman's free post-attack move costing strictly more than declining it. `tests/test_reward_hygiene.py` pins the once-per-turn property per mechanism, because it is invisible in gameplay and would regress silently.
+- `ATTACK_REWARD = 0.0` (was 0.02, zeroed 2026-08-09). Still tracked in the training loop as `r_attack` / `score_attack`, but those are now ~0 by construction; the tempo cost is peeled into its own `score_tempo` bucket so it does not masquerade as attack reward.
 - An exploration bonus (`MOVE_EXPLORE_REWARD_MAX_TURN = 5`, `MOVE_EXPLORE_REWARD_PER_TURN = 0.1`) is defined as constants but is not wired into `perform_move_action`. The exploration map is updated every step for use in the observation, but no reward is computed from it.
 - `CLAIM_BASE_REWARD` is 0.0. A non-zero direct claim reward caused a circular-claiming exploit: the policy learned to claim bases back and forth with pool opponents, accumulating reward far in excess of `WIN_REWARD = 1.0`. Potential shaping and the holding reward handle base value correctly without this risk.
 
@@ -271,7 +276,8 @@ above looks the way it does:
    it densifies the *per-step* signal without changing the optimal policy and
    without inflating return variance the way raw per-event bonuses do. This is
    why both the base-diff and material terms are PBRS, not raw bonuses (and why
-   `ATTACK_REWARD`, a raw bonus, is flagged for removal above).
+   `ATTACK_REWARD`, a raw bonus, was zeroed above on 2026-08-09). The holding
+   reward is the one surviving non-PBRS term, which is why it is annealed.
 3. **Anneal shaping toward the true objective.** OpenAI Five's annealed
    `team_spirit` is the template: use the dense signal to bootstrap learning
    early, then decay its influence so the *final* policy optimizes the terminal

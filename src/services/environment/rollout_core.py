@@ -36,8 +36,12 @@ OPP_TYPE_IDX = {'random': 0, 'greedy': 1, 'pool': 2}
 # analogue (and the same reason those bots condition on opp_type='pool' by default).
 # The label stays distinct everywhere else (sampling weights, win-rate metrics);
 # only the one-hot collapses it onto `pool`.
+# `random_eval` (docs/IDEAS.md B1) shares the `greedy` slot instead: it is a SimGreedyBot
+# with sampled leaf coefficients, i.e. a hand-written heuristic bot of roughly greedy
+# strength, and nothing about it is policy-derived.
 OPP_ONEHOT_SLOT = {**OPP_TYPE_IDX, 'lookahead_critic': OPP_TYPE_IDX['pool'],
-                   'puct': OPP_TYPE_IDX['pool']}
+                   'puct': OPP_TYPE_IDX['pool'],
+                   'random_eval': OPP_TYPE_IDX['greedy']}
 
 # Fine-grained opponent id, used ONLY to group advantage normalisation
 # (`RolloutBuffer.compute_gae(adv_norm='per_opponent')`, docs/next_iteration.md §5 row 6).
@@ -47,7 +51,8 @@ OPP_ONEHOT_SLOT = {**OPP_TYPE_IDX, 'lookahead_critic': OPP_TYPE_IDX['pool'],
 # 25 % `lookahead_critic`, two opponents of genuinely different strength, so grouping them
 # together would leave in the advantage exactly the per-opponent offset this is removing.
 # Not fed to any network, so it is free to grow: adding an entry breaks no checkpoint.
-OPP_GROUP_IDX = {'random': 0, 'greedy': 1, 'pool': 2, 'lookahead_critic': 3, 'puct': 4}
+OPP_GROUP_IDX = {'random': 0, 'greedy': 1, 'pool': 2, 'lookahead_critic': 3, 'puct': 4,
+                 'random_eval': 5}
 # Shared bucket for an opponent label nobody registered above. Warned about once per
 # process rather than raised, so adding a bot to the pool cannot kill a running job — but
 # it does mean that bot's advantages are centred together with any other stranger.
@@ -71,8 +76,10 @@ def opp_group_id(opp_type):
 
 # Opponent families that forward-simulate the full game state and therefore read
 # the live env (`act(env)`, absolute frame) instead of the ego-centric obs the
-# reactive bots consume — see `_opponent_env_action`.
-_SEARCH_OPP_TYPES = frozenset({'lookahead_critic', 'puct'})
+# reactive bots consume — see `_opponent_env_action`. `random_eval` is a SimGreedyBot
+# subclass, so it belongs here despite being a *heuristic* bot rather than a deep search:
+# what puts a bot in this set is the interface it speaks, not how hard it thinks.
+_SEARCH_OPP_TYPES = frozenset({'lookahead_critic', 'puct', 'random_eval'})
 
 
 def _opponent_env_action(opp, opp_type, env, obs, acting_pid):
@@ -146,7 +153,7 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
     main_score = 0.0
     turns = 0
     opp_pid = 3 - main_pid  # absolute id of the main actor's opponent
-    r_attack = r_shaping = r_holding = r_material = r_terminal = r_other = 0.0
+    r_attack = r_shaping = r_holding = r_material = r_terminal = r_other = r_tempo = 0.0
     sum_log_nlegal = 0.0
     n_decisions = 0
 
@@ -250,12 +257,18 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
             r_shaping += base_shaping
             r_holding += annealed_holding
             r_material += annealed_material
+            # The per-turn tempo cost rides on every turn-ending reward, so peel it into
+            # its own bucket first — otherwise it would be spread across attack/other and
+            # r_attack would report tempo rather than attacks (ATTACK_REWARD is now 0).
+            tempo = step_info['action'].tempo_cost
+            r_tempo += tempo
+            env_reward = reward - tempo
             if terminated:
-                r_terminal += reward  # dominated by WIN_REWARD on a winning move
+                r_terminal += env_reward  # dominated by WIN_REWARD on a winning move
             elif step_info['action'].type == ATTACK_ACTION:
-                r_attack += reward
+                r_attack += env_reward
             else:
-                r_other += reward
+                r_other += env_reward
             n_legal = int(obs_before['valid_action_mask'].sum())
             sum_log_nlegal += float(np.log(max(n_legal, 1)))
             n_decisions += 1
@@ -369,6 +382,7 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
         'r_material': r_material,
         'r_terminal': r_terminal,
         'r_other': r_other,
+        'r_tempo': r_tempo,
         'sum_log_nlegal': sum_log_nlegal,
         'n_decisions': n_decisions,
         't_env': t_env,

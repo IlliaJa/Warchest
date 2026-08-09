@@ -149,12 +149,30 @@ UNIT_COINS = UNIT_IDS
 
 MOVE_EXPLORE_REWARD_MAX_TURN = 5
 MOVE_EXPLORE_REWARD_PER_TURN = 0.1
-MOVE_NEG_REWARD_PER_TURN = -0.002
-ATTACK_REWARD = 0.02  # kept small so a game's worth of attacks cannot rival a win (+1.0)
+# Tempo cost, charged once per *completed turn* — equivalently, once per coin spent from
+# hand — in `_apply_action`, not once per maneuver (docs/IDEAS.md L8). It used to be
+# attached to every move-shaped result, including the tactic continuations, so a Berserker
+# chain, a Footman double maneuver and a Swordsman bonus move each paid it again per
+# maneuver. In a game whose currency is maneuvers-per-coin that taxed exactly the mechanics
+# that generate extra maneuvers. Charged at the turn boundary it is a constant across every
+# option a turn offers, so it cannot distort the choice among them — it prices only elapsed
+# turns, which is all it was ever meant to do.
+TURN_TEMPO_REWARD = -0.002
+# Zeroed (docs/IDEAS.md L8, docs/next_iteration.md §4): the material PBRS potential already
+# pays the box-a-coin event this fired on, so the two double-paid every attack. Kept as a
+# named constant so the A/B back to 0.02 is a one-line change.
+ATTACK_REWARD = 0.0
 INVALID_ACTION_REWARD = -0.02
 CLAIM_BASE_REWARD = 0.0
 WIN_REWARD = 1.0
 LOSS_REWARD = -1.0
+
+# Main-actor decisions in a typical episode, used to size `holding_reward` (docs/rewards.md).
+# Measured, not assumed: converged PPO runs settle at ~78 plies per episode
+# (`turns=` in logs/ppo_20260807-203528.log), about half of which are the main actor's.
+# The old sizing used the worst-case bound `max_rounds * HAND_SIZE = 150`, which made the
+# term ~4x weaker than designed in every game that actually gets played.
+TYPICAL_MAIN_TURNS = 37
 
 NUM_PLAYERS = 2
 
@@ -167,6 +185,20 @@ class WarChestEnv(gym.Env):
     # Under 180° rotation direction d maps to its opposite.
     # Self-inverse: _OFFSET_FLIP[_OFFSET_FLIP[i]] == i.
     _OFFSET_FLIP = [3, 4, 5, 0, 1, 2]
+
+    @classmethod
+    def default_holding_reward_rate(cls) -> float:
+        """Per-main-turn rate for `holding_reward = rate * (my_bases - opp_bases)`.
+
+        Sized so that holding the largest sub-winning lead for a whole typical episode
+        accumulates `0.8 * WIN_REWARD` — the 0.8 being the margin that keeps shaping
+        from rivalling a win. The divisor is the *measured* main-actor turn count
+        (`TYPICAL_MAIN_TURNS`), not the old `max_rounds * HAND_SIZE = 150` worst-case
+        bound: no real episode runs that long, so the bound made the term ~4x weaker
+        than its own design intent (docs/IDEAS.md L8, docs/rewards.md). Single source
+        of truth for ppo.py and LookaheadBot, which must agree on this number.
+        """
+        return WIN_REWARD / ((cls.winning_base_count - 1) * TYPICAL_MAIN_TURNS) * 0.8
 
     @staticmethod
     def encode_action(verb: int, r: int, q: int) -> int:
@@ -490,6 +522,11 @@ class WarChestEnv(gym.Env):
                 self.state.last_coin_player = self.active_player
             if not action.finishes_game and self.state.pending is None:
                 self._advance_turn()
+                # The turn is over, so the tempo cost lands exactly once here: never on a
+                # mid-tactic continuation (`pending` still set), never on a game-ending
+                # move, and never more than once however many maneuvers the turn produced.
+                action.tempo_cost = TURN_TEMPO_REWARD
+                action.reward += TURN_TEMPO_REWARD
             if self.history is not None:
                 self.history.append(deepcopy(self.state))
             if self.event_log is not None:
@@ -760,7 +797,7 @@ class WarChestEnv(gym.Env):
         self.exploration_map_dict[self.active_player][end] += 1
         self._play_coin(moving_unit.id, 'faceup')
         self._fire_maneuver_triggers(moving_unit, 'move')
-        return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
+        return Action(reward=0.0, finishes_game=False,
                       txt_result='Move successful', is_valid=True)
 
     def perform_attack_action(self, verb: int, r: int, q: int) -> Action:
@@ -1046,7 +1083,7 @@ class WarChestEnv(gym.Env):
                 return invalid, loc
             unit.move(loc=end)
             self.exploration_map_dict[active][end] += 1
-            return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
+            return Action(reward=0.0, finishes_game=False,
                           txt_result='Maneuver: move', is_valid=True), end
         if 6 <= verb <= 11:
             offset = self.board.offsets[verb - 6]
@@ -1652,7 +1689,7 @@ class WarChestEnv(gym.Env):
             # Both halves are mandatory: the step was restricted to attack-enabling cells,
             # so an attackable enemy is guaranteed adjacent and the attack step is required.
             self.state.pending = Pending('move_then_attack:attack', unit_loc=end, optional=False)
-            return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
+            return Action(reward=0.0, finishes_game=False,
                           txt_result='Moved; must now attack', is_valid=True)
 
         if p.kind == 'move_then_attack:attack':
@@ -1704,7 +1741,7 @@ class WarChestEnv(gym.Env):
             self.board.get_unit_at(r, q).move(loc=end)
             self.exploration_map_dict[active][end] += 1
             self.state.pending = None
-            return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
+            return Action(reward=0.0, finishes_game=False,
                           txt_result='Bonus move', is_valid=True)
 
         if p.kind == 'extra_maneuver':
@@ -1725,7 +1762,7 @@ class WarChestEnv(gym.Env):
                 self._damage_unit(unit)  # pay from the stack (stack >= 2, so it survives)
                 unit.move(loc=end)
                 self.exploration_map_dict[active][end] += 1
-                reward, new_loc = MOVE_NEG_REWARD_PER_TURN, end
+                reward, new_loc = 0.0, end
             elif 6 <= verb <= 11:  # attack
                 offset = self.board.offsets[verb - 6]
                 enemy = self.board.get_unit_at(r + offset[0], q + offset[1])
@@ -1769,7 +1806,7 @@ class WarChestEnv(gym.Env):
             unit.move(loc=(r, q))
             self.exploration_map_dict[active][(r, q)] += 1
             self.state.pending = None
-            return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
+            return Action(reward=0.0, finishes_game=False,
                           txt_result='Moved', is_valid=True)
 
         if p.kind == 'line_charge':
@@ -1838,7 +1875,7 @@ class WarChestEnv(gym.Env):
             # The granted unit's own attribute still triggers (FAQ: a Berserker may
             # continue with stack-paid maneuvers after an Ensign-granted move).
             self._fire_maneuver_triggers(self.board.get_unit_at(*dest), 'move')
-            return Action(reward=MOVE_NEG_REWARD_PER_TURN, finishes_game=False,
+            return Action(reward=0.0, finishes_game=False,
                           txt_result='Granted move', is_valid=True)
 
         if p.kind == 'free_maneuver':

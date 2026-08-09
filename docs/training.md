@@ -66,7 +66,7 @@ rationale (this section previously duplicated it and had drifted out of sync).
 
 After each eval block, pool weights are set automatically:
 
-- If eval WR vs random ≥ `wr_random_finetune_threshold` (0.90) → switch to finetune weights (random removed from training; greedy kept as a small fixed anchor)
+- If eval WR vs greedy ≥ `wr_greedy_finetune_threshold` (0.90) → switch to finetune weights (random removed from training; greedy kept as a small fixed anchor)
 - Otherwise → restore initial weights
 
 This raises the training bar automatically as the policy matures, without any one-way flag.
@@ -100,7 +100,7 @@ This raises the training bar automatically as the policy matures, without any on
 | Pool `max_size` / `snapshot_every` | 20 / 15 | Rolling snapshot window length / batches between snapshots |
 | `eval_every` | 10 | Evaluate every N batches |
 | `eval_episodes` | 20 | Episodes per evaluation block |
-| `wr_random_finetune_threshold` | 0.90 | WR vs random that triggers finetune phase |
+| `wr_greedy_finetune_threshold` | 0.90 | WR vs greedy that triggers finetune phase |
 
 ---
 

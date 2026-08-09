@@ -7,6 +7,7 @@ from ..environment.warchest_env import (
     N_VERBS, BOARD_DIM, ACTION_SPACE_SIZE, SPATIAL_SIZE, FACEDOWN_SIZE,
     N_FACTORED_VERBS, VERB_OF_ACTION,
 )
+from ..environment.board import Board
 from ..environment.obs_encoders import latest_encoder
 
 
@@ -49,6 +50,38 @@ def _split_pool(feat: torch.Tensor) -> torch.Tensor:
     left = feat[..., 0:4].mean(dim=(-2, -1))
     right = feat[..., 3:7].mean(dim=(-2, -1))
     return torch.cat([left, right], dim=-1)
+
+
+# The 10 fixed base-cell (row, col) indices win/loss is actually decided on (docs/IDEAS.md
+# A2). `Board.default_bases` is the single source of truth; the layout never moves and is
+# symmetric under the P2 ego-rotation (each cell's 180°-rotated counterpart is also a base
+# cell), so one constant index set is correct for both players' encoded boards.
+_BASE_CELLS = tuple(sorted({cell for cells in Board.default_bases.values() for cell in cells}))
+
+
+def _masked_mean_max(feat, mask):
+    """feat: [B,C,7,7], mask: [B,7,7] bool -> (mean [B,C], max [B,C]) over True cells.
+
+    A sample with no True cells (e.g. before any unit is deployed) falls back to zero for
+    both rather than propagating -inf/NaN.
+    """
+    m = mask.unsqueeze(1).to(feat.dtype)  # [B,1,7,7]
+    count = m.sum(dim=(-2, -1)).clamp_min(1.0)  # [B,1]
+    mean = (feat * m).sum(dim=(-2, -1)) / count  # [B,C]
+    masked = feat.masked_fill(~mask.unsqueeze(1), torch.finfo(feat.dtype).min)
+    max_, _ = masked.flatten(2).max(dim=-1)  # [B,C]
+    empty = mask.flatten(1).sum(dim=-1) == 0  # [B]
+    if empty.any():
+        mean = mean.masked_fill(empty.unsqueeze(-1), 0.0)
+        max_ = max_.masked_fill(empty.unsqueeze(-1), 0.0)
+    return mean, max_
+
+
+def _global_mean_max(feat):
+    """feat: [B,C,7,7] -> (mean [B,C], max [B,C]) over the whole board."""
+    mean = feat.mean(dim=(-2, -1))
+    max_, _ = feat.flatten(2).max(dim=-1)
+    return mean, max_
 
 
 class Policy(nn.Module):
@@ -258,7 +291,9 @@ class Policy(nn.Module):
 CRITIC_ARCH_V1 = 'critic_v1'
 CRITIC_ARCH_V2 = 'critic_v2'
 CRITIC_ARCH_V3 = 'critic_v3'
+CRITIC_ARCH_V4 = 'critic_v4'
 CRITIC_GROUPS = 8  # GroupNorm groups; must divide both 32 and hidden_dim
+_KNOWN_CRITIC_ARCHS = (CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3, CRITIC_ARCH_V4)
 
 
 class Critic(nn.Module):
@@ -273,7 +308,7 @@ class Critic(nn.Module):
     `_split_pool`) → [B, 2*Cf]. Concatenate with global features, opp_onehot and
     the privileged vector → scalar value.
 
-    Three architectures, selected by `arch`, because checkpoints of every generation
+    Four architectures, selected by `arch`, because checkpoints of every generation
     exist on disk and the gauntlet has to keep reconstructing them (docs/history.md):
 
     `critic_v1` — the original `HexConv2d → ReLU` ×3 with no normalisation. **This
@@ -322,13 +357,30 @@ class Critic(nn.Module):
 
     Consequence for consumers: `opp_onehot` is **ignored** by v3 (and may be `None`),
     so every call site keeps its signature and v1/v2 checkpoints keep working.
+
+    `critic_v4` — v3's trunk and auxiliary head, with `_split_pool`'s flank-average
+    readout replaced by a task-relevant gather (docs/IDEAS.md A2). Motivation: against
+    a win condition that is a function of 10 fixed base cells with at most a handful of
+    units per side, a two-number-per-channel average is close to throwing the board
+    away, and it is exactly the readout §3.4 measured tying 89-93 % of sibling pairs
+    that differ only in position. The new readout concatenates the trunk features at
+    the 10 static base-cell indices (`Board.default_bases` — free, a constant index
+    set, the layout never moves), masked mean+max over own- and opponent-occupied unit
+    cells (mean alone would erase "my Berserker is hanging on the far flank"; occupancy
+    comes from the *input* board's unit-stack planes via `ObsEncoder.own/opp_unit_
+    channels`, since the trunk output no longer carries a clean per-cell occupancy
+    signal), and a whole-board mean+max — `[B, 16*hidden_dim]` in place of
+    `[B, 2*hidden_dim]`. Trunk and auxiliary head are otherwise identical to v3
+    (GroupNorm, no opponent one-hot). Needs the raw board tensor, not just trunk
+    features, so `value_from_features` (which only ever receives pre-encoded features)
+    does not support it.
     """
 
     OPP_DIM = 3
 
-    def __init__(self, device, hidden_dim=64, *, obs_encoder=None, arch=CRITIC_ARCH_V3):
+    def __init__(self, device, hidden_dim=64, *, obs_encoder=None, arch=CRITIC_ARCH_V4):
         super().__init__()
-        if arch not in (CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3):
+        if arch not in _KNOWN_CRITIC_ARCHS:
             raise ValueError(f'unknown critic arch {arch!r}')
         # Obs dims (incl. the privileged vector) come from the paired encoder.
         enc = obs_encoder or latest_encoder()
@@ -357,9 +409,13 @@ class Critic(nn.Module):
                 self._conv_block(hidden_dim, hidden_dim),
             )
 
-        # v3 drops the opponent one-hot from the head input (see the class docstring).
-        self.uses_opp_onehot = arch != CRITIC_ARCH_V3
-        head_in = 2 * hidden_dim + self.global_dim + self.priv_dim
+        # v3 and v4 drop the opponent one-hot from the head input (see the class docstring).
+        self.uses_opp_onehot = arch not in (CRITIC_ARCH_V3, CRITIC_ARCH_V4)
+        # v4's gather readout is wider than the flank-average pool it replaces: 10
+        # concatenated base cells + own/opp unit mean+max + whole-board mean+max = 16
+        # channel-widths, vs. 2 for `_split_pool` (see `_gathered_pool`).
+        self.pool_width = 16 * hidden_dim if arch == CRITIC_ARCH_V4 else 2 * hidden_dim
+        head_in = self.pool_width + self.global_dim + self.priv_dim
         if self.uses_opp_onehot:
             head_in += self.OPP_DIM
         self.head = nn.Sequential(
@@ -372,8 +428,16 @@ class Critic(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
         # v1 checkpoints have no such parameter, so it only exists on v2 and later.
-        self.board_only_head = (nn.Linear(2 * hidden_dim, 1)
+        self.board_only_head = (nn.Linear(self.pool_width, 1)
                                 if arch != CRITIC_ARCH_V1 else None)
+
+        if arch == CRITIC_ARCH_V4:
+            rows = torch.tensor([r for r, q in _BASE_CELLS], dtype=torch.long)
+            cols = torch.tensor([q for r, q in _BASE_CELLS], dtype=torch.long)
+            self.register_buffer('_base_rows', rows, persistent=False)
+            self.register_buffer('_base_cols', cols, persistent=False)
+            self._own_unit_channels = enc.own_unit_channels
+            self._opp_unit_channels = enc.opp_unit_channels
 
     @staticmethod
     def _conv_block(cin, cout):
@@ -418,16 +482,38 @@ class Critic(nn.Module):
                 else:
                     x = block(x)
             # Variation of what the value head actually receives, across the batch. This is
-            # the quantity that matters: the head sees `_split_pool(trunk(board))`, and if
-            # that does not vary with the board the critic cannot rank two positions no
-            # matter how many pre-activations are positive.
-            pooled = _split_pool(x)
+            # the quantity that matters: the head sees `pool(trunk(board))` (`_split_pool`
+            # for v1-v3, `_gathered_pool` for v4), and if that does not vary with the board
+            # the critic cannot rank two positions no matter how many pre-activations are
+            # positive.
+            pooled = self._gathered_pool(board, x) if self.arch == CRITIC_ARCH_V4 else _split_pool(x)
             out_std = float(pooled.std()) if pooled.numel() > 1 else 0.0
         return {'alive': alive, 'out_std': out_std}
 
+    def _gathered_pool(self, board_enc, feat):
+        """Task-relevant readout (docs/IDEAS.md A2). -> [B, 16*hidden_dim]  (critic_v4 only.)
+
+        Concatenates the trunk features at the 10 fixed base-cell indices, masked
+        mean+max over own- and opponent-occupied unit cells, and a whole-board mean+max.
+        Occupancy comes from `board_enc` (the input planes), not `feat` (the trunk
+        output no longer carries a clean per-cell occupancy signal after convolution).
+        """
+        base = feat[:, :, self._base_rows, self._base_cols]  # [B, C, 10]
+        base = base.reshape(base.shape[0], -1)  # [B, 10*C]
+        own_occ = board_enc[:, self._own_unit_channels, :, :].sum(dim=1) > 0  # [B,7,7]
+        opp_occ = board_enc[:, self._opp_unit_channels, :, :].sum(dim=1) > 0
+        own_mean, own_max = _masked_mean_max(feat, own_occ)
+        opp_mean, opp_max = _masked_mean_max(feat, opp_occ)
+        glob_mean, glob_max = _global_mean_max(feat)
+        return torch.cat(
+            [base, own_mean, own_max, opp_mean, opp_max, glob_mean, glob_max], dim=-1)
+
     def _pooled(self, board_enc):
-        """Board trunk + flank pool. -> [B, 2*hidden_dim]"""
-        return _split_pool(self.board_encoder(board_enc))
+        """Board trunk + readout. -> [B, pool_width]"""
+        feat = self.board_encoder(board_enc)
+        if self.arch == CRITIC_ARCH_V4:
+            return self._gathered_pool(board_enc, feat)
+        return _split_pool(feat)
 
     def _head_input(self, pooled, global_feats, opp_onehot, privileged):
         """Assemble the value head's input, with or without the opponent one-hot.
@@ -451,14 +537,15 @@ class Critic(nn.Module):
         return self.head(self._head_input(pooled, global_feats, opp_onehot, privileged)).squeeze(-1)
 
     def board_only_value(self, board_enc):
-        """Value predicted from the BOARD ALONE. -> [B]  (critic_v2 only.)
+        """Value predicted from the BOARD ALONE. -> [B]  (critic_v2 and later.)
 
         The auxiliary target that keeps the trunk alive: because this head sees no
         globals, opp_onehot or privileged features, its loss is unsatisfiable without a
         board representation that carries signal. See the class docstring.
         """
         if self.board_only_head is None:
-            raise RuntimeError(f'board_only_value requires {CRITIC_ARCH_V2}, this is {self.arch}')
+            raise RuntimeError(
+                f'board_only_value requires {CRITIC_ARCH_V2} or later, this is {self.arch}')
         return self.board_only_head(self._pooled(board_enc)).squeeze(-1)
 
     def value_single(self, obs, opp_onehot, privileged):
@@ -480,7 +567,16 @@ class Critic(nn.Module):
         feat must come from a Policy with the same hidden_dim as this Critic.
         Used during rollout collection to avoid running the board encoder twice per step.
         The critic's own board_encoder is still used (and trained) via value_batch.
+
+        Not supported on `critic_v4`: its readout needs the raw board tensor for unit
+        occupancy (see `_gathered_pool`), which this fast path never receives.
         """
+        if self.arch == CRITIC_ARCH_V4:
+            raise NotImplementedError(
+                f'{self.arch} readout needs the raw board tensor for unit occupancy; '
+                'value_from_features only has pre-encoded features. Use value_batch or '
+                'value_from_tensors instead (docs/IDEAS.md A2).'
+            )
         pooled = _split_pool(feat)  # [B, 2*hidden_dim]
         combined = self._head_input(pooled, global_t, opp_onehot, privileged)
         return self.head(combined).squeeze(-1).squeeze(0)
@@ -490,7 +586,7 @@ class Critic(nn.Module):
 
         Expects batch keys: board, global, privileged (N,PRIV_DIM), plus opp_onehot
         (N,3) — required by `critic_v1`/`critic_v2`, ignored (and optional) on
-        `critic_v3`.
+        `critic_v3`/`critic_v4`.
         """
         return self._forward(batch['board'], batch['global'], batch.get('opp_onehot'),
                              batch['privileged'])

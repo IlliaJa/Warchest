@@ -15,7 +15,8 @@ class OpponentPool:
     def __init__(self, max_size=20, snapshot_every=1, *, p_random, p_greedy, p_pool,
                  p_lookahead_critic=0.0, lookahead_critic_time_budget=0.1,
                  lookahead_critic_device='cpu', p_puct=0.0, puct_time_budget=0.1,
-                 puct_device='cpu'):
+                 puct_device='cpu', p_random_eval=0.0, random_eval_seed=0,
+                 random_eval_reply_branching=2):
         self._snapshots = deque(maxlen=max_size)
         self._snapshot_every = snapshot_every
         self._batch_count = 0
@@ -25,7 +26,19 @@ class OpponentPool:
         self._append_count = 0
         self._greedy_bot = GreedyBot()
         self._weights = {'random': p_random, 'greedy': p_greedy, 'pool': p_pool,
-                         'lookahead_critic': p_lookahead_critic, 'puct': p_puct}
+                         'lookahead_critic': p_lookahead_critic, 'puct': p_puct,
+                         'random_eval': p_random_eval}
+        # RandomEvalBot: the B1 randomised-coefficient family (docs/IDEAS.md B1). One
+        # instance, resampling its 8-dim leaf-evaluator θ on every `sample()` — so the
+        # slice is not one opponent but a *continuum* of policy-independent playstyles,
+        # which is the coverage self-play cannot generate (docs/independent_opponents.md).
+        # Its cost is SimGreedyBot's (~18 ms/move, IDEAS.md Table A), an order of magnitude
+        # under lookahead_critic's, so `reply_branching` is trimmed to 2 by default rather
+        # than the bot's own 8: the reply ply only has to surface the punishing move, which
+        # the ordering key ranks first anyway.
+        self._random_eval_seed = random_eval_seed
+        self._random_eval_reply_branching = random_eval_reply_branching
+        self._random_eval_bot = None
         # LookaheadCriticBot is a search opponent: it is eval-scoped by design
         # (docs/bots.md), so as a training opponent it runs at a much smaller
         # per-move time_budget than its own default to keep rollout throughput
@@ -50,10 +63,12 @@ class OpponentPool:
         # to device every episode (was a per-episode cost during rollout collection).
         self._cached_opp = None
 
-    def set_weights(self, *, p_random, p_greedy, p_pool, p_lookahead_critic=0.0, p_puct=0.0):
+    def set_weights(self, *, p_random, p_greedy, p_pool, p_lookahead_critic=0.0, p_puct=0.0,
+                    p_random_eval=0.0):
         """Replace sampling weights. Values are normalised automatically."""
         self._weights = {'random': p_random, 'greedy': p_greedy, 'pool': p_pool,
-                         'lookahead_critic': p_lookahead_critic, 'puct': p_puct}
+                         'lookahead_critic': p_lookahead_critic, 'puct': p_puct,
+                         'random_eval': p_random_eval}
 
     @property
     def weights(self):
@@ -62,7 +77,8 @@ class OpponentPool:
                 'p_greedy': self._weights['greedy'],
                 'p_pool': self._weights['pool'],
                 'p_lookahead_critic': self._weights['lookahead_critic'],
-                'p_puct': self._weights['puct']}
+                'p_puct': self._weights['puct'],
+                'p_random_eval': self._weights['random_eval']}
 
     def maybe_snapshot(self, policy):
         """Copy current policy weights into the pool (called after each batch update).
@@ -124,15 +140,32 @@ class OpponentPool:
             )
         return self._puct_bot
 
+    def _get_random_eval_bot(self):
+        """Lazily build (once) and return the shared RandomEvalBot. Its θ is resampled per
+        episode by `sample`, so one instance covers the whole family.
+        """
+        if self._random_eval_bot is None:
+            from .bots.random_eval_bot import RandomEvalBot
+            self._random_eval_bot = RandomEvalBot(
+                seed=self._random_eval_seed,
+                resample_each_episode=True,
+                reply_branching=self._random_eval_reply_branching,
+            )
+        return self._random_eval_bot
+
     def sample(self, policy_constructor, device):
-        """Return (bot, opponent_type_str) sampled according to internal weights."""
+        """Return (bot, opponent_type_str) sampled according to internal weights.
+
+        Reused bot instances get a `new_episode()` call before being handed out — this is
+        the episode boundary as far as an opponent is concerned, and it is where
+        `RandomEvalBot` draws the θ that defines its playstyle for this episode.
+        """
         types = ['random', 'greedy']
         if self._snapshots:
             types.append('pool')
-        if self._weights.get('lookahead_critic', 0.0) > 0.0:
-            types.append('lookahead_critic')
-        if self._weights.get('puct', 0.0) > 0.0:
-            types.append('puct')
+        for optional in ('lookahead_critic', 'puct', 'random_eval'):
+            if self._weights.get(optional, 0.0) > 0.0:
+                types.append(optional)
         weights = np.array([self._weights[t] for t in types], dtype=float)
         weights /= weights.sum()
         choice = np.random.choice(types, p=weights)
@@ -145,6 +178,10 @@ class OpponentPool:
             return self._get_lookahead_bot(), 'lookahead_critic'
         if choice == 'puct':
             return self._get_puct_bot(), 'puct'
+        if choice == 'random_eval':
+            bot = self._get_random_eval_bot()
+            bot.new_episode()
+            return bot, 'random_eval'
         idx = np.random.randint(len(self._snapshots))
         if self._cached_opp is None:
             self._cached_opp = policy_constructor()

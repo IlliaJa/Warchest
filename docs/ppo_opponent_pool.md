@@ -49,10 +49,10 @@ After each batch update, `pool.maybe_snapshot(policy)` copies the current policy
 
 ### Finetune phase
 
-After every eval block, `PPOTrainer` unconditionally calls `pool.set_weights()` based on the current eval WR vs random:
+After every eval block, `PPOTrainer` unconditionally calls `pool.set_weights()` based on the current eval WR vs greedy:
 
 ```python
-if wr_random_eval >= wr_random_finetune_threshold:  # default 0.90
+if wr_greedy_eval >= wr_greedy_finetune_threshold:  # default 0.90
     pool.set_weights(p_random=0.00, p_greedy=0.40, p_pool=0.60)
 else:
     pool.set_weights(p_random=0.40, p_greedy=0.20, p_pool=0.40)
@@ -175,4 +175,4 @@ for epoch in range(ppo_epochs):                   # default 1
 | `snapshot_every` | 1 | Snapshot after every N batch updates |
 | `eval_every` | 10 | Eval every N batches |
 | `eval_episodes` | 20 | Games per eval block |
-| `wr_random_finetune_threshold` | 0.90 | WR vs random to trigger finetune weights |
+| `wr_greedy_finetune_threshold` | 0.90 | WR vs greedy to trigger finetune weights |
