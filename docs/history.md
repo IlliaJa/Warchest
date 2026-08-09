@@ -294,3 +294,15 @@ at matched readout, and it would cap the critic at the actor's representation.
 
 **Owed:** the gate is *pooled R² holds ~0.20* (§5 row 6), which needs a training run plus
 `eval_board_value.py fit`. Until that runs, this is an implemented change with no measured effect.
+
+**Bundled with it, by explicit decision: `lam` 0.97 → 0.90** (`--lam`, new flag, `IDEAS.md` L2).
+`V(s_{t+1})` enters the advantage at `γ(1−λ)`, so at 0.97 the critic supplied ~3 % of the
+discriminative signal and a repaired critic could not show up in the gauntlet at all; 0.90 is 3.3×
+that weight, an effective horizon of ~9 main-actor decisions against a ~42-decision episode. The
+standing rule wants this attributable and separate; it is bundled anyway because a run is ~9.5 h
+(`ppo_20260807-203528`: 1500 batches, 20:35 → 06:07) and the owner cannot run arms frequently.
+So this run is **a bundle of three changes** (`critic_v3`, per-opponent advantage centring, λ) and
+nothing in it is individually attributable — recorded here so it is not later read as a clean A/B.
+`--lam 0.97` reproduces the prior behaviour for a baseline arm. **Trap:** λ also determines the
+critic's regression target (`returns = GAE advantage + values`), so `critic_mae` is *not*
+comparable across λ arms — it should fall at 0.90 simply because the target is more bootstrapped.

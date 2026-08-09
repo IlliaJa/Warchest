@@ -583,7 +583,10 @@ This is the step that *converts* a repaired critic into policy improvement; with
 is invisible in the gauntlet and will read as a negative result. Difficulty: trivial (a
 hyperparameter arm). **Should ride along with §5 row 8's first training run.**
 
-**Recommended value: λ = 0.90**, swept as `{0.97 (baseline), 0.90, 0.80}`. The arithmetic:
+**Recommended value: λ = 0.90**, swept as `{0.97 (baseline), 0.90, 0.80}`. **Shipped as the
+`--lam` default 2026-08-09**, bundled into the row-6 run rather than swept, because a run is
+~9.5 h and arms are expensive — see `docs/history.md` for what that costs in attribution.
+The arithmetic:
 
 | λ | γ(1−λ) — the weight on `V(s_{t+1})`, i.e. on sibling ranking | vs today | effective horizon `1/(1−γλ)`, in main-actor decisions |
 |---|---|---|---|

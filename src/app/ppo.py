@@ -10,6 +10,10 @@ import torch.nn.functional as F
 import time
 import wandb
 
+# Match every other entry point under src/app (and the invocation README/CLAUDE.md document)
+# so `python src/app/ppo.py` works without PYTHONPATH being set by hand.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
 from src.services.policy.policy import Policy, Critic
 from src.services.policy.checkpoint import (
     save_policy_checkpoint, save_critic_checkpoint, CRITIC_ARCHS, CURRENT_CRITIC_ARCH,
@@ -912,10 +916,15 @@ class PPOTrainer:
         # while `adv_norm='global'` means that bias is going straight into the policy
         # gradient.
         offsets = self._buffer.adv_group_offsets
+        spread = (max(offsets.values()) - min(offsets.values())) if offsets else 0.0
+        # As a fraction of the raw advantage std, which is the readable form: "the opponent
+        # gap was 0.4 sigma of the advantage signal". Raw units alone say nothing without
+        # knowing the batch's scale, and that scale drifts over a run.
+        spread_frac = spread / max(self._buffer.raw_adv_std, 1e-8)
         if offsets:
-            spread = max(offsets.values()) - min(offsets.values())
             logger.info(
                 f'batch={batch_num} adv_norm={self._adv_norm} adv_spread={spread:.4f} '
+                f'({spread_frac:.2f} of raw adv std) '
                 + ' '.join(f'{OPP_GROUP_NAME.get(g, g)}={m:+.4f}'
                            for g, m in sorted(offsets.items()))
             )
@@ -955,8 +964,10 @@ class PPOTrainer:
                 'advantage_std': self._buffer.raw_adv_std,
                 # How much of the raw advantage was opponent identity rather than action
                 # quality (docs/next_iteration.md §5 row 6). 0.0 under adv_norm='global'.
-                'adv_group_spread': (max(offsets.values()) - min(offsets.values())
-                                     if offsets else 0.0),
+                # `_frac` is the same number in units of the raw advantage std — the one to
+                # plot, since the raw scale drifts as the reward shaping anneals.
+                'adv_group_spread': spread,
+                'adv_group_spread_frac': spread_frac,
                 'avg_turns': avg_turns,
                 'entropy_coeff': self._entropy_coeff,
                 'lr': self._actor_optimizer.param_groups[0]['lr'],
@@ -1000,6 +1011,15 @@ if __name__ == '__main__':
         help='Weight of the board-only auxiliary value loss (critic_v2 and later). This is what '
              'gives the board trunk gradient pressure the main head does not supply; 0 '
              'disables it and lets the trunk drift toward the v1 failure mode.')
+    parser.add_argument(
+        '--lam', type=float, default=0.90,
+        help="GAE lambda. Lowered 0.97 -> 0.90 (docs/IDEAS.md L2) now that the critic's trunk "
+             'is alive: V(s_t+1) enters the advantage at gamma*(1-lam), so at 0.97 only ~3 %% '
+             'of the discriminative signal was the critic and repairing it could not show up. '
+             '0.90 is 3.3x that weight, with an effective horizon of ~9 main-actor decisions '
+             'against a ~42-decision episode. Pass --lam 0.97 for the pre-2026-08-09 baseline '
+             'arm. NOTE: lam also changes the critic\'s regression target, so critic_mae is '
+             'NOT comparable across lam arms.')
     parser.add_argument(
         '--adv-norm', choices=('per_opponent', 'global'), default='per_opponent',
         help="How advantages are normalised. 'per_opponent' (default) subtracts each "
@@ -1045,7 +1065,7 @@ if __name__ == '__main__':
         # win/loss signal further back with less bias, densifying credit for
         # delayed-payoff actions (bolster -> durable stack -> later trade/base) without
         # touching the reward. Reward-neutral, so A/B against 0.95 in isolation.
-        'lam': 0.97,
+        'lam': cli_args.lam,
         'ppo_epochs': 4,
         'ppo_eps': 0.2,
         'entropy_coeff': 0.025,
