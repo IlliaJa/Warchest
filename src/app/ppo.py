@@ -219,6 +219,7 @@ class PPOTrainer:
             'p_lookahead_critic': hp['p_lookahead_critic_initial'],
             'p_puct': hp.get('p_puct_initial', 0.0),
             'p_random_eval': hp.get('p_random_eval_initial', 0.0),
+            'p_policy_theta': hp.get('p_policy_theta_initial', 0.0),
         }
         self._opp_weights_finetune = {
             'p_random': hp['p_random_finetune'],
@@ -227,6 +228,7 @@ class PPOTrainer:
             'p_lookahead_critic': hp['p_lookahead_critic_finetune'],
             'p_puct': hp.get('p_puct_finetune', 0.0),
             'p_random_eval': hp.get('p_random_eval_finetune', 0.0),
+            'p_policy_theta': hp.get('p_policy_theta_finetune', 0.0),
         }
         # Advantage normalisation (docs/next_iteration.md §5 row 6). 'per_opponent' centres
         # advantages inside each opponent group, which is what lets `critic_v3` drop the
@@ -289,6 +291,7 @@ class PPOTrainer:
             p_random_eval=hp.get('p_random_eval_initial', 0.0),
             random_eval_seed=hp.get('rollout_seed', 0),
             random_eval_reply_branching=hp.get('random_eval_reply_branching', 2),
+            p_policy_theta=hp.get('p_policy_theta_initial', 0.0),
         )
         self._buffer = RolloutBuffer()
         self._greedy_bot = GreedyBot()
@@ -299,6 +302,7 @@ class PPOTrainer:
         self._wr_vs_lookahead_critic = deque(maxlen=100)
         self._wr_vs_puct = deque(maxlen=100)
         self._wr_vs_random_eval = deque(maxlen=100)
+        self._wr_vs_policy_theta = deque(maxlen=100)
 
         # pre-computed once; actor-side params are needed for separate gradient clipping
         self._actor_side_params = list(self._policy.parameters())
@@ -971,6 +975,10 @@ class PPOTrainer:
                 self._wr_vs_lookahead_critic.append(int(ep['outcome'] == 'win'))
             elif ep['opp_type'] == 'puct':
                 self._wr_vs_puct.append(int(ep['outcome'] == 'win'))
+            elif ep['opp_type'] == 'policy_theta':
+                # One number over the whole verified family — θ is redrawn per episode, so
+                # this is the win rate against a *distribution* of strong opponents.
+                self._wr_vs_policy_theta.append(int(ep['outcome'] == 'win'))
             elif ep['opp_type'] == 'random_eval':
                 # One number over the whole θ family, not per playstyle: each episode draws
                 # its own θ, so this is the win rate against a *distribution* of opponents.
@@ -984,6 +992,8 @@ class PPOTrainer:
         wr_puct = float(np.mean(self._wr_vs_puct)) if self._wr_vs_puct else 0.0
         wr_random_eval = (float(np.mean(self._wr_vs_random_eval))
                           if self._wr_vs_random_eval else 0.0)
+        wr_policy_theta = (float(np.mean(self._wr_vs_policy_theta))
+                           if self._wr_vs_policy_theta else 0.0)
 
         s = update_stats
         avg_turns = float(np.mean([ep['turns'] for ep in self._batch_eps]))
@@ -1098,6 +1108,7 @@ class PPOTrainer:
                 'wr_vs_lookahead_critic_train': wr_lookahead,
                 'wr_vs_puct_train': wr_puct,
                 'wr_vs_random_eval_train': wr_random_eval,
+                'wr_vs_policy_theta_train': wr_policy_theta,
                 'actor_loss': s['avg_actor'],
                 'critic_loss': s['avg_critic'],
                 'approx_kl': s['avg_kl'],
@@ -1203,6 +1214,13 @@ if __name__ == '__main__':
     parser.add_argument(
         '--no-reference-eval', action='store_true',
         help='Skip the frozen-checkpoint eval opponent (saves eval_episodes games per eval).')
+    parser.add_argument(
+        '--p-policy-theta-finetune', type=float, default=0.0,
+        help='Share of finetune-phase episodes played against the verified PolicyThetaBot '
+             'family (docs/bots.md): six θ, each measured to beat lookahead_critic '
+             '(0.53-0.78) at ~1/20th of its per-move cost, redrawn per episode. Off by '
+             'default. Taken out of p_pool, which is the point — the finetune schedule is '
+             'otherwise ~100 %% policy-derived. Needs a policy checkpoint on disk.')
     parser.add_argument(
         '--dump-returns-dir', default=None,
         help='If set, dump (critic input -> shaped GAE return) shards here as round*.npz, '
@@ -1332,6 +1350,15 @@ if __name__ == '__main__':
         # the *finetune* phase (where p_random = p_greedy = 0 and the schedule is ~100 %
         # policy-derived — the collapse docs/independent_opponents.md diagnoses) rather
         # than the initial one, which already has `random` for coverage.
+        # PolicyThetaBot — the strong, fast branch of the B1 family (docs/bots.md).
+        # Every member beats `lookahead_critic` (0.53-0.78, verified on a disjoint seed
+        # block) at ~4.5 ms/move against its ~99, so unlike `p_lookahead_critic` a slice
+        # here is nearly free. Needs a `data/warchest_ppo_*.pth` checkpoint for its
+        # candidate prior, so a fresh run with none on disk must leave this at 0.
+        # OFF by default: the strength and variety are measured, the *training* benefit
+        # is not — that needs an A/B, which is the one thing this work has not run.
+        'p_policy_theta_initial': 0.00,
+        'p_policy_theta_finetune': cli_args.p_policy_theta_finetune,
         'p_random_eval_initial': 0.00,
         'p_random_eval_finetune': cli_args.p_random_eval_finetune,
         # 2nd-ply reply cap for that bot; the base SimGreedyBot uses 8. Only the opponent's
@@ -1339,7 +1366,7 @@ if __name__ == '__main__':
         # choice — see SimGreedyBot.reply_branching.
         'random_eval_reply_branching': 2,
         # win-rate vs greedy that triggers the phase switch
-        'wr_greedy_finetune_threshold': 0.90,
+        'wr_greedy_finetune_threshold': 0.75,
         # self-play pool cadence: snapshot rarely so the max_size-slot pool spans a wide
         # skill range (~pool_max_size * pool_snapshot_every batches) rather than near-copies.
         'pool_max_size': 20,

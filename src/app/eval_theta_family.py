@@ -148,12 +148,19 @@ def _bot_for(theta):
     question the second arm answers is whether θ still separates playstyles once more of
     the real env reward sits between root and leaf.
     """
-    from src.services.bots.random_eval_bot import RandomEvalBot, RandomEvalLookaheadBot
+    from src.services.bots.random_eval_bot import (
+        RandomEvalBot, RandomEvalLookaheadBot, RandomEvalCriticBot,
+    )
 
     key = tuple(theta[k] for k in THETA_KEYS)
     bot = _W['bots'].get(key)
     if bot is None:
-        cls = RandomEvalLookaheadBot if _W['base'] == 'lookahead' else RandomEvalBot
+        if _W['base'] == 'policy_theta':
+            from src.services.bots.policy_theta_bot import PolicyThetaBot
+            cls = PolicyThetaBot
+        else:
+            cls = {'lookahead': RandomEvalLookaheadBot, 'critic': RandomEvalCriticBot}.get(
+                _W['base'], RandomEvalBot)
         bot = cls(theta=theta, **_W['bot_kwargs'])
         _W['bots'][key] = bot
     return bot
@@ -289,6 +296,11 @@ def _print_table(title, arms, thetas, summary):
 def main():
     ap = argparse.ArgumentParser(description='Measure the B1 θ-family behaviour spread.')
     ap.add_argument('--arms', type=int, default=8, help='Sampled θ arms (treatment).')
+    ap.add_argument('--thetas', default=None,
+                    help='JSON list of θ (or of search_theta.py --dump rows) to use as the '
+                         'treatment arms instead of sampling. This is how a *selected* '
+                         'family is verified: sampling re-draws from the prior and would '
+                         'not reproduce the members that passed a strength bar.')
     ap.add_argument('--sweep', default=None, choices=list(THETA_KEYS),
                     help='Replace the sampled arms with a ladder in this single θ '
                          'coordinate (every other coordinate at its default). Answers '
@@ -308,11 +320,22 @@ def main():
     ap.add_argument('--policy-path', default=None, help='Checkpoint for --opponent policy.')
     ap.add_argument('--critic-path', default=None,
                     help='Critic checkpoint for --opponent lookahead_critic.')
-    ap.add_argument('--base', default='greedy', choices=['greedy', 'lookahead'],
+    ap.add_argument('--base', default='greedy',
+                    choices=['greedy', 'lookahead', 'critic', 'policy_theta'],
                     help='Which search bot carries θ. "greedy" is the 2-ply SimGreedyBot '
                          '(~18-25 ms/move); "lookahead" is the alpha-beta search — ~6x the '
-                         'cost, but a base bot that beats SimGreedyBot 0.79, and the arm '
-                         'that answers whether θ still separates playstyles at depth.')
+                         'cost, but a base bot that beats SimGreedyBot 0.79; "critic" is '
+                         'the critic-guided beam search, where θ re-weights only the '
+                         'hand-written half of the leaf blend.')
+    ap.add_argument('--policy-weight', type=float, default=None,
+                    help='Weight on the policy log-prior (--base policy_theta only).')
+    ap.add_argument('--top-k', type=int, default=None,
+                    help='Policy-ranked moves simulated per decision (--base policy_theta).')
+    ap.add_argument('--critic-weight', type=float, default=None,
+                    help='Leaf blend weight (--base critic only). Default: the shipped 0.7.')
+    ap.add_argument('--branching', type=int, default=None,
+                    help='Search width (--base critic only): sets both max_branching and '
+                         'beam_width. Default: the shipped 5.')
     ap.add_argument('--reply-branching', type=int, default=8,
                     help="Each arm's 2nd-ply reply cap (--base greedy only). 2 is the cheap "
                          'setting B1 suggests for the training hot path.')
@@ -338,7 +361,15 @@ def main():
 
     # Arm keys are display labels; θ is carried in the task so workers need no shared state.
     thetas, order = {}, []
-    if args.sweep:
+    if args.thetas:
+        with open(args.thetas) as fh:
+            rows = json.load(fh)
+        for i, row in enumerate(rows):
+            theta = row['theta'] if isinstance(row, dict) and 'theta' in row else row
+            key = f't{i}:{theta_tag(theta)}'
+            thetas[key] = theta
+            order.append(key)
+    elif args.sweep:
         for value in args.sweep_values:
             key = f'{args.sweep[:5]}={value:g}'
             thetas[key] = {**LEGACY_THETA, args.sweep: value}
@@ -379,8 +410,23 @@ def main():
                 'decisions': 0, 'bot_seconds': 0.0}
             for k in order + control_order}
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    bot_kwargs = ({'time_budget': args.bot_time_budget} if args.base == 'lookahead'
-                  else {'reply_branching': args.reply_branching})
+    if args.base == 'policy_theta':
+        bot_kwargs = {'reply_branching': args.reply_branching}
+        if args.policy_weight is not None:
+            bot_kwargs['policy_weight'] = args.policy_weight
+        if args.top_k is not None:
+            bot_kwargs['top_k'] = args.top_k
+    elif args.base == 'critic':
+        bot_kwargs = {'time_budget': args.bot_time_budget, 'stats_log_every': 0}
+        if args.critic_weight is not None:
+            bot_kwargs['critic_weight'] = args.critic_weight
+        if args.branching is not None:
+            bot_kwargs['max_branching'] = args.branching
+            bot_kwargs['beam_width'] = args.branching
+    elif args.base == 'lookahead':
+        bot_kwargs = {'time_budget': args.bot_time_budget}
+    else:
+        bot_kwargs = {'reply_branching': args.reply_branching}
     t0 = time.perf_counter()
     ctx = mp.get_context('spawn')
     with ctx.Pool(args.n_workers, initializer=_init_worker,

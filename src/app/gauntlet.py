@@ -25,6 +25,9 @@ import numpy as np
 import torch
 
 from src.services.bots.evaluation import sample_theta, theta_tag, format_theta
+from src.services.bots.policy_theta_bot import (
+    POLICY_THETA_FAMILY_MEMBERS, FAMILY_POLICY_WEIGHT, FAMILY_TOP_K,
+)
 from src.services.gauntlet import round_robin, build_agent
 from src.services.gauntlet_parallel import round_robin_parallel
 
@@ -140,6 +143,40 @@ def _build_specs(args):
             specs.append({'kind': kind, 'name': name,
                           'kwargs': {'seed': seed, 'theta': theta, **extra}})
             print(f'  {name}: {format_theta(theta)}')
+    if 'policy_theta' in args.bots:
+        # One entrant per *verified* family member (docs/bots.md § PolicyThetaBot), not per
+        # random draw: these six were selected for strength and re-measured on a disjoint
+        # seed block, so the field is reproducible without re-running the search.
+        #
+        # Checkpoint resolution deliberately falls back through --checkpoints before the
+        # newest-on-disk default. Without that middle step, `--bots policy_theta policy
+        # --checkpoints old.pth` silently pits the family (on the *newest* policy) against
+        # a `policy` entrant loaded from `old.pth` — two different networks in a field the
+        # reader will assume shares one. The resolved path is printed either way, because
+        # "which policy did this field actually use" must never be a guess.
+        policy_path = args.policy_critic_policy
+        source = '--policy-critic-policy'
+        if policy_path is None and args.checkpoints and len(args.checkpoints) == 1:
+            policy_path, source = args.checkpoints[0], '--checkpoints'
+        if policy_path is None:
+            policy_path, source = _latest_policy_path(), 'newest on disk'
+        if policy_path is None:
+            print(f'  ! skipping policy_theta: no policy checkpoint matching {POLICY_GLOB}')
+        else:
+            print(f'  policy_theta prior: {policy_path}  ({source})')
+            for i, member in enumerate(POLICY_THETA_FAMILY_MEMBERS):
+                # Named by ROLE, not by `theta_tag`: the tag ranks a coefficient against
+                # its own sampling range, which labelled four of these six `bas` and told
+                # the reader nothing about which bot is which.
+                name = f'pt{i}{member.role}'
+                specs.append({'kind': 'policy_theta', 'name': name, 'kwargs': {
+                    'policy_path': policy_path, 'theta': member.theta,
+                    'policy_weight': (FAMILY_POLICY_WEIGHT if args.policy_theta_weight is None
+                                      else args.policy_theta_weight),
+                    'top_k': FAMILY_TOP_K if args.policy_theta_top_k is None else args.policy_theta_top_k,
+                }})
+                print(f'  {name} (WR {member.wr:.2f} vs lookahead_critic): '
+                      f'{format_theta(member.theta)}')
     if 'random' in args.bots:
         specs.append({'kind': 'random', 'name': 'random'})
     if 'lookahead' in args.bots:
@@ -294,7 +331,8 @@ def main():
                         default=['policy', 'greedy_sim', 'lookahead', 'lookahead_critic', 'policy_critic'],
                         choices=['policy', 'greedy_sim', 'greedy_fast', 'threat_greedy', 'random',
                                  'lookahead', 'lookahead_critic', 'policy_critic', 'round_critic',
-                                 'puct', 'random_eval', 'random_eval_lookahead'],
+                                 'puct', 'random_eval', 'random_eval_lookahead',
+                                 'policy_theta'],
                         help='Participant kinds to include in the field. Default: '
                              'policy greedy_sim lookahead lookahead_critic policy_critic. "policy" '
                              'loads checkpoints per --checkpoints (or the data/*.pth glob); '
@@ -361,6 +399,14 @@ def main():
                              'cost of random_eval). Default 0.1.')
     parser.add_argument('--random-eval-max-branching', type=int, default=8,
                         help='Branching cap per search node for random_eval_lookahead.')
+    parser.add_argument('--policy-theta-weight', type=float, default=None,
+                        help='Weight on the policy log-prior for policy_theta entrants. '
+                             'Default: the measured FAMILY_POLICY_WEIGHT (0.0). Raising it '
+                             'makes every member stronger and more alike — the strength / '
+                             'variety trade is sharp, see policy_theta_bot.py.')
+    parser.add_argument('--policy-theta-top-k', type=int, default=None,
+                        help='Policy-ranked moves simulated per decision by policy_theta '
+                             'entrants. Default: the measured FAMILY_TOP_K (12).')
     parser.add_argument('--puct-c', type=float, default=1.5,
                         help='PUCT exploration constant, for PuctBot (higher = trust the '
                              'policy prior / explore breadth longer). Default 1.5.')

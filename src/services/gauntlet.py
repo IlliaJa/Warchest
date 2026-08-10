@@ -25,7 +25,10 @@ from .bots.greedy_bot import GreedyBot
 from .bots.threat_greedy_bot import ThreatAwareGreedyBot
 from .bots.greedy_sim_bot import SimGreedyBot
 from .bots.bolster_bot import BolsterBot
-from .bots.random_eval_bot import RandomEvalBot, RandomEvalLookaheadBot
+from .bots.random_eval_bot import (
+    RandomEvalBot, RandomEvalLookaheadBot, RandomEvalCriticBot,
+)
+from .bots.policy_theta_bot import PolicyThetaBot
 from .bots.random_bot import RandomBot
 from .bots.lookahead_bot import LookaheadBot
 from .bots.lookahead_critic_bot import LookaheadCriticBot
@@ -111,6 +114,25 @@ def random_eval_lookahead_agent(name=None, encoder=None, *, theta=None, seed=0, 
     `SimGreedyBot` 0.79. θ is pinned here for the same reason as `random_eval_agent`.
     """
     return RandomEvalLookaheadBot(theta=theta, seed=seed, name=name, **kwargs)
+
+
+def random_eval_critic_agent(name=None, encoder=None, *, theta=None, seed=0, **kwargs):
+    """`RandomEvalCriticBot` — the θ family on the critic-guided beam search.
+
+    The strong branch: θ re-weights the hand-written half of the leaf blend and
+    `critic_weight` sets how much of the leaf that half is. Needs a critic checkpoint, so
+    unlike the other two it is not policy-independent.
+    """
+    return RandomEvalCriticBot(theta=theta, seed=seed, name=name, **kwargs)
+
+
+def policy_theta_agent(name=None, encoder=None, *, theta=None, seed=0, **kwargs):
+    """`PolicyThetaBot` — policy proposes, θ-weighted simulation checks (docs/IDEAS.md B1).
+
+    The fast branch: ~5 ms/move against `lookahead_critic`'s ~104. Needs a policy
+    checkpoint, so like the critic family it is not policy-independent.
+    """
+    return PolicyThetaBot(theta=theta, seed=seed, name=name, **kwargs)
 
 
 def bolster_agent(name='bolster', encoder=None, **kwargs):
@@ -218,6 +240,12 @@ def build_agent(spec, *, device):
         return random_eval_agent(spec.get('name'), **spec.get('kwargs', {}))
     if kind == 'random_eval_lookahead':
         return random_eval_lookahead_agent(spec.get('name'), **spec.get('kwargs', {}))
+    if kind == 'policy_theta':
+        return policy_theta_agent(spec.get('name'), device=device,
+                                  **spec.get('kwargs', {}))
+    if kind == 'random_eval_critic':
+        return random_eval_critic_agent(spec.get('name'), device=device,
+                                        **spec.get('kwargs', {}))
     if kind == 'greedy_fast':
         return greedy_fast_agent(spec['name'])
     if kind == 'threat_greedy':

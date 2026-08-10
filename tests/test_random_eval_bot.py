@@ -8,9 +8,9 @@ would do:
      `HeuristicEvaluator.evaluate`, which is the leaf of every search bot in the repo and
      the distribution `LookaheadCriticBot`'s value-scale calibration is moment-matched
      against — a silent shift there would void measurements taken with bots that never
-     heard of θ. Note this is asserted per *decision* on fixed states, not over a whole
-     game: these bots re-sample a determinization from the global RNG on every `act()`, so
-     even two plain `SimGreedyBot`s drift apart over a game. See the test's own docstring.
+     heard of θ. Asserted on *action values under a shared determinization*, not over a
+     whole game: these bots re-sample the future draw order from the global RNG on every
+     `act()`, so even two plain `SimGreedyBot`s drift apart. See the test's own docstring.
   2. **A different θ is a different bot.** The whole proposal is worthless if the search
      washes the coefficients out; a test that only checked (1) would pass on a no-op.
   3. **θ never touches the global RNG.** `gauntlet.play_game` re-seeds the global RNG per
@@ -27,7 +27,7 @@ from src.services.bots.evaluation import (
     normalize_theta, sample_theta, theta_tag, format_theta,
 )
 from src.services.bots.greedy_sim_bot import SimGreedyBot
-from src.services.bots.lookahead_bot import LookaheadBot
+from src.services.bots.lookahead_bot import LookaheadBot, _clone_state
 from src.services.bots.random_eval_bot import RandomEvalBot, RandomEvalLookaheadBot
 
 
@@ -54,38 +54,49 @@ def _play_actions(bot, seed, n_steps=60):
 # --------------------------------------------------------------------------- #
 # 1. the default θ is the status quo
 # --------------------------------------------------------------------------- #
-def test_default_theta_changes_no_decision_across_many_states():
-    """The equivalence guard: θ=`LEGACY_THETA` must not change a single choice.
+def test_default_theta_changes_no_action_value_across_many_states():
+    """The equivalence guard: θ=`LEGACY_THETA` must not change a single action's value.
 
-    Decision-by-decision on fixed states, **not** a whole-game action sequence, and the
-    global RNG is re-pinned before every `act()`. Both details are load-bearing, and
-    neither has anything to do with θ:
+    Compared on **one shared determinization** per probe, not by calling `act()` twice.
+    That detail is load-bearing and has nothing to do with θ: `LookaheadBot._prepare_root`
+    samples a fresh determinization of the future draw order from the *global* RNG on every
+    `act()` call (documented design — see its module docstring), and the draw is sensitive
+    enough that re-pinning the seed around each call is not sufficient — two bots differing
+    only in construction order get different queues. Two *plain* `SimGreedyBot`s already
+    diverge on the same seeded game for exactly this reason.
 
-      * `LookaheadBot._prepare_root` samples one determinization of future draws per
-        `act()` call, from the *global* RNG (documented design — see its module docstring).
-        A decision therefore depends on the global RNG state, measurably: the same bot on
-        the same state under two different global states picks differently ~1 call in 40.
-      * So over a whole game the arms drift apart from any difference at all in how much
-        global RNG each consumed, and two *plain* `SimGreedyBot`s already diverge on the
-        same seeded game. A sequence comparison would be testing the determinization
-        sampler, not θ.
-
-    Pinned per decision, the comparison is exact and this is the strongest form the claim
-    can actually take.
+    So the comparison hands both bots the same root state and the same queues and checks
+    every legal action's value. That is strictly stronger than comparing the argmax — it
+    would catch a θ effect too small to flip a decision — and it is exactly deterministic.
     """
+    np.random.seed(1234)
+    plain = SimGreedyBot()
+    np.random.seed(1234)
+    themed = RandomEvalBot(theta=LEGACY_THETA)
+
+    compared = 0
     for i in range(25):
         env = _fresh_env(200 + i)
         for _ in range(i % 9):          # spread the probes over the opening, not just ply 0
             env.make_random_step()
-        np.random.seed(1234)
-        plain = SimGreedyBot()
-        np.random.seed(1234)
-        themed = RandomEvalBot(theta=LEGACY_THETA)
-
+        root_player = env.active_player
+        legal = env.get_possible_actions()
+        if len(legal) <= 1:
+            continue
         np.random.seed(99)
-        expected = plain.act(env)
-        np.random.seed(99)
-        assert themed.act(env) == expected, f'theta=LEGACY changed the choice at probe {i}'
+        root_state, queues = plain._prepare_root(env, root_player)
+        for action in legal:
+            expected = plain._value_after_my_turn(
+                _clone_state(root_state), {1: list(queues[1]), 2: list(queues[2])},
+                action, root_player)
+            actual = themed._value_after_my_turn(
+                _clone_state(root_state), {1: list(queues[1]), 2: list(queues[2])},
+                action, root_player)
+            assert actual == expected, (
+                f'theta=LEGACY changed action {action}\'s value at probe {i}: '
+                f'{actual!r} vs {expected!r}')
+            compared += 1
+    assert compared > 100, f'only {compared} action values compared — probe set too thin'
 
 
 def test_legacy_theta_leaf_is_bit_identical_to_the_pre_theta_evaluator():

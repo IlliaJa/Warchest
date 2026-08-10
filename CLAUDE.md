@@ -17,7 +17,7 @@ Turn-based hex-grid strategy game with a reinforcement learning agent (PPO + GAE
 - [RL algorithms](docs/rl_algorithms.md) — GAE, PPO, DQN, and alternatives with Warchest-specific trade-offs
 - [Metrics reference](docs/METRICS.md) — W&B metrics explained: ideal ranges, trends, warning signs
 - [Web agent](docs/web_agent.md) — design for driving warchestonline.com with a trained checkpoint via Playwright (not yet implemented; `config/web_agent.sample.toml` is the sketch)
-- [Bots](docs/bots.md) — non-learned/search-based bots overview; `LookaheadCriticBot` bugs found, fixes, and experiment log. Also **§ `RandomEvalBot` — the θ family (2026-08-09, IDEAS.md B1)**: `HeuristicEvaluator` now takes an 8-dim coefficient vector `theta` (default bit-identical to the pre-θ evaluator), and `RandomEvalBot` samples it. Measured 4–5× behaviour spread over a re-seeded control, but only 2 of the 6 promised archetypes are real (`tempo`/`progress` are inert), `durability` produces a **turtle** not a bolster brawler and is what actually collapsed the old `rich_eval` bundle, and a 9-agent gauntlet is **fully transitive** — diverse, not mutually orthogonal
+- [Bots](docs/bots.md) — non-learned/search-based bots overview; `LookaheadCriticBot` bugs found, fixes, and experiment log. Also **§ `RandomEvalBot` — the θ family (2026-08-09, IDEAS.md B1)**: `HeuristicEvaluator` now takes an 8-dim coefficient vector `theta` (default bit-identical to the pre-θ evaluator), and `RandomEvalBot` samples it. Measured 4–5× behaviour spread over a re-seeded control, but only 2 of the 6 promised archetypes are real (`tempo`/`progress` are inert), `durability` produces a **turtle** not a bolster brawler and is what actually collapsed the old `rich_eval` bundle, and a 9-agent gauntlet is **fully transitive** — diverse, not mutually orthogonal. **§ `PolicyThetaBot` (2026-08-09)** is the follow-up that *is* strong: policy proposes the candidates, a θ-weighted heuristic checks them on 1 ply. All six shipped family members beat `lookahead_critic` (**0.53–0.78**, verified on a disjoint seed block) at **4.5 ms/move vs its 98.7 — 21× faster**, with a 3.03× behaviour spread and one member that bolsters 18.5 % of the time and still wins. Not policy-independent (the candidate set comes from a checkpoint); `policy_weight`/`top_k` trade strength against variety *sharply*, so the family is **selected**, not sampled
 - [Search under uncertainty](docs/search_under_uncertainty.md) — what is actually hidden (3-way coin partition), why single-determinization search is flawed (strategy fusion / non-locality), and the belief/IS-MCTS/CFR fix list. §8 holds the 2026-08-02 measurement that **closed** the belief track (seeing the opponent's hand is worth ~0) and, in passing, found the **v11 critics' spatial trunk is dead**
 
 ## Quick orientation
@@ -32,7 +32,10 @@ src/
     bots/           Bot ABC, RandomBot, GreedyBot, search bots
       evaluation.py   shared HeuristicEvaluator + the 8-dim `theta` coefficient
                       vector and its sampler (docs/IDEAS.md B1)
-      random_eval_bot.py  SimGreedyBot with sampled theta — the opponent family
+      random_eval_bot.py  ThetaSampling mixin + the SimGreedy / LookaheadBot /
+                      LookaheadCriticBot theta families
+      policy_theta_bot.py  policy proposes + theta-weighted 1-ply check; the
+                      verified POLICY_THETA_FAMILY that beats lookahead_critic
     opponent_pool.py  weighted opponent sampler (random / greedy / pool snapshots)
     gauntlet.py     round-robin agents + Bradley-Terry/Elo ratings + transitivity
   app/
@@ -49,6 +52,9 @@ src/
     eval_theta_family.py  does the B1 sampled-θ evaluator family actually produce
                         different bots — verb-profile spread vs a re-seeded control,
                         plus --sweep KEY to move one coefficient at a time
+    search_theta.py     best-response search over θ (+ search knobs) with common random
+                        numbers and successive halving — answers "is any member strong",
+                        which is what produced the shipped PolicyThetaBot family
     eval_move_agreement.py  do the cheating and blind PuctBot teachers pick different
                         moves (the thing ExIt actually distills) — §8.3
     policy_viz.py   export policy graph to TensorBoard

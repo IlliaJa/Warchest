@@ -16,7 +16,7 @@ class OpponentPool:
                  p_lookahead_critic=0.0, lookahead_critic_time_budget=0.1,
                  lookahead_critic_device='cpu', p_puct=0.0, puct_time_budget=0.1,
                  puct_device='cpu', p_random_eval=0.0, random_eval_seed=0,
-                 random_eval_reply_branching=2):
+                 random_eval_reply_branching=2, p_policy_theta=0.0):
         self._snapshots = deque(maxlen=max_size)
         self._snapshot_every = snapshot_every
         self._batch_count = 0
@@ -27,7 +27,7 @@ class OpponentPool:
         self._greedy_bot = GreedyBot()
         self._weights = {'random': p_random, 'greedy': p_greedy, 'pool': p_pool,
                          'lookahead_critic': p_lookahead_critic, 'puct': p_puct,
-                         'random_eval': p_random_eval}
+                         'random_eval': p_random_eval, 'policy_theta': p_policy_theta}
         # RandomEvalBot: the B1 randomised-coefficient family (docs/IDEAS.md B1). One
         # instance, resampling its 8-dim leaf-evaluator θ on every `sample()` — so the
         # slice is not one opponent but a *continuum* of policy-independent playstyles,
@@ -39,6 +39,9 @@ class OpponentPool:
         self._random_eval_seed = random_eval_seed
         self._random_eval_reply_branching = random_eval_reply_branching
         self._random_eval_bot = None
+        # PolicyThetaBot: the strong, fast branch of the same family — measured 0.53-0.78
+        # per member against `lookahead_critic` at ~1/3 its per-move cost (docs/bots.md).
+        self._policy_theta_bot = None
         # LookaheadCriticBot is a search opponent: it is eval-scoped by design
         # (docs/bots.md), so as a training opponent it runs at a much smaller
         # per-move time_budget than its own default to keep rollout throughput
@@ -64,11 +67,11 @@ class OpponentPool:
         self._cached_opp = None
 
     def set_weights(self, *, p_random, p_greedy, p_pool, p_lookahead_critic=0.0, p_puct=0.0,
-                    p_random_eval=0.0):
+                    p_random_eval=0.0, p_policy_theta=0.0):
         """Replace sampling weights. Values are normalised automatically."""
         self._weights = {'random': p_random, 'greedy': p_greedy, 'pool': p_pool,
                          'lookahead_critic': p_lookahead_critic, 'puct': p_puct,
-                         'random_eval': p_random_eval}
+                         'random_eval': p_random_eval, 'policy_theta': p_policy_theta}
 
     @property
     def weights(self):
@@ -78,7 +81,8 @@ class OpponentPool:
                 'p_pool': self._weights['pool'],
                 'p_lookahead_critic': self._weights['lookahead_critic'],
                 'p_puct': self._weights['puct'],
-                'p_random_eval': self._weights['random_eval']}
+                'p_random_eval': self._weights['random_eval'],
+                'p_policy_theta': self._weights['policy_theta']}
 
     def maybe_snapshot(self, policy):
         """Copy current policy weights into the pool (called after each batch update).
@@ -140,6 +144,22 @@ class OpponentPool:
             )
         return self._puct_bot
 
+    def _get_policy_theta_bot(self):
+        """Lazily build (once) the shared PolicyThetaBot. Unlike `random_eval` it needs a
+        policy checkpoint, so a fresh run with none on disk must keep `p_policy_theta=0`.
+        θ is redrawn per episode from the *verified* six (`POLICY_THETA_FAMILY`), not from
+        the raw prior — a training pool cannot re-measure, and the prior contains θ that
+        lose outright.
+        """
+        if self._policy_theta_bot is None:
+            from .bots.policy_theta_bot import PolicyThetaBot
+            self._policy_theta_bot = PolicyThetaBot(
+                seed=self._random_eval_seed,
+                resample_each_episode=True,
+                device=self._lookahead_device,
+            )
+        return self._policy_theta_bot
+
     def _get_random_eval_bot(self):
         """Lazily build (once) and return the shared RandomEvalBot. Its θ is resampled per
         episode by `sample`, so one instance covers the whole family.
@@ -163,7 +183,7 @@ class OpponentPool:
         types = ['random', 'greedy']
         if self._snapshots:
             types.append('pool')
-        for optional in ('lookahead_critic', 'puct', 'random_eval'):
+        for optional in ('lookahead_critic', 'puct', 'random_eval', 'policy_theta'):
             if self._weights.get(optional, 0.0) > 0.0:
                 types.append(optional)
         weights = np.array([self._weights[t] for t in types], dtype=float)
@@ -182,6 +202,10 @@ class OpponentPool:
             bot = self._get_random_eval_bot()
             bot.new_episode()
             return bot, 'random_eval'
+        if choice == 'policy_theta':
+            bot = self._get_policy_theta_bot()
+            bot.new_episode()
+            return bot, 'policy_theta'
         idx = np.random.randint(len(self._snapshots))
         if self._cached_opp is None:
             self._cached_opp = policy_constructor()

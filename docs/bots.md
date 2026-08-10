@@ -220,7 +220,97 @@ point: the ceiling here is the **`SimGreedyBot` class**, not the coefficients in
 that class is ~0.17 against the current policy. B2 should be re-scoped (search over a
 stronger base bot) or deprioritised — optimising θ cannot reach 65 % from 0.08.
 
+---
+
+## `PolicyThetaBot` — a fast family that actually beats `lookahead_critic` (2026-08-09)
+
+The θ family above is varied but weak. This one is the answer to "a **fast** bot stronger
+than `lookahead_critic`, as a family with different behaviours". It exists because three
+cheaper ideas were measured and killed, in this order:
+
+| what was tried | vs `lookahead_critic` (0.1 s both sides) |
+|---|---|
+| θ search on `SimGreedyBot` | ~0.0 |
+| θ search on `LookaheadBot`, 48 candidates, n=64 | **0.391** — and the winner was the *default* θ |
+| tuning `LookaheadCriticBot`'s own knobs (`critic_weight`, width), 2 grids | 0.56 ± 0.035 (stock control 0.47) |
+| the raw trained policy, n=64 | 0.53 ± 0.06, at **~0.86 ms/move** |
+
+The first two rows are the load-bearing negative result: **θ is a behaviour dial, not a
+strength dial, at every search depth tested.** The 48-candidate search returned the
+incumbent; every apparent leader at n=8 regressed to the mean (0.625 → 0.375 → 0.438 →
+0.359). So strength has to come from somewhere other than the coefficients.
+
+The last row says where. The policy is already competitive at ~1/120 of the cost, and its
+documented weakness is not evaluation but that it is a reflex with no forward check. So:
+**the policy proposes, a θ-weighted `HeuristicEvaluator` checks.** One policy forward ranks
+the legal moves, the top `top_k` are played out as whole turns with the opponent's best
+reply (inherited from `SimGreedyBot`), and `policy_weight` says how much simulated gain it
+takes to overrule the prior.
+
+### The strength / variety trade is sharp, and it is a *knob*, not a compromise
+
+All vs `lookahead_critic`, 24 games per arm, 8 sampled θ:
+
+| `policy_weight` | `top_k` | mean WR | behaviour spread ratio |
+|---|---|---|---|
+| 0.15 | 6 | 0.67 | 0.88x — no family at all |
+| 0.05 | 10 | 0.67 | 0.65x |
+| **0.00** | **12** | 0.39 | **4.12x** |
+
+Any prior weight above ~0 swamps θ: log-prior gaps between the 1st and 10th candidate run
+to ~7 nats, so even 0.05 contributes ~0.35 against heuristic differences of ~0.05. There
+is no middle setting that buys both — which is why the family is **selected, not sampled**:
+run `search_theta.py` at the diverse end and keep the θ that clear the strength bar.
+
+### The shipped family (`POLICY_THETA_FAMILY`, six members)
+
+Selected by `search_theta.py --base policy_theta` (40 candidates, 16/32/48 successive
+halving, seeds 9000+), then **re-measured on a disjoint seed block (77000+)**, so the
+numbers below are not the ones that selected them:
+
+```
+entrant   role                WR vs lookahead_critic (n=32)   bolster rate
+pt0bal    balanced (no dominant term)   0.78                     0.010
+pt1cls    closer (progress 5.9x)        0.66                     0.011
+pt2bas    base-hungry                   0.59                     0.011
+pt3def    the default θ                 0.56                     0.008
+pt4rac    racer (pos 6.3x)              0.56                     0.017
+pt5bol    brawler (risk 0, dur 0.30)    0.53                     0.185   <-
+spread ratio 3.03x  |  0/6 degenerate  |  mean 0.61
+```
+
+Entrants are named by **role** — and by *behaviour*, never by rank: `pt0` is the
+strongest of the six here, but it is called `bal` (balanced: no dominant coefficient)
+because strength is a property of this measurement, against this opponent with this policy
+supplying the prior, while the shape of θ is not. Roles are not `evaluation.theta_tag`. That function ranks a
+coefficient against its own *sampling range* — useful for labelling a random draw, useless
+for a fixed family, where it labelled four of these six `bas`.
+
+**Every member beats `lookahead_critic`**, the spread is 3.0x the re-seeded control, and
+`pt5` bolsters on **18.5 %** of its moves against the others' ~1 % — `docs/IDEAS.md` #R8
+records bolster underuse as a standing blind spot, and this is the first opponent in the
+repo that both bolsters and wins.
+
+Speed, measured single-process (no worker contention): **4.5–4.7 ms/move vs
+`lookahead_critic`'s 98.7 — 21x faster.**
+
+Two caveats worth keeping straight. These are **not policy-independent**: the candidate set
+comes from a frozen checkpoint, so they inherit its blind spots and share the `pool` critic
+one-hot slot. Use the `RandomEvalLookaheadBot` family when independence from the learner is
+what matters. And θ only separates the members **mid-game** — measured disagreement between
+the two most distant members is 0/60 over plies 0–10 and 10/59 over plies 30–90, because in
+the opening every unit is still in supply and the terms θ re-weights have nothing to read.
+
 ### Wiring
+
+`ppo.py --p-policy-theta-finetune` takes its share out of `p_pool`; `OpponentPool` holds
+one instance and redraws θ per episode **from the verified six**, not from the raw prior
+(a training pool cannot re-measure, and the prior contains θ that lose outright).
+`--bots policy_theta` puts one gauntlet entrant per member in the field. **Default 0.0** —
+the strength and the variety are measured, the *training* benefit is not; that needs an
+A/B, which is the one thing this work has not run.
+
+### `RandomEvalBot` wiring
 
 `OpponentPool(p_random_eval=...)` holds one instance and calls `new_episode()` per
 episode, so the slice is a *distribution* over playstyles rather than one opponent;

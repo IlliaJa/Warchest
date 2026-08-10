@@ -199,10 +199,18 @@ class LookaheadCriticBot(LookaheadBot):
     # base search pays nothing for the hook.
     _BOUNDS_BY_ROUND = False
 
+    # Weight on the critic in the leaf blend; the remainder goes to `_leaf_potential`.
+    # 0.7 is the measured default (docs/bots.md swept 1.0/0.5/0.4/0.3/0.2/0.0 against
+    # LookaheadBot and found both extremes markedly worse). A constructor argument rather
+    # than a constant so the θ family can co-search it: the sweep that fixed it was run
+    # against a *different* opponent and with the pre-θ heuristic on the other side of the
+    # blend, so it is not obviously still optimal once that half is re-weighted.
+    CRITIC_WEIGHT = 0.7
+
     def __init__(self, critic_path=None, beam_width=5, max_branching=5,
                  time_budget=0.5, see_opponent_hand=True, max_depth=40, gamma=0.99,
                  opp_type='pool', n_determinizations=1, stats_log_every=20,
-                 device='cpu', name='lookahead_critic'):
+                 device='cpu', name='lookahead_critic', theta=None, critic_weight=None):
         if critic_path is None:
             critic_path = _latest_critic_path()
             if critic_path is None:
@@ -210,15 +218,20 @@ class LookaheadCriticBot(LookaheadBot):
                     f'No checkpoint matching {CRITIC_GLOB} — pass critic_path '
                     f'explicitly, or train and save one first.'
                 )
-        # rich_eval=False: this bot's value-scale calibration is moment-matched to
-        # `_leaf_potential`'s exact distribution (see docs/bots.md), so its leaf
-        # must stay the legacy base/material/pos/risk formula. The new
-        # bolster/recruit/tempo terms would shift that distribution and invalidate
-        # the calibration; they belong to the hand-tuned LookaheadBot, not here.
+        # rich_eval is never used here: this bot's value-scale calibration is
+        # moment-matched to `_leaf_potential`'s distribution (see docs/bots.md), and the
+        # `rich_eval` bundle would shift that distribution without the calibration knowing.
+        # `theta` is safe where `rich_eval` was not, and the difference is not a judgement
+        # call — `_calibrate_value_scale` computes the target moments from the *live*
+        # `_leaf_potential` at construction time (see its `heur = ...` line), so a θ that
+        # rescales the heuristic is absorbed by the calibration automatically. θ=None
+        # reproduces the historical bot exactly.
         super().__init__(time_budget=time_budget, max_branching=max_branching,
                           see_opponent_hand=see_opponent_hand, max_depth=max_depth,
-                          gamma=gamma, shaping_anneal=1.0, rich_eval=False, name=name)
+                          gamma=gamma, shaping_anneal=1.0, rich_eval=False, name=name,
+                          theta=theta)
         self.beam_width = beam_width
+        self.critic_weight = self.CRITIC_WEIGHT if critic_weight is None else float(critic_weight)
         self.n_determinizations = n_determinizations
         self.stats_log_every = stats_log_every
         self._reset_agg_stats()
@@ -400,6 +413,10 @@ class LookaheadCriticBot(LookaheadBot):
             self.last_stats['legal_at_root'], self.last_stats['best_value'],
         )
         self._record_agg_stats()
+        # Same verb-usage accounting LookaheadBot.act does — this override never reaches
+        # it, so without this the behaviour profile every θ-family measurement reads
+        # (src/app/eval_theta_family.py) would come back empty for this branch.
+        self.usage[self._classify(best_action)] += 1
         return best_action
 
     def _reset_agg_stats(self):
@@ -608,7 +625,8 @@ class LookaheadCriticBot(LookaheadBot):
                     # critic weight; both a pure critic and a pure heuristic
                     # scored markedly worse than this blend).
                     heur = self._leaf_potential(c.state, root_player)
-                    c.est = c.partial_value + self.gamma ** (ply + 1) * (0.7 * v + 0.3 * heur)
+                    w = self.critic_weight
+                    c.est = c.partial_value + self.gamma ** (ply + 1) * (w * v + (1.0 - w) * heur)
 
             children.sort(key=lambda c: c.est, reverse=maximizing)
             survivors = children[:self._beam_width_at(ply)]

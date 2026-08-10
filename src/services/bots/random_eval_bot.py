@@ -38,6 +38,7 @@ import numpy as np
 
 from .greedy_sim_bot import SimGreedyBot
 from .lookahead_bot import LookaheadBot
+from .lookahead_critic_bot import LookaheadCriticBot
 from .evaluation import sample_theta, normalize_theta, theta_tag, format_theta
 
 
@@ -71,7 +72,7 @@ class ThetaSampling:
         self._rng = np.random.default_rng(seed)
         self.seed = seed
         self.resample_each_episode = resample_each_episode
-        theta = normalize_theta(theta) if theta is not None else sample_theta(self._rng)
+        theta = normalize_theta(theta) if theta is not None else self._draw_theta()
         super().__init__(name=name or f'{self._NAME_PREFIX}_{theta_tag(theta)}', **kwargs)
         # Set after super(): the search bot's __init__ builds the evaluator this re-weights.
         self.theta = None
@@ -81,6 +82,13 @@ class ThetaSampling:
         # which. With θ pinned (the gauntlet/eval case) it holds exactly one entry and
         # `usage` *is* that θ's behaviour profile.
         self.theta_history = [self.theta]
+
+    def _draw_theta(self):
+        """One θ from this family's distribution. Overridable: `PolicyThetaBot` draws from
+        a *verified* finite set instead of the prior, because a training pool cannot
+        re-measure and the prior contains θ that lose outright.
+        """
+        return sample_theta(self._rng)
 
     def set_theta(self, theta):
         """Adopt `theta` (in place — no search env rebuild)."""
@@ -95,7 +103,7 @@ class ThetaSampling:
         do not define it.
         """
         if self.resample_each_episode:
-            self.set_theta(sample_theta(self._rng))
+            self.set_theta(self._draw_theta())
             self.theta_history.append(self.theta)
 
     def reset_usage(self):
@@ -138,3 +146,26 @@ class RandomEvalLookaheadBot(ThetaSampling, LookaheadBot):
     """
 
     _NAME_PREFIX = 'thetaLA'
+
+
+class RandomEvalCriticBot(ThetaSampling, LookaheadCriticBot):
+    """The θ family on `LookaheadCriticBot` — the *strong* branch.
+
+    Here θ re-weights only the hand-written half of the leaf: this bot scores a node as
+    `critic_weight * critic + (1 - critic_weight) * _leaf_potential`, and θ enters through
+    the second term. So a family member differs from stock `lookahead_critic` in what its
+    heuristic hedge values, and (if `critic_weight` is given) in how much it trusts that
+    hedge at all — the blend weight was measured once, against a different opponent and
+    with the pre-θ heuristic on the other side, so it is co-searchable rather than fixed.
+
+    Safe despite the `rich_eval` prohibition in `LookaheadCriticBot`'s docstring: the
+    critic's value-scale calibration is moment-matched against the *live* `_leaf_potential`
+    at construction, so it absorbs a θ rescale instead of being invalidated by it.
+
+    Slower than `RandomEvalLookaheadBot` (a critic forward pass per node) and it needs a
+    checkpoint, so it is not policy-*independent*: it inherits whatever the critic knows,
+    which is derived from self-play. Use it where strength is the point and the
+    LookaheadBot family where independence is.
+    """
+
+    _NAME_PREFIX = 'thetaLC'
