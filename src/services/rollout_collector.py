@@ -50,9 +50,10 @@ def _worker_loop(worker_id, task_q, result_q, counter, cfg):
 
     device = torch.device('cpu')
     hidden_dim = cfg['policy_hidden_dim']
+    policy_arch = cfg['policy_arch']
 
     def policy_constructor():
-        return Policy(device=device, hidden_dim=hidden_dim)
+        return Policy(device=device, hidden_dim=hidden_dim, arch=policy_arch)
 
     env = WarChestEnv(save_game_history=False, debug_mode=False)
     policy = policy_constructor()
@@ -173,7 +174,7 @@ class ParallelRolloutCollector:
     even for a fixed seed (documented tradeoff).
     """
 
-    def __init__(self, n_workers, *, policy_hidden_dim, pool_max_size, seed_base,
+    def __init__(self, n_workers, *, policy_hidden_dim, policy_arch, pool_max_size, seed_base,
                  lookahead_critic_time_budget=0.1, puct_time_budget=0.1, collect_dense=False,
                  random_eval_reply_branching=2):
         self._ctx = mp.get_context('spawn')
@@ -184,6 +185,7 @@ class ParallelRolloutCollector:
         self._procs = []
         cfg = {
             'policy_hidden_dim': policy_hidden_dim,
+            'policy_arch': policy_arch,
             'pool_max_size': pool_max_size,
             'seed_base': seed_base,
             'lookahead_critic_time_budget': lookahead_critic_time_budget,

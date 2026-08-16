@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 from src.services.policy.policy import Policy, Critic
 from src.services.policy.checkpoint import (
     save_policy_checkpoint, save_critic_checkpoint, load_policy_checkpoint,
-    CRITIC_ARCHS, CURRENT_CRITIC_ARCH,
+    CRITIC_ARCHS, CURRENT_CRITIC_ARCH, POLICY_ARCHS, CURRENT_ARCH,
 )
 from src.services.environment.obs_encoders import get_encoder
 from src.services.environment.warchest_env import WarChestEnv
@@ -206,6 +206,7 @@ class PPOTrainer:
         self._overlap = hp.get('overlap_collection', False)
         self._rollout_seed = hp.get('rollout_seed', 0)
         self._policy_hidden_dim = hp['hidden_dim']
+        self._policy_arch = hp.get('policy_arch', CURRENT_ARCH)
         self._pool_max_size = hp.get('pool_max_size', 20)
         self._collector = None
         self._print_every = hp['print_every']
@@ -456,6 +457,7 @@ class PPOTrainer:
             self._collector = ParallelRolloutCollector(
                 self._n_workers,
                 policy_hidden_dim=self._policy_hidden_dim,
+                policy_arch=self._policy_arch,
                 pool_max_size=self._pool_max_size,
                 seed_base=self._rollout_seed,
                 lookahead_critic_time_budget=self._lookahead_critic_time_budget,
@@ -822,7 +824,7 @@ class PPOTrainer:
             meta = load_policy_checkpoint(path, map_location=self._device)
             encoder = get_encoder(meta['obs_version'])
             ref = Policy(device=self._device, hidden_dim=meta['hidden_dim'],
-                         obs_encoder=encoder).to(self._device)
+                         obs_encoder=encoder, arch=meta['arch']).to(self._device)
             ref.load_state_dict(meta['state_dict'])
         except Exception as e:
             logger.warning(
@@ -1165,7 +1167,11 @@ if __name__ == '__main__':
         help='Weight of the dense auxiliary critic loss (only used with --dense-critic-targets).')
     parser.add_argument(
         '--critic-arch', choices=CRITIC_ARCHS, default=CURRENT_CRITIC_ARCH,
-        help="Critic architecture. 'critic_v4' (default) is critic_v3 with the flank-average "
+        help="Critic architecture. 'critic_v5' (default) is critic_v4 plus the shared "
+             'unit-type embedding on the unit planes and the per-type global vectors '
+             '(docs/IDEAS.md A1); it deliberately has no FiLM, which would leak the globals '
+             'into board_only_head and void the critic_v2 fix. critic_v4 is critic_v3 with '
+             'the flank-average '
              'readout replaced by a gather at the 10 fixed base cells plus masked mean+max '
              'over own/opponent unit cells and the whole board (docs/IDEAS.md A2), aimed at '
              'the sibling-pair ties in docs/next_iteration.md §3.4. critic_v3 is the same net '
@@ -1173,6 +1179,14 @@ if __name__ == '__main__':
              'one-hot (§5 row 6 — that offset now comes out of the advantage instead, see '
              '--adv-norm). The un-normalised critic_v1 trunk provably dies (§3.4). Pass an '
              'older arch only to reproduce a baseline.')
+    parser.add_argument(
+        '--policy-arch', choices=POLICY_ARCHS, default=CURRENT_ARCH,
+        help="Policy architecture. 'policy_factored_v2' (default) contracts the unit-stack "
+             'planes and the per-type global vectors against a shared unit-type table whose '
+             'first 10 columns are frozen roster.py attributes (docs/IDEAS.md A1), and feeds '
+             'the globals to the trunk as FiLM (gamma, beta) after each conv block instead of '
+             'broadcasting them across all 49 cells into the spatial head (A3). '
+             'policy_factored_v1 is the pre-A1/A3 net; pass it to reproduce a baseline.')
     parser.add_argument(
         '--aux-board-coeff', type=float, default=0.1,
         help='Weight of the board-only auxiliary value loss (critic_v2 and later). This is what '
@@ -1380,6 +1394,10 @@ if __name__ == '__main__':
         # auxiliary head, so the trunk cannot enter the ReLU absorbing state and has a
         # gradient source the main head does not give it.
         'critic_arch': cli_args.critic_arch,
+        # Policy trunk/input rework (docs/IDEAS.md A1 + A3): shared unit-type embedding
+        # in place of one-hot type indices, and FiLM conditioning of the trunk on the
+        # globals in place of the 245 broadcast constant planes.
+        'policy_arch': cli_args.policy_arch,
         'adv_norm': cli_args.adv_norm,
         'aux_board_coeff': cli_args.aux_board_coeff,
         'trunk_health_every': 10,
@@ -1412,7 +1430,7 @@ if __name__ == '__main__':
         logger.info(f'wandb_run={run.url}')
 
     def policy_constructor():
-        return Policy(device=device, hidden_dim=hp['hidden_dim'])
+        return Policy(device=device, hidden_dim=hp['hidden_dim'], arch=hp['policy_arch'])
 
     warchest_policy = policy_constructor().to(device)
     warchest_critic = Critic(device=device, hidden_dim=hp['critic_hidden_dim'],
@@ -1457,6 +1475,7 @@ if __name__ == '__main__':
                     warchest_policy, f'data/{filename}',
                     obs_version=environment._obs_encoder.version,
                     hidden_dim=hp['hidden_dim'],
+                    arch=hp['policy_arch'],
                 )
                 save_critic_checkpoint(
                     warchest_critic, f'data/{critic_filename}',

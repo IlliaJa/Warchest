@@ -36,7 +36,8 @@ from src.services.policy.checkpoint import (
     CRITIC_ARCHS, CURRENT_CRITIC_ARCH, load_critic_checkpoint, save_critic_checkpoint,
 )
 from src.services.policy.policy import (
-    CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3, CRITIC_ARCH_V4, Critic, _BASE_CELLS,
+    CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3, CRITIC_ARCH_V4, CRITIC_ARCH_V5,
+    Critic, _BASE_CELLS,
 )
 
 DEV = torch.device('cpu')
@@ -48,10 +49,11 @@ def _boards(n=16, channels=None):
     return torch.randn(n, ch, 7, 7)
 
 
-def test_v4_is_the_default_and_every_arch_builds():
-    assert CURRENT_CRITIC_ARCH == CRITIC_ARCH_V4
-    assert set(CRITIC_ARCHS) == {CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3, CRITIC_ARCH_V4}
-    assert Critic(DEV, HIDDEN).arch == CRITIC_ARCH_V4
+def test_v5_is_the_default_and_every_arch_builds():
+    assert CURRENT_CRITIC_ARCH == CRITIC_ARCH_V5
+    assert set(CRITIC_ARCHS) == {CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3, CRITIC_ARCH_V4,
+                                 CRITIC_ARCH_V5}
+    assert Critic(DEV, HIDDEN).arch == CRITIC_ARCH_V5
     for arch in CRITIC_ARCHS:
         assert Critic(DEV, HIDDEN, arch=arch).arch == arch
 

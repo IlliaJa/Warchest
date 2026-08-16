@@ -45,7 +45,8 @@ if __name__ == '__main__':
     policy_encoder = get_encoder(ckpt['obs_version'])
     print(f"arch={ckpt['arch']} obs_version={ckpt['obs_version']} hidden_dim={ckpt['hidden_dim']}")
 
-    policy = Policy(device=device, hidden_dim=ckpt['hidden_dim'], obs_encoder=policy_encoder).to(device)
+    policy = Policy(device=device, hidden_dim=ckpt['hidden_dim'], obs_encoder=policy_encoder,
+                    arch=ckpt['arch']).to(device)
     policy.load_state_dict(ckpt['state_dict'])
     policy.eval()
     opponent = PolicyAgent(os.path.basename(model_path), policy, policy_encoder)

@@ -9,6 +9,7 @@ from ..environment.warchest_env import (
 )
 from ..environment.board import Board
 from ..environment.obs_encoders import latest_encoder
+from .unit_embedding import ObsTypeEmbedding, DEFAULT_LEARNED_DIM
 
 
 class HexConv2d(nn.Module):
@@ -37,6 +38,48 @@ class HexConv2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
+
+
+class FiLM(nn.Module):
+    """Condition a conv feature map on the global vector, per channel (docs/IDEAS.md A3).
+
+    The alternative it replaces is `Conv2d(hidden + global_dim, ..., k=1)` fed a
+    `global_feats` tensor broadcast across all 49 cells. Because the broadcast value
+    is identical at every cell and a 1x1 conv applies the same weights at every cell,
+    that whole path collapses to one *constant* term `W_g @ g` added to the head's
+    output everywhere — the globals contribute a position-independent bias and nothing
+    else, and the trunk that computed the board features never saw them at all.
+
+    An additive bias cannot express the thing the game needs: "this channel does not
+    matter with the hand I am holding". A Berserker threat cell is worth nothing when
+    no Berserker coin is playable this round, and switching a channel off requires
+    multiplying it, not shifting it. So `MLP(globals) -> (gamma, beta)` per channel and
+
+        x <- x * (1 + gamma) + beta
+
+    applied after each conv block, before the activation. Two consequences beyond the
+    extra expressiveness: it is applied three times down the trunk rather than once at
+    the end, so the conditioning reaches the spatial interactions the later blocks
+    compute; and the 245*N_VERBS dead head weights disappear.
+
+    The last layer is zero-initialised, so at step 0 gamma = beta = 0 and the module is
+    exactly the identity — a fresh v2 net starts from the same trunk behaviour as v1
+    and learns the conditioning from there instead of being perturbed by it.
+    """
+
+    def __init__(self, cond_dim: int, channels: int, hidden: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cond_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 2 * channels),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        gamma, beta = self.net(cond).chunk(2, dim=-1)
+        return x * (1.0 + gamma[:, :, None, None]) + beta[:, :, None, None]
 
 
 def _split_pool(feat: torch.Tensor) -> torch.Tensor:
@@ -84,6 +127,11 @@ def _global_mean_max(feat):
     return mean, max_
 
 
+POLICY_ARCH_V1 = 'policy_factored_v1'
+POLICY_ARCH_V2 = 'policy_factored_v2'
+_KNOWN_POLICY_ARCHS = (POLICY_ARCH_V1, POLICY_ARCH_V2)
+
+
 class Policy(nn.Module):
     """Actor with a factored (verb-level) action head — Phase 2.
 
@@ -118,10 +166,42 @@ class Policy(nn.Module):
                could land on each cell this turn
         41-43: enemy threat (melee, ranged, charge)
         44: row_coord  45: col_coord — static ego-centric position planes
+
+    Two architectures, selected by `arch`, because policy checkpoints of both
+    generations exist on disk and the gauntlet reconstructs them from the `arch`
+    recorded in the envelope (`checkpoint.py`):
+
+    `policy_factored_v1` — the original: raw one-hot-indexed unit planes into the
+    trunk, and globals broadcast across all 49 cells into `policy_head`.
+
+    `policy_factored_v2` — docs/IDEAS.md A1 + A3, a matched pair:
+      * **A1**: the 16 own / 16 opponent unit-stack planes and every per-type
+        global vector are contracted against a shared unit-type table
+        (`ObsTypeEmbedding`), 10 of whose 16 columns are frozen rules attributes
+        from `roster.py`. The layer downstream then reads channels whose meaning
+        does not depend on which types were drafted, so its weights take gradient
+        from every game instead of only from the ~1/4 in which their type appears.
+      * **A3**: the globals condition the *trunk* through FiLM after each conv
+        block (see `FiLM`) instead of being pasted onto every cell as 245 constant
+        planes, and `policy_head` loses the `global_dim` input block that only ever
+        produced a position-independent bias.
+    `facedown_head`/`verb_head` keep their globals: those read a pooled vector, not
+    a per-cell map, so concatenating there is an ordinary MLP input rather than the
+    broadcast A3 is about.
+
+    The observation itself is untouched by both — the contraction needs the learned
+    half of the table and so must happen inside the net, and the raw planes already
+    are the per-type count tensor it consumes. Hence no OBS_VERSION bump, and v10/v11
+    encoders both keep working (v2 additionally needs the per-type global layout the
+    encoder publishes, which v11 has and v10 does not).
     """
 
-    def __init__(self, device, hidden_dim=64, *, obs_encoder=None):
+    def __init__(self, device, hidden_dim=64, *, obs_encoder=None, arch=POLICY_ARCH_V2,
+                 learned_type_dim=DEFAULT_LEARNED_DIM):
         super().__init__()
+        if arch not in _KNOWN_POLICY_ARCHS:
+            raise ValueError(f'unknown policy arch {arch!r}')
+        self.arch = arch
 
         # Observation dims come from the (versioned) encoder this net is paired
         # with, not from a hardcoded env constant — so a policy built for one obs
@@ -130,23 +210,45 @@ class Policy(nn.Module):
         self.board_channels = enc.board_channels
         self.global_dim = enc.global_dim
 
-        self.board_encoder = nn.Sequential(
-            HexConv2d(in_channels=self.board_channels, out_channels=32),
-            nn.ReLU(),
-            HexConv2d(in_channels=32, out_channels=hidden_dim),
-            nn.ReLU(),
-            HexConv2d(in_channels=hidden_dim, out_channels=hidden_dim),
-            nn.ReLU(),
-        )
+        if arch == POLICY_ARCH_V2:
+            self.type_emb = ObsTypeEmbedding(enc, learned_dim=learned_type_dim)
+            # Post-contraction widths — what the layers below are actually sized on.
+            trunk_in = self.type_emb.board_channels
+            head_g = self.type_emb.global_dim
+            self._head_global_dim = head_g
+            # Kept as separate ModuleLists rather than an nn.Sequential: FiLM takes
+            # two arguments, so the trunk has to be stepped explicitly.
+            self.conv_blocks = nn.ModuleList()
+            self.films = nn.ModuleList()
+            cin = trunk_in
+            for cout in (32, hidden_dim, hidden_dim):
+                self.conv_blocks.append(HexConv2d(in_channels=cin, out_channels=cout))
+                self.films.append(FiLM(head_g, cout))
+                cin = cout
+        else:
+            self.type_emb = None
+            trunk_in = self.board_channels
+            head_g = self.global_dim
+            self._head_global_dim = head_g
+            self.board_encoder = nn.Sequential(
+                HexConv2d(in_channels=trunk_in, out_channels=32),
+                nn.ReLU(),
+                HexConv2d(in_channels=32, out_channels=hidden_dim),
+                nn.ReLU(),
+                HexConv2d(in_channels=hidden_dim, out_channels=hidden_dim),
+                nn.ReLU(),
+            )
 
         # Within-verb logits: 1×1 conv → N_VERBS spatial planes (flattened) plus a
         # linear head for the face-down actions. The spatial head sees the full
         # per-cell feature map directly, so it was never location-blind; only the
         # pooled path (facedown_head/verb_head) needed the split pool below.
-        self.policy_head = nn.Conv2d(hidden_dim + self.global_dim, N_VERBS, kernel_size=1)
-        self.facedown_head = nn.Linear(2 * hidden_dim + self.global_dim, FACEDOWN_SIZE)
+        # v2 drops the broadcast global block here — FiLM carries it (docs/IDEAS.md A3).
+        spatial_in = hidden_dim if arch == POLICY_ARCH_V2 else hidden_dim + head_g
+        self.policy_head = nn.Conv2d(spatial_in, N_VERBS, kernel_size=1)
+        self.facedown_head = nn.Linear(2 * hidden_dim + head_g, FACEDOWN_SIZE)
         # Top-level verb head.
-        self.verb_head = nn.Linear(2 * hidden_dim + self.global_dim, N_FACTORED_VERBS)
+        self.verb_head = nn.Linear(2 * hidden_dim + head_g, N_FACTORED_VERBS)
 
         # Static flat-id -> verb-index map, and a per-verb membership matrix.
         verb_index = torch.tensor(VERB_OF_ACTION, dtype=torch.long)
@@ -159,17 +261,34 @@ class Policy(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def _encode_board(self, board: torch.Tensor) -> torch.Tensor:
-        """board: [B,C,7,7] → feat: [B, hidden_dim, 7, 7]"""
-        return self.board_encoder(board)
+    def _embed_globals(self, global_feats: torch.Tensor) -> torch.Tensor:
+        """Raw encoder globals → what the heads and FiLM consume. Identity on v1."""
+        return global_feats if self.type_emb is None else self.type_emb.globals(global_feats)
 
-    def _logits_from_feat(self, feat: torch.Tensor, global_feats: torch.Tensor):
-        """feat: [B,hidden_dim,7,7], global_feats: [B,G] → (flat_logits [B,A], verb_logits [B,V])"""
-        B = feat.shape[0]
-        g = global_feats.view(B, self.global_dim, 1, 1).expand(B, self.global_dim, BOARD_DIM, BOARD_DIM)
-        spatial = self.policy_head(torch.cat([feat, g], dim=1)).flatten(1)  # [B, SPATIAL_SIZE]
+    def _encode_board(self, board: torch.Tensor, embedded_globals: torch.Tensor) -> torch.Tensor:
+        """board: [B,C,7,7] → feat: [B, hidden_dim, 7, 7]
+
+        `embedded_globals` must already have been through `_embed_globals`; it is
+        unused on v1 and is the FiLM conditioning input on v2.
+        """
+        if self.arch != POLICY_ARCH_V2:
+            return self.board_encoder(board)
+        x = self.type_emb.board(board)
+        for conv, film in zip(self.conv_blocks, self.films):
+            x = F.relu(film(conv(x), embedded_globals))
+        return x
+
+    def _logits_from_feat(self, feat: torch.Tensor, embedded_globals: torch.Tensor):
+        """feat: [B,hidden_dim,7,7], embedded_globals: [B,G'] → (flat_logits, verb_logits)"""
+        if self.arch == POLICY_ARCH_V2:
+            spatial = self.policy_head(feat).flatten(1)  # [B, SPATIAL_SIZE]
+        else:
+            B = feat.shape[0]
+            g = embedded_globals.view(B, self._head_global_dim, 1, 1).expand(
+                B, self._head_global_dim, BOARD_DIM, BOARD_DIM)
+            spatial = self.policy_head(torch.cat([feat, g], dim=1)).flatten(1)
         pooled = _split_pool(feat)  # [B, 2*hidden_dim]
-        pg = torch.cat([pooled, global_feats], dim=-1)
+        pg = torch.cat([pooled, embedded_globals], dim=-1)
         facedown = self.facedown_head(pg)  # [B, FACEDOWN_SIZE]
         flat_logits = torch.cat([spatial, facedown], dim=1)  # [B, ACTION_SPACE_SIZE]
         verb_logits = self.verb_head(pg)  # [B, N_FACTORED_VERBS]
@@ -177,7 +296,8 @@ class Policy(nn.Module):
 
     def _features(self, board: torch.Tensor, global_feats: torch.Tensor):
         """board: [B,C,7,7], global_feats: [B,G] → (flat_logits [B,A], verb_logits [B,V])"""
-        return self._logits_from_feat(self._encode_board(board), global_feats)
+        g = self._embed_globals(global_feats)
+        return self._logits_from_feat(self._encode_board(board, g), g)
 
     def _joint_log_probs(self, flat_logits, verb_logits, mask):
         """Factored joint log-probs over the flat action space. [B, ACTION_SPACE_SIZE].
@@ -226,13 +346,18 @@ class Policy(nn.Module):
             return action.item(), dist.log_prob(action).squeeze(0), dist.entropy().squeeze(0)
 
     def act_with_encoded(self, obs):
-        """Like act(), but returns encoded board features [1,H,7,7] for critic reuse."""
+        """Like act(), but returns encoded board features [1,H,7,7] for critic reuse.
+
+        The returned `global_feats` is the *raw* encoder vector, not the embedded one
+        — the critic that consumes it applies its own contraction.
+        """
         with torch.inference_mode():
             board = torch.from_numpy(obs['board']).unsqueeze(0)
             global_feats = torch.from_numpy(obs['global']).unsqueeze(0)
             mask = torch.from_numpy(obs['valid_action_mask']).bool().unsqueeze(0)
-            feat = self._encode_board(board)  # [1, hidden_dim, 7, 7]
-            flat_logits, verb_logits = self._logits_from_feat(feat, global_feats)
+            g = self._embed_globals(global_feats)
+            feat = self._encode_board(board, g)  # [1, hidden_dim, 7, 7]
+            flat_logits, verb_logits = self._logits_from_feat(feat, g)
             joint = self._joint_log_probs(flat_logits, verb_logits, mask)
             dist = Categorical(logits=joint)
             action = dist.sample()
@@ -292,8 +417,12 @@ CRITIC_ARCH_V1 = 'critic_v1'
 CRITIC_ARCH_V2 = 'critic_v2'
 CRITIC_ARCH_V3 = 'critic_v3'
 CRITIC_ARCH_V4 = 'critic_v4'
+CRITIC_ARCH_V5 = 'critic_v5'
 CRITIC_GROUPS = 8  # GroupNorm groups; must divide both 32 and hidden_dim
-_KNOWN_CRITIC_ARCHS = (CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3, CRITIC_ARCH_V4)
+_KNOWN_CRITIC_ARCHS = (CRITIC_ARCH_V1, CRITIC_ARCH_V2, CRITIC_ARCH_V3, CRITIC_ARCH_V4,
+                       CRITIC_ARCH_V5)
+# Architectures whose readout needs the raw board tensor for unit occupancy.
+_GATHER_ARCHS = (CRITIC_ARCH_V4, CRITIC_ARCH_V5)
 
 
 class Critic(nn.Module):
@@ -374,11 +503,25 @@ class Critic(nn.Module):
     (GroupNorm, no opponent one-hot). Needs the raw board tensor, not just trunk
     features, so `value_from_features` (which only ever receives pre-encoded features)
     does not support it.
+
+    `critic_v5` — v4 plus the unit-type embedding of docs/IDEAS.md A1: the own/opponent
+    unit-stack planes and every per-type global vector are contracted against a shared
+    16-wide table (10 frozen `roster.py` attribute columns + 6 learned per type) before
+    the trunk and the head see them, so a weight reading "unit types" is trained on every
+    game rather than only on the games where its plane's type was drafted. Trunk, gather
+    readout and auxiliary head are otherwise v4's.
+
+    Deliberately **not** included here: A3's FiLM conditioning of the trunk on the globals,
+    which `policy_factored_v2` does get. `board_only_head` reads `pool(trunk(board))` and
+    exists precisely so that its loss cannot be satisfied from the globals (see `critic_v2`
+    above); FiLM-ing the globals into the trunk would put them back inside that path and
+    quietly void the auxiliary-head fix.
     """
 
     OPP_DIM = 3
 
-    def __init__(self, device, hidden_dim=64, *, obs_encoder=None, arch=CRITIC_ARCH_V4):
+    def __init__(self, device, hidden_dim=64, *, obs_encoder=None, arch=CRITIC_ARCH_V5,
+                 learned_type_dim=DEFAULT_LEARNED_DIM):
         super().__init__()
         if arch not in _KNOWN_CRITIC_ARCHS:
             raise ValueError(f'unknown critic arch {arch!r}')
@@ -389,10 +532,20 @@ class Critic(nn.Module):
         self.priv_dim = enc.priv_dim
         self.arch = arch
 
+        if arch == CRITIC_ARCH_V5:
+            self.type_emb = ObsTypeEmbedding(enc, learned_dim=learned_type_dim)
+            trunk_in = self.type_emb.board_channels
+            head_g = self.type_emb.global_dim
+        else:
+            self.type_emb = None
+            trunk_in = self.board_channels
+            head_g = self.global_dim
+        self._head_global_dim = head_g
+
         if arch == CRITIC_ARCH_V1:
             # Module layout preserved EXACTLY so existing state_dicts load unchanged.
             self.board_encoder = nn.Sequential(
-                HexConv2d(self.board_channels, 32),
+                HexConv2d(trunk_in, 32),
                 nn.ReLU(),
                 HexConv2d(32, hidden_dim),
                 nn.ReLU(),
@@ -404,18 +557,18 @@ class Critic(nn.Module):
                 raise ValueError(
                     f'{arch} needs hidden_dim divisible by {CRITIC_GROUPS}, got {hidden_dim}')
             self.board_encoder = nn.Sequential(
-                self._conv_block(self.board_channels, 32),
+                self._conv_block(trunk_in, 32),
                 self._conv_block(32, hidden_dim),
                 self._conv_block(hidden_dim, hidden_dim),
             )
 
-        # v3 and v4 drop the opponent one-hot from the head input (see the class docstring).
-        self.uses_opp_onehot = arch not in (CRITIC_ARCH_V3, CRITIC_ARCH_V4)
-        # v4's gather readout is wider than the flank-average pool it replaces: 10
+        # v3 and later drop the opponent one-hot from the head input (see the class docstring).
+        self.uses_opp_onehot = arch in (CRITIC_ARCH_V1, CRITIC_ARCH_V2)
+        # The gather readout is wider than the flank-average pool it replaces: 10
         # concatenated base cells + own/opp unit mean+max + whole-board mean+max = 16
         # channel-widths, vs. 2 for `_split_pool` (see `_gathered_pool`).
-        self.pool_width = 16 * hidden_dim if arch == CRITIC_ARCH_V4 else 2 * hidden_dim
-        head_in = self.pool_width + self.global_dim + self.priv_dim
+        self.pool_width = 16 * hidden_dim if arch in _GATHER_ARCHS else 2 * hidden_dim
+        head_in = self.pool_width + head_g + self.priv_dim
         if self.uses_opp_onehot:
             head_in += self.OPP_DIM
         self.head = nn.Sequential(
@@ -431,7 +584,7 @@ class Critic(nn.Module):
         self.board_only_head = (nn.Linear(self.pool_width, 1)
                                 if arch != CRITIC_ARCH_V1 else None)
 
-        if arch == CRITIC_ARCH_V4:
+        if arch in _GATHER_ARCHS:
             rows = torch.tensor([r for r, q in _BASE_CELLS], dtype=torch.long)
             cols = torch.tensor([q for r, q in _BASE_CELLS], dtype=torch.long)
             self.register_buffer('_base_rows', rows, persistent=False)
@@ -468,7 +621,7 @@ class Critic(nn.Module):
         board-blind critic voids every measurement taken with it (docs/next_iteration.md §3.4),
         which is why `ppo.py` logs both every run. Healthy `alive` is roughly 20-50 %.
         """
-        alive, x = [], board
+        alive, x = [], self._trunk_input(board)
         with torch.no_grad():
             for block in self.board_encoder:
                 if isinstance(block, nn.Sequential):     # v2: [conv, norm, relu]
@@ -486,9 +639,17 @@ class Critic(nn.Module):
             # for v1-v3, `_gathered_pool` for v4), and if that does not vary with the board
             # the critic cannot rank two positions no matter how many pre-activations are
             # positive.
-            pooled = self._gathered_pool(board, x) if self.arch == CRITIC_ARCH_V4 else _split_pool(x)
+            pooled = self._gathered_pool(board, x) if self.arch in _GATHER_ARCHS else _split_pool(x)
             out_std = float(pooled.std()) if pooled.numel() > 1 else 0.0
         return {'alive': alive, 'out_std': out_std}
+
+    def _trunk_input(self, board_enc):
+        """Raw board planes → what the conv trunk consumes. Identity below v5."""
+        return board_enc if self.type_emb is None else self.type_emb.board(board_enc)
+
+    def _embed_globals(self, global_feats):
+        """Raw encoder globals → what the value head consumes. Identity below v5."""
+        return global_feats if self.type_emb is None else self.type_emb.globals(global_feats)
 
     def _gathered_pool(self, board_enc, feat):
         """Task-relevant readout (docs/IDEAS.md A2). -> [B, 16*hidden_dim]  (critic_v4 only.)
@@ -509,19 +670,26 @@ class Critic(nn.Module):
             [base, own_mean, own_max, opp_mean, opp_max, glob_mean, glob_max], dim=-1)
 
     def _pooled(self, board_enc):
-        """Board trunk + readout. -> [B, pool_width]"""
-        feat = self.board_encoder(board_enc)
-        if self.arch == CRITIC_ARCH_V4:
+        """Board trunk + readout. -> [B, pool_width]
+
+        `board_enc` stays the RAW observation throughout: the v5 embedding is applied
+        on the way into the trunk, while `_gathered_pool` still reads per-cell occupancy
+        off the untouched unit-stack planes.
+        """
+        feat = self.board_encoder(self._trunk_input(board_enc))
+        if self.arch in _GATHER_ARCHS:
             return self._gathered_pool(board_enc, feat)
         return _split_pool(feat)
 
     def _head_input(self, pooled, global_feats, opp_onehot, privileged):
         """Assemble the value head's input, with or without the opponent one-hot.
 
-        `critic_v3` drops the one-hot (class docstring), so it accepts `None` there and
-        ignores anything passed — which is what lets every existing call site keep its
-        signature while v1/v2 checkpoints still load and still receive their block.
+        `critic_v3` and later drop the one-hot (class docstring), so they accept `None`
+        there and ignore anything passed — which is what lets every existing call site
+        keep its signature while v1/v2 checkpoints still load and still receive their
+        block. `global_feats` is the raw encoder vector; v5 contracts it here.
         """
+        global_feats = self._embed_globals(global_feats)
         if not self.uses_opp_onehot:
             return torch.cat([pooled, global_feats, privileged], dim=-1)
         if opp_onehot is None:
@@ -568,10 +736,10 @@ class Critic(nn.Module):
         Used during rollout collection to avoid running the board encoder twice per step.
         The critic's own board_encoder is still used (and trained) via value_batch.
 
-        Not supported on `critic_v4`: its readout needs the raw board tensor for unit
-        occupancy (see `_gathered_pool`), which this fast path never receives.
+        Not supported on `critic_v4`/`critic_v5`: their readout needs the raw board tensor
+        for unit occupancy (see `_gathered_pool`), which this fast path never receives.
         """
-        if self.arch == CRITIC_ARCH_V4:
+        if self.arch in _GATHER_ARCHS:
             raise NotImplementedError(
                 f'{self.arch} readout needs the raw board tensor for unit occupancy; '
                 'value_from_features only has pre-encoded features. Use value_batch or '

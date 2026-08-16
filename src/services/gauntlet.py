@@ -210,7 +210,8 @@ def checkpoint_agent(path, device):
     try:
         meta = load_policy_checkpoint(path, map_location=device)
         encoder = get_encoder(meta['obs_version'])
-        policy = Policy(device=device, hidden_dim=meta['hidden_dim'], obs_encoder=encoder).to(device)
+        policy = Policy(device=device, hidden_dim=meta['hidden_dim'], obs_encoder=encoder,
+                        arch=meta['arch']).to(device)
         policy.load_state_dict(meta['state_dict'])
     except Exception as e:  # unreadable file, or incompatible arch/obs/dims
         reason = str(e).splitlines()[0] if str(e).strip() else type(e).__name__

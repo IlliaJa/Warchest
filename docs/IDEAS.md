@@ -585,6 +585,41 @@ to compositions never seen** — a rare unit is legible through its attributes r
 an under-trained plane index. Cost: an obs schema change ⇒ new `OBS_VERSION`, fresh run; the
 gauntlet contract absorbs it. Pair with A2 so one version bump buys both. Difficulty: moderate.
 
+**Shipped 2026-08-16 as `policy_factored_v2` / `critic_v5`** (`src/services/policy/unit_embedding.py`,
+both now the default arch). **The `OBS_VERSION` bump above was wrong and did not happen** — the
+contraction has to run inside the net (the learned half of the table cannot exist in the numpy
+encoder), and the 32 unit planes already *are* the per-type count tensor it consumes, so the
+observation is byte-identical and v11 is untouched. What v11 gained is descriptive metadata only
+(`deck_block_offsets` / `unit_block_offsets` / `deck_unit_positions` / `deck_royal_position`), so
+the net can read the flat 245-vector as per-type blocks. All existing checkpoints still load.
+
+Two design points settled during implementation and worth carrying:
+
+* **Table shape 16 = 10 frozen + 6 learned, and no royal row.** The frozen columns are a fixed
+  function of `roster.py`, a non-persistent buffer that never takes gradient — freezing is
+  load-bearing, since learnable per-type columns would be a rotation of the one-hot being
+  replaced. Every frozen column is shared by ≥2 units *by rule*: a singleton column (there were
+  six in the first draft — `counter_when_attacked`, `move_after_attack`, …) shares nothing and
+  is a one-hot slot with a nicer name, so those collapsed into `gives_extra_tempo` (5 units) and
+  `has_defensive_trait` (3). The tactic block is decomposed by behaviour rather than one-hot by
+  mechanic name, and its `ranged`/`charge` split deliberately mirrors v11's `THREAT_KINDS`, which
+  already spends six planes separating Archer/Crossbowman from Cavalry/Lancer. The royal coin gets
+  no row (bag-only, no board unit, no unit behaviour to describe); its count rides through as a
+  raw scalar.
+* **The frozen block is deliberately not injective.** Swordsman/Berserker/Mercenary, Knight/Pikeman
+  and Ensign/Marshall share a frozen row and are separated by the learned block. Identity is the
+  learned half's job; starting genuinely-similar types together *is* the prior being bought.
+  `tests/test_unit_embedding.py` pins exactly which three collide, so a new one — two unrelated
+  types merged — fails loudly.
+
+Note what this is *not*: with 10 + 6 = 16 = `NUM_UNIT_TYPES`, `board_channels` and `global_dim`
+both come out unchanged (48 / 245) and the effective per-type weight `W_eff[o,t] = Σ_d W[o,d]·E[t,d]`
+is still full rank. Nothing is compressed. The change is that 10 of each type's 16 degrees of
+freedom are tied to shared, rules-derived columns that take gradient from *every* game instead of
+only from the ~1/4 in which that type was drafted. The gate is a run: the win is supposed to show
+up on rare compositions, so `eval_bucketed.py` (per-composition buckets) is the measurement, not
+the pooled win rate.
+
 #### A2. Read the board where the game happens — a base-cell + unit-cell gather readout
 
 `_split_pool` compresses 49 cells into **two numbers per channel**. Against a win condition that
@@ -628,6 +663,25 @@ parameters, removes the dead head weights, and gives the *trunk* hand-conditioni
 cannot have. It also dissolves §3.5's `opp_onehot` problem structurally — the one-hot becomes one
 conditioning input among many rather than a raw head input with a 0.747 output spread. Difficulty:
 low-moderate.
+
+**Shipped 2026-08-16 as `policy_factored_v2`** (`FiLM` in `src/services/policy/policy.py`), paired
+with A1 in the same arch. `x ← x·(1 + γ) + β` after each of the three conv blocks, before the
+activation; `policy_head` drops its `global_dim` input block and is now `Conv2d(hidden, N_VERBS,
+k=1)`. That block was exactly the 245×32 = 7840 dead weights predicted above — confirmed by the
+parameter delta. `facedown_head`/`verb_head` keep their globals: they read a *pooled* vector, which
+is an ordinary MLP input, not the per-cell broadcast this item is about.
+
+The conditioning MLP's output layer is zero-initialised, so at step 0 γ = β = 0 and the module is
+exactly the identity — a fresh v2 net starts from v1's trunk behaviour rather than a random
+perturbation of it. The usual zero-init consequence applies: on the first step only that output
+layer has a gradient, and the layers below it start moving from the second.
+
+**Deliberately not applied to the critic.** `critic_v5` gets A1 but *not* FiLM. `board_only_head`
+reads `pool(trunk(board))` and exists precisely so its loss cannot be satisfied from the globals
+(`critic_v2`, next_iteration.md §3.4 — the fix that took the positional-sibling tie rate 93 % → 0 %).
+Conditioning the trunk on globals would put them straight back inside that path and silently void
+it. Pinned by `test_v5_board_only_value_ignores_globals`. If FiLM is ever wanted in the critic, the
+auxiliary head has to bypass it first — that is a separate item, not a tweak.
 
 #### A4. Global context and residuals — the trunk cannot see across the board
 
@@ -950,7 +1004,7 @@ Not sequenced ahead of `next_iteration.md` §5 rows 2b/3. After those report:
 | 5 | **B3** | the falsifiable read on whether the race framing is right | moderate |
 | 6 | ~~**B2**~~ | ~~interpretable exploitability; subsumes the expensive half of #12~~ **Deprioritised 2026-08-09** — B1 measured the class ceiling at 0.00–0.08 vs the current policy (`greedy_sim` itself: 0.17), so a θ search cannot reach the 65 % decision threshold. Re-scope onto a stronger base bot first | low-mod |
 | 7 | **L1**, **B4** | 2× data and ~3× rollout throughput; B4 also unlocks L6, L7 and independent ExIt | moderate |
-| 8 | **A1 + A3** together | one `OBS_VERSION` bump buys both | moderate |
+| 8 | ~~**A1 + A3**~~ together | ~~one `OBS_VERSION` bump buys both~~ **Shipped 2026-08-16** as `policy_factored_v2` + `critic_v5`, and the premise was wrong: neither needs an obs bump, because the contraction runs inside the net and v11 is byte-identical. Both gates still need a run — A1's on `eval_bucketed.py` (rare compositions, not pooled WR), A3's on the gauntlet | moderate |
 | 9 | **A6**, **A7**, **L3**, **L4** | each depends on something above having reported | moderate |
 | 10 | **A5** | only if A2/A3 leave a gap worth a rebuild | high |
 

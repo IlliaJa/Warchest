@@ -189,7 +189,7 @@ def _trunk_width(trunk):
 def load_policy(path, device):
     ck = load_policy_checkpoint(path)
     enc = get_encoder(ck['obs_version'])
-    pol = Policy(device, hidden_dim=ck['hidden_dim'], obs_encoder=enc)
+    pol = Policy(device, hidden_dim=ck['hidden_dim'], obs_encoder=enc, arch=ck['arch'])
     pol.load_state_dict(ck['state_dict'])
     pol.eval()
     return pol, enc

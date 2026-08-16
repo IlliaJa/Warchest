@@ -31,20 +31,31 @@ from ..environment.obs_encoders import LATEST_VERSION
 
 # Architecture id for the current factored-head Policy. Bump (and register a
 # loader) when the network class changes; the gauntlet keys reconstruction on it.
-CURRENT_ARCH = 'policy_factored_v1'
+# `policy_factored_v1` is the original (raw one-hot unit planes, globals broadcast
+# across all 49 cells into `policy_head`); `policy_factored_v2` adds the unit-type
+# embedding and FiLM trunk conditioning (docs/IDEAS.md A1 + A3). Checkpoints of v1
+# exist on disk and the gauntlet must keep reconstructing them, so `Policy` builds
+# either on demand and callers pass the loaded `arch` straight through.
+# Never mutate a released arch in place — add the next one.
+CURRENT_ARCH = 'policy_factored_v2'
+POLICY_ARCHS = ('policy_factored_v1', 'policy_factored_v2')
+# Checkpoints predating `policy_factored_v2` are all v1 by definition.
+LEGACY_POLICY_ARCH = 'policy_factored_v1'
 # Architecture id for the current Critic. `critic_v1` is the original un-normalised
 # HexConv+ReLU trunk — the one that dies (docs/next_iteration.md §3.4); `critic_v2` adds
 # GroupNorm plus a board-only auxiliary head; `critic_v3` is v2 minus the opponent
 # one-hot (§5 row 6 — the identity offset moves to grouped advantage normalisation
 # instead); `critic_v4` is v3 with the flank-split average readout replaced by a
 # task-relevant gather (docs/IDEAS.md A2) — the 10 fixed base-cell features, masked
-# mean+max over own/opponent unit-occupied cells, and a whole-board mean+max. Checkpoints
-# of all four exist on disk (everything before 2026-08-07 is v1, `warchest_critic_
-# 20260808-0607.pth` is v2) and the gauntlet must keep reconstructing them, so `Critic`
-# builds any of them on demand and callers pass the loaded `arch` straight through.
+# mean+max over own/opponent unit-occupied cells, and a whole-board mean+max;
+# `critic_v5` is v4 plus the unit-type embedding (docs/IDEAS.md A1) on the unit planes
+# and the per-type global vectors. Checkpoints of the earlier ones exist on disk
+# (everything before 2026-08-07 is v1, `warchest_critic_20260808-0607.pth` is v2) and
+# the gauntlet must keep reconstructing them, so `Critic` builds any of them on demand
+# and callers pass the loaded `arch` straight through.
 # Never mutate a released arch in place — add the next one.
-CURRENT_CRITIC_ARCH = 'critic_v4'
-CRITIC_ARCHS = ('critic_v1', 'critic_v2', 'critic_v3', 'critic_v4')
+CURRENT_CRITIC_ARCH = 'critic_v5'
+CRITIC_ARCHS = ('critic_v1', 'critic_v2', 'critic_v3', 'critic_v4', 'critic_v5')
 # Checkpoints predating the `arch` key are all v1 by definition.
 LEGACY_CRITIC_ARCH = 'critic_v1'
 
@@ -68,7 +79,8 @@ def load_policy_checkpoint(path, map_location='cpu', *, default_hidden_dim=64):
     """
     obj = torch.load(path, map_location=map_location, weights_only=False)
     if isinstance(obj, dict) and 'state_dict' in obj and 'obs_version' in obj:
-        arch = obj.get('arch', CURRENT_ARCH)
+        # A missing `arch` predates the key, so it is v1 — never the current default.
+        arch = obj.get('arch', LEGACY_POLICY_ARCH)
         if arch in CRITIC_ARCHS:
             raise ValueError(
                 f"{path!r} is a CRITIC checkpoint (arch={arch!r}), not a policy checkpoint "
@@ -85,7 +97,7 @@ def load_policy_checkpoint(path, map_location='cpu', *, default_hidden_dim=64):
     return {
         'state_dict': obj,
         'obs_version': LATEST_VERSION,
-        'arch': CURRENT_ARCH,
+        'arch': LEGACY_POLICY_ARCH,
         'hidden_dim': default_hidden_dim,
     }
 
@@ -129,7 +141,7 @@ def load_critic_checkpoint(path, map_location='cpu', *, default_hidden_dim=64):
     """
     obj = torch.load(path, map_location=map_location, weights_only=False)
     arch = obj.get('arch', LEGACY_CRITIC_ARCH)
-    if arch == CURRENT_ARCH:
+    if arch in POLICY_ARCHS:
         # The #1 real-world cause: someone copied a data/warchest_ppo_*.pth (policy)
         # over the critic path by mistake. Catching it here, keyed on the saved
         # `arch` metadata, turns a cryptic "Missing/Unexpected key(s)" state_dict

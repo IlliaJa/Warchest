@@ -105,7 +105,8 @@ def _latest_critic_path():
 def _load_policy(path, device):
     meta = load_policy_checkpoint(path, map_location=device)
     encoder = get_encoder(meta['obs_version'])
-    policy = Policy(device=device, hidden_dim=meta['hidden_dim'], obs_encoder=encoder).to(device)
+    policy = Policy(device=device, hidden_dim=meta['hidden_dim'], obs_encoder=encoder,
+                    arch=meta['arch']).to(device)
     policy.load_state_dict(meta['state_dict'])
     return policy, meta
 
@@ -218,12 +219,15 @@ def _run_distill(dataset, policy_path, critic_path, args, *, out_policy, out_cri
 
     os.makedirs(os.path.dirname(out_policy) or '.', exist_ok=True)
     os.makedirs(os.path.dirname(out_critic) or '.', exist_ok=True)
+    # Distillation fine-tunes the loaded nets in place, so the saved copies are the same
+    # architecture they came in as — never the current default.
     save_policy_checkpoint(policy, out_policy, obs_version=pmeta['obs_version'],
-                           hidden_dim=pmeta['hidden_dim'])
+                           hidden_dim=pmeta['hidden_dim'], arch=pmeta['arch'])
     # z-scale critic: return_mean=0 / return_std=1 so PuctBot's denormalisation is
     # identity and it consumes the outcome-scale value directly (value_mode='outcome').
     save_critic_checkpoint(critic, out_critic, obs_version=cmeta['obs_version'],
-                           hidden_dim=cmeta['hidden_dim'], return_mean=0.0, return_std=1.0)
+                           hidden_dim=cmeta['hidden_dim'], arch=cmeta['arch'],
+                           return_mean=0.0, return_std=1.0)
     logger.info('distill: saved policy=%s critic=%s', out_policy, out_critic)
     return before, after
 

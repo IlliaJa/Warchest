@@ -191,7 +191,7 @@ class PolicyThetaBot(ThetaSampling, SimGreedyBot):
         meta = load_policy_checkpoint(policy_path, map_location=device)
         self._policy_encoder = get_encoder(meta['obs_version'])
         self._policy = Policy(device=device, hidden_dim=meta['hidden_dim'],
-                              obs_encoder=self._policy_encoder).to(device)
+                              obs_encoder=self._policy_encoder, arch=meta['arch']).to(device)
         self._policy.load_state_dict(meta['state_dict'])
         self._policy.eval()
         self.device = device

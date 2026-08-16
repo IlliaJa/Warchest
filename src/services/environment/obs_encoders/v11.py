@@ -22,7 +22,7 @@ from collections import Counter
 import numpy as np
 import gymnasium as gym
 
-from ..roster import UNIT_IDS, NUM_UNIT_TYPES, TOTAL_COINS, SUPPLY_CAP, MAX_TOTAL
+from ..roster import UNIT_IDS, NUM_UNIT_TYPES, TOTAL_COINS, SUPPLY_CAP, MAX_TOTAL, ROYAL_ID
 from ..game_state import DECK, HAND_SIZE, UNITS_PER_PLAYER
 from ..cell_ids import (
     INVALID_CELL_ID, EMPTY_CELL_ID, UNCONTROLLED_BASE_CELL_ID,
@@ -110,6 +110,27 @@ PENDING_KIND_IDX = {k: i for i, k in enumerate(PENDING_KINDS)}
 GLOBAL_DIM = 10 * N_COIN_TYPES + 3 * NUM_UNIT_TYPES + 12 + PENDING_CTX_DIM  # 245
 OBS_VERSION = 11
 
+# Where the per-type blocks sit inside the flat global vector, for a consumer that
+# wants to read them AS per-type vectors rather than as 245 anonymous slots — the
+# unit-type embedding of docs/IDEAS.md A1 contracts each block against a shared
+# table instead of giving every type its own weight column. Purely descriptive: the
+# encoded observation is unchanged, which is why A1 needs no OBS_VERSION bump.
+# The offsets follow the concatenation order in `encode` and are pinned against a
+# real encode by `tests/test_unit_embedding.py` — keep them in step with it.
+#   0      [round, my_bases, opp_bases, initiative]
+#   4      hand[C]      21 bag[C]      38 discard[C]
+#   55     supply[U]    71 [bag_size]  72 owned[C]
+#   89     p_soon[C]   106 p_mean[C]  123 opp_on_board[U]
+#   139    opp_faceup[C]              156 opp_supply[U]
+#   172    opp_hidden[C]              189 opp_owned[C]
+#   206    [opp_hand_size, init_transferred]
+#   208    [own_at_risk, opp_at_risk]
+#   210    E_opp_hand[C]
+#   227    [bases_i_can_claim, my_bases_under_flip, win_alarm]
+#   230    pending one-hot
+DECK_BLOCK_OFFSETS = (4, 21, 38, 72, 89, 106, 139, 172, 189, 210)
+UNIT_BLOCK_OFFSETS = (55, 123, 156)
+
 # Privileged critic-only features: opponent's true hidden split, per coin (C).
 #   [0:C] opp hand   [C:2C] opp bag   [2C:3C] opp face-down discard
 PRIV_DIM = 3 * N_COIN_TYPES  # 51
@@ -179,6 +200,16 @@ class ObsEncoderV11:
     # (Critic's A2 gather-pool) that need per-cell occupancy rather than raw features.
     own_unit_channels = slice(OWN_UNIT_PLANE_BASE, OWN_UNIT_PLANE_BASE + NUM_UNIT_TYPES)
     opp_unit_channels = slice(OPP_UNIT_PLANE_BASE, OPP_UNIT_PLANE_BASE + NUM_UNIT_TYPES)
+    # Per-type structure of the flat global vector (docs/IDEAS.md A1). `deck_*` blocks
+    # run over DECK (units + the royal coin), `unit_*` blocks over the unit types only;
+    # `deck_unit_positions` picks the unit slots out of a DECK block in unit-plane order
+    # and `deck_royal_position` is the one slot left over.
+    deck_block_offsets = DECK_BLOCK_OFFSETS
+    unit_block_offsets = UNIT_BLOCK_OFFSETS
+    deck_block_len = N_COIN_TYPES
+    unit_block_len = NUM_UNIT_TYPES
+    deck_unit_positions = tuple(int(i) for i in _UNIT_IN_DECK)
+    deck_royal_position = _DECK_COIN_TO_IDX[ROYAL_ID]
 
     def observation_space(self):
         return gym.spaces.Dict({

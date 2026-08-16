@@ -444,7 +444,7 @@ def main():
     # Accept both the metadata-envelope and legacy bare-state_dict checkpoint formats,
     # and honour the checkpoint's own hidden_dim over the CLI default.
     ckpt = load_policy_checkpoint(model_path, map_location=device, default_hidden_dim=args.hidden_dim)
-    policy = Policy(device=device, hidden_dim=ckpt['hidden_dim']).to(device)
+    policy = Policy(device=device, hidden_dim=ckpt['hidden_dim'], arch=ckpt['arch']).to(device)
     policy.load_state_dict(ckpt['state_dict'])
     policy.eval()
 

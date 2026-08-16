@@ -96,7 +96,8 @@ if __name__ == '__main__':
         encoder = get_encoder(ckpt['obs_version'])
         print(f"arch={ckpt['arch']} obs_version={ckpt['obs_version']} hidden_dim={ckpt['hidden_dim']}")
 
-        policy = Policy(device=device, hidden_dim=ckpt['hidden_dim'], obs_encoder=encoder).to(device)
+        policy = Policy(device=device, hidden_dim=ckpt['hidden_dim'], obs_encoder=encoder,
+                        arch=ckpt['arch']).to(device)
         policy.load_state_dict(ckpt['state_dict'])
         policy.eval()
 
