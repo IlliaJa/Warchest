@@ -42,11 +42,11 @@ The evaluator is stateless w.r.t. the env — every method takes the (already
 `LookaheadCriticBot` swaps its `_sim_env` out from under `LookaheadBot.__init__`
 (it rebuilds it against the critic's obs version).
 
-New-term coefficients are first-cut and kept well below `SHAPING_C` (bases win
+New-term coefficients are first-cut and kept well below `EVAL_BASE_C` (bases win
 the game); they are meant to be swept in the gauntlet, not treated as tuned.
 
 **θ — the randomised-coefficient family (docs/IDEAS.md B1).** Every one of the
-eight coefficients above (the two imported reward scales included) is multiplied
+eight coefficients above (the two anchor scales included) is multiplied
 by an entry of `theta`, a dict over `THETA_KEYS`. `theta=LEGACY_THETA` (the
 default) is bit-identical to the pre-θ evaluator and `theta=RICH_THETA` is
 bit-identical to `enable_new_terms=True`, so the parametrisation costs the
@@ -65,8 +65,32 @@ from collections import deque
 
 import numpy as np
 
-from ..environment.rollout_core import SHAPING_C, C_MAT
 from ..environment.cell_ids import UNCONTROLLED_BASE_CELL_ID
+
+# --------------------------------------------------------------------------- #
+# The evaluator's two anchor scales — DELIBERATELY NOT imported from
+# `rollout_core` any more (decoupled 2026-08-18, docs/IDEAS.md R.9).
+# --------------------------------------------------------------------------- #
+# They used to be `from ..environment.rollout_core import SHAPING_C, C_MAT`, and
+# **five of the eight coefficients below derive from them** (`_c_base`, `_c_mat`,
+# `RISK_COEFF`, `DUR_COEFF`, `ECON_COEFF`). That import made every heuristic bot a
+# function of the *training reward*: `greedy_sim`, `lookahead`, `lookahead_critic`,
+# `policy_theta`, `random_eval` and `PuctBot`'s `_leaf_potential` all re-tune
+# themselves the moment `SHAPING_C`/`C_MAT` move. Those bots are the gauntlet's fixed
+# agent field — the measurement of record every historical number is quoted against —
+# so a reward re-balance would have moved the yardstick together with the treatment and
+# made the comparison meaningless in the one place it has to hold.
+#
+# The values below are the ones in force from the project's start through
+# 2026-08-18 (`SHAPING_C = 0.05`, `C_MAT = 0.015`), so every bot is bit-identical to
+# what produced every recorded gauntlet result, and `rollout_core` is now free to move
+# without silently reaching in here.
+#
+# If a *reward-matched* bot is ever wanted, do not restore the import — add it as a
+# θ member (`theta['base']`/`theta['material']` already scale exactly these two), so the
+# frozen yardstick and the matched variant can both be in the field at once.
+EVAL_BASE_C = 0.05
+EVAL_MAT_C = 0.015
 
 
 # Order is fixed: it is the vector layout for any θ search (docs/IDEAS.md B2) and the
@@ -236,7 +260,7 @@ class HeuristicEvaluator:
     POS_COEFF = 0.01
     # Weight on material-at-risk (stack coins a unit stands to lose next turn, not
     # yet actually lost) — half of C_MAT, since it's predictive, not realized.
-    RISK_COEFF = 0.5 * C_MAT
+    RISK_COEFF = 0.5 * EVAL_MAT_C
     # Distance used when a side has no on-board unit or no capturable base exists —
     # larger than any real hex distance on the 7x7 board, so it always reads "far".
     _FAR_DIST = 12
@@ -244,12 +268,12 @@ class HeuristicEvaluator:
     # --- new term coefficients (first-cut; sweep in the gauntlet) ---
     # Per bolstered coin (stack height above 1) held on the board. Below C_MAT so
     # a standing durability asset never outweighs a coin actually boxed.
-    DUR_COEFF = 0.4 * C_MAT
+    DUR_COEFF = 0.4 * EVAL_MAT_C
     # Cap on stack-above-1 counted per unit, so one over-bolstered stack can't
     # dominate the term.
     _MAX_BOLSTER = 4
     # Per supply coin drained into the active cycle (recruiting lowers own supply).
-    ECON_COEFF = 0.15 * C_MAT
+    ECON_COEFF = 0.15 * EVAL_MAT_C
     # Value of holding initiative this round (tempo).
     INIT_COEFF = 0.005
     # Convex bonus for standing exactly one base short of the win — the linear
@@ -280,8 +304,8 @@ class HeuristicEvaluator:
         # runs on the search hot path. Multiplication order is chosen to keep a θ of 1.0
         # bit-identical to the pre-θ expressions (x * 1.0 is exact in IEEE-754, but only if
         # the remaining products associate the same way).
-        self._c_base = t['base'] * SHAPING_C
-        self._c_mat = t['material'] * self.shaping_anneal * C_MAT
+        self._c_base = t['base'] * EVAL_BASE_C
+        self._c_mat = t['material'] * self.shaping_anneal * EVAL_MAT_C
         self._c_pos = t['pos'] * self.POS_COEFF
         self._c_risk = t['risk'] * self.RISK_COEFF
         self._c_dur = t['durability'] * self.DUR_COEFF

@@ -384,3 +384,126 @@ playing *itself*, and then failed on the real field — the third time in this p
 quantity measured on a degenerate proxy did not transfer (cf. `next_iteration.md` §4's
 "reliability is not validity"). **Validate a variance-reduction scheme on the estimator you
 actually use, not on a simplified stand-in.**
+
+---
+
+## Unit-type embedding + FiLM trunk conditioning (2026-08-16 to 08-18)
+
+*Source: `docs/IDEAS.md` A1 + A3, shipped as the matched pair `policy_factored_v2` + `critic_v5`
+(both now the defaults) and measured two days later with `src/app/eval_a1_a3.py`. Full
+architectural write-up: `docs/architecture.md` → *How the network reads a unit type, and how the
+hand reaches the board*. **No `OBS_VERSION` bump** — see below, the plan called for one and was
+wrong. Every prior checkpoint still loads on its recorded `arch`; `policy_factored_v1` is now a
+selectable baseline (`--policy-arch`).*
+
+**The two problems.** (1) The observation addresses a unit type by *index* — its own board plane
+(`base + id - 1`), its own slot in every per-type coin vector — and an index carries no
+information about the unit, so plane 6 (Swordsman) and plane 7 (Knight) are as unrelated to a conv
+kernel as any two integers. Only 4 of 16 types are drafted per side, so `probe_costs.py` Table B
+measures **62 % of board planes and 82 % of global dims exactly zero on any given forward pass**,
+with *which* ones changing every game: 16 disjoint kernel slices per side, each trained on ~1/4 of
+the data. (2) The trunk never saw the globals at all. `policy_head` was
+`Conv2d(hidden + 245 → N_VERBS, k=1)` fed the globals broadcast onto all 49 cells — and since a
+value identical at every cell run through a 1×1 conv that applies the same weights at every cell
+collapses to one constant `W_g @ g` added everywhere, the globals contributed a
+position-independent bias and nothing else. 245 × 32 = 7840 weights computing one offset 49 times.
+
+| What changed | Detail |
+|---|---|
+| **`unit_embedding.py`** — a shared unit-type table | `[16, 16]` per network: **10 frozen columns** derived from `roster.py` (a non-persistent buffer that never takes gradient) plus **6 learned rows per type**. The observation is contracted against it, `embedded[d] = Σ_t count[t] · E[t,d]`, for both the unit-stack planes and every per-type global vector. Freezing is load-bearing: learnable per-type attribute columns would be a rotation of the one-hot being replaced. |
+| **Every frozen column is shared by ≥2 units, by rule** | A column belonging to one unit shares nothing and is a one-hot slot with a friendlier name. The first draft had six such singletons (`counter_when_attacked`, `move_after_attack`, …); they collapsed into `gives_extra_tempo` (5 units) and `has_defensive_trait` (3). The tactic block is decomposed by *behaviour*, not one-hot by mechanic name, and its `ranged`/`charge` split mirrors `v11.THREAT_KINDS`, which already spends six planes separating Archer/Crossbowman from Cavalry/Lancer. |
+| **The frozen block is deliberately not injective** | Swordsman/Berserker/Mercenary, Knight/Pikeman and Ensign/Marshall share a frozen row; the learned block carries identity. Starting genuinely-similar types together *is* the prior being bought. `tests/test_unit_embedding.py` pins exactly which three collide so a **new** collision — two unrelated types merged — fails loudly. |
+| **No royal-coin row** | It is bag-only with no board unit, so it has no unit behaviour for the frozen columns to describe. Its count passes through `globals()` as a raw scalar. |
+| **`FiLM`** (`policy.py`) — A3 | `MLP(globals) → (γ, β)` per channel, `x ← x·(1 + γ) + β` after each of the three conv blocks, and `policy_head` drops its global input block. Multiplying is the whole point: an additive bias cannot express "this channel does not matter with the hand I am holding", and a Berserker threat cell is worth nothing when no Berserker coin is playable. Output layer zero-initialised, so the module is exactly the identity at step 0 and a fresh v2 net starts from v1's trunk behaviour. |
+| **`critic_v5` deliberately has NO FiLM** | v4 + the embedding, nothing else. `board_only_head` reads `pool(trunk(board))` and exists precisely so its loss cannot be satisfied from the globals — the `critic_v2` fix that took the positional-sibling tie rate 93 % → 0 %. Conditioning the trunk on globals would put them back inside that path and void it silently. `test_v5_board_only_value_ignores_globals` is the invariant. |
+| **Nothing is compressed** | 10 + 6 = 16 = `NUM_UNIT_TYPES`, so `board_channels` (48) and `global_dim` (245) come out unchanged and `W_eff[o,t] = Σ_d W[o,d]·E[t,d]` is still full rank. What changed is that 10 of each type's 16 degrees of freedom are tied to shared, rules-derived columns taking gradient from *every* game. `ObsTypeEmbedding` recomputes both widths rather than assuming the coincidence. |
+| **The `OBS_VERSION` bump in the plan was wrong** | The contraction must run *inside* the net (the learned half cannot exist in the numpy encoder) and the raw 32 planes already *are* the per-type count tensor it consumes. So v11's output is byte-identical, `test_obs_golden.py` is untouched, and pool snapshots stay compatible. v11 gained only descriptive metadata — `deck_block_offsets`, `unit_block_offsets`, `deck_unit_positions`, `deck_royal_position`. This also decoupled A1 from A3, which `IDEAS.md` had paired *because* of the shared bump. |
+| **Tests** | `tests/test_unit_embedding.py`, 26 tests. Full suite: **312 passed**. |
+
+### Measured effect (2026-08-18) — mechanism yes, strength no
+
+`warchest_ppo_20260817-2102` (v2, `hidden_dim=128`) against `warchest_ppo_20260810-0802` (v1, same
+width). The pooled head-to-head was ~50 %, which is why the measurement is not a win rate:
+
+| Claim | Measurement | Verdict |
+|---|---|---|
+| A3 conditions the board on the hand | **46.4 %** of verbs change their top-1 cell when only the hand is substituted (board and legal-action mask held fixed), against **0.00 % for v1** | **confirmed** |
+| FiLM escaped its zero init | mean \|γ\| 1.83 / 1.77 / 1.13 per block; γ spread *across observations* 0.74 / 0.60 / 0.38 | **confirmed** |
+| A1's learned rows carry identity | Knight/Pikeman separated to 2.24× the init scale, Ensign/Marshall 1.47×, **Swordsman/Berserker/Mercenary 1.15× — not separated** | partial |
+| Either change buys strength | pooled **+4.0 % [−3.9 %, +11.9 %]** over 300 decided games per arm | **not detected** |
+
+The A3 row is unusually strong evidence because its control is **arithmetic, not statistical**: on
+v1 the answer is *provably* zero, since the broadcast globals shift all 49 logits of a verb by the
+same constant and cancel in a softmax across cells. A non-zero v1 reading would mean the
+measurement is broken, not the network. Frozen-column gradient share is uneven and worth knowing
+before adding more columns: `has_defensive_trait` 22.6 %, `coin_count` 16.6 %, down to
+`tactic_deals_damage` 4.4 %.
+
+**Two measurement traps, both of which produced confidently wrong answers before being fixed.**
+They apply to any future head-to-head in this repo, not just this one:
+
+1. **Ego-frame remap.** A policy's action id is in the rotated frame whenever P2 is to move and
+   must go through `WarChestEnv.remap_action` (what `gauntlet.PolicyAgent.act` does). Skipping it
+   does not raise — every P2 ply lands mirrored, fails validation and silently becomes a *random
+   legal move*, which reads as "P1 wins nearly every game" and gave exactly 2/4 in all six
+   archetype buckets. `eval_a1_a3.py` now counts illegal plies and warns above 2 %.
+2. **Forcing a composition onto one arm only** confounds "this net plays the deck worse" with "the
+   deck is weak". Unmirrored, the `support` archetype read 0 % for v2; dealt to both arms it showed
+   v2 **ahead**. Deal every forced composition to both sides.
+
+**Winner's curse, caught in the act.** The all-archetype table lit up `tempo` at
+**+24 % [+4.5 %, +41.1 %]**, which did not survive Bonferroni across the six rows. A confirmatory
+single-archetype run at a fresh seed and 6× the games returned **+3.3 % [−4.6 %, +11.2 %]**. With
+six rows tested at 0.05 each there is a ~26 % chance of at least one star when the nets are
+identical, so the tool now prints the corrected interval alongside the raw one and says in its own
+output that a single starred row is a lead to re-run, not a result. Related: `Policy.act` samples
+from torch's global RNG, so seeding only numpy left two runs at the same `--seed` disagreeing about
+which archetype was significant — indistinguishable from a real effect moving. Both generators are
+seeded now.
+
+## Base-diff PBRS joins the shaping anneal (2026-08-18)
+
+`docs/IDEAS.md` R.0.3 → R.6 row 6. One multiplier moved; no constant changed. **Not measured
+yet** — this is the reward the next PPO run launches on (its checklist is `IDEAS.md` R.9).
+
+**What was wrong.** `SHAPING_C` was the one dense term deliberately excluded from
+`shaping_anneal`, on the argument that proper PBRS is policy-invariant and so has nothing to
+anneal away. That argument is about the *optimum*; R.0.3 measured what it costs on the way
+there. From `logs/ppo_20260809-195643.log` at batches 1497–1500, per-episode means:
+
+```
+shaping=0.205   terminal=0.125   material=0.005   holding=0.001   tempo=-0.060
+```
+
+Two readings, and the second is the one that motivated the change:
+
+1. **The realised base payout outran the realised terminal.** `γ^T·Φ(s_T) = 0.205` against a
+   mean terminal of `0.125`. The `±1` win reward is a *peak*: averaged over wins, losses and
+   the `−0.5…−1.0` truncations it lands at 0.125, so the comparison is 0.205 vs 0.125, not
+   0.3 vs 1. And with `lam=0.90` the terminal reaches a decision `k` plies back at `(γλ)^k`
+   — 0.10 at k=20, 0.008 at k=42 — while base shaping is paid in the `δ_t` of the step that
+   earned it. Per-step, where the gradient actually lives, the dense term is not a hint.
+2. **The anneal was itself widening the base : material gap.** Material rode the anneal and
+   base did not, so one base went from 3.3 boxed coins at batch 1 to **33** at the 0.1 floor.
+   Real games box 4–6 of 16–20 coins, so the entire material axis of a whole game was priced
+   below a third of one base — the reward-side half of "it rushes bases and has no strategy".
+
+| What changed | Detail |
+|---|---|
+| **`rollout_core.play_episode`** | new `base_shaping_anneal` kwarg; `annealed_base = base_shaping_anneal * (gamma * phi_after - phi_before)`. Defaults to `1.0`, so a caller that does not know about the split gets the old reward. |
+| **`ppo.py`** | passes the same multiplier it already passes for holding/material, via `_base_shaping_anneal`. Logged per batch as `base_shaping_anneal` (console `base_anneal=`) and in the W&B config as `anneal_base_shaping`. |
+| **`rollout_collector.py`** | the knob rides the task dict to the parallel workers, so both collection paths agree. |
+| **`--no-anneal-base-shaping`** | reproduces the pre-2026-08-18 reward. It changes the critic's regression target, so `critic_mae` and `score_*` are **not** comparable across arms. |
+| **Still proper PBRS** | `c·(γΦ′ − Φ)` telescopes exactly like the potential `c·Φ`, and `c` is constant within an episode (set once per batch), so nothing leaks across the telescope. |
+
+**What it buys:** the base : material ratio is now flat at 3.3 : 1 for the whole run instead of
+drifting to 33 : 1, and the late-run dense payout sits ~6× *under* the terminal instead of above
+it. **What it does not buy:** `C_MAT` still prices only material *already boxed*. Nothing prices
+material *hanging*, which is the two-move quantity `next_iteration.md` §1 is about — that is
+L4's `Φ_risk`, still open (`IDEAS.md` R.9.4).
+
+**Blast radius: none, by prior arrangement.** `HeuristicEvaluator` had already been decoupled
+from `rollout_core`'s constants the same day (R.9.1), and every search bot passes
+`shaping_anneal=1.0`, so the gauntlet's fixed field — the measurement of record — is untouched.
+`tests/test_shaping_anneal.py` pins the scaling (same seed ⇒ same trajectory, so only
+`r_shaping` may move), and `test_evaluation.py` pins the evaluator's deliberate divergence.

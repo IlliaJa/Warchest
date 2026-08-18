@@ -105,6 +105,7 @@ def _worker_loop(worker_id, task_q, result_q, counter, cfg):
                     env, policy, opp, main_pid, opp_type,
                     gamma=task['gamma'],
                     shaping_anneal=task['shaping_anneal'],
+                    base_shaping_anneal=task['base_shaping_anneal'],
                     holding_reward_rate=task['holding_reward_rate'],
                     max_t=task['max_t'],
                     collect_dense=collect_dense,
@@ -205,7 +206,7 @@ class ParallelRolloutCollector:
         logger.info(f'ParallelRolloutCollector: spawned {n_workers} rollout workers')
 
     def submit(self, policy, pool, n_episodes, *, gamma, shaping_anneal,
-               holding_reward_rate, max_t):
+               base_shaping_anneal, holding_reward_rate, max_t):
         """Broadcast the policy + pool delta and hand out n_episodes for the workers to claim."""
         policy_sd = {k: v.detach().cpu() for k, v in policy.state_dict().items()}
         new_snaps, cnt = pool.new_snapshots_since(self._seen_snapshots)
@@ -221,6 +222,7 @@ class ParallelRolloutCollector:
             'weights': weights,
             'gamma': gamma,
             'shaping_anneal': shaping_anneal,
+            'base_shaping_anneal': base_shaping_anneal,
             'holding_reward_rate': holding_reward_rate,
             'max_t': max_t,
         }

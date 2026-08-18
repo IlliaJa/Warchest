@@ -365,8 +365,9 @@ def load_exit_dataset(pattern, max_samples, val_rounds, seed):
     print(f'{len(files)} dataset files — train on {len(train_files)}, '
           f'held out (by round, no trajectory leakage): {[os.path.basename(f) for f in val_files]}')
 
+    keys = ('boards', 'globals', 'opp_onehots', 'privileged', 'z')
+
     def stack(fs):
-        keys = ('boards', 'globals', 'opp_onehots', 'privileged', 'z')
         parts = {k: [] for k in keys}
         for f in fs:
             d = np.load(f)
@@ -374,10 +375,41 @@ def load_exit_dataset(pattern, max_samples, val_rounds, seed):
                 parts[k].append(d[k])
         return {k: np.concatenate(v) for k, v in parts.items()}
 
-    tr, va = stack(train_files), stack(val_files)
-    if max_samples and len(tr['z']) > max_samples:
-        idx = np.random.default_rng(seed).choice(len(tr['z']), max_samples, replace=False)
-        tr = {k: v[idx] for k, v in tr.items()}
+    def stack_capped(fs, cap, seed):
+        """Load at most `cap` samples total without ever holding a whole file set in RAM.
+
+        `data/ppo_returns` alone is 252 shards / ~4.3M samples — concatenating every board
+        tensor before subsampling (the old behaviour) tries to materialise tens of GB and
+        gets the process OOM-killed. Counting via `d['z'].shape` only decompresses that one
+        small array per file, so the sample counts are cheap; the boards/globals/etc. of a
+        file are only ever read for the rows actually selected into `cap`.
+        """
+        counts = []
+        for f in fs:
+            with np.load(f) as d:
+                counts.append(int(d['z'].shape[0]))
+        total = sum(counts)
+        rng = np.random.default_rng(seed)
+        keep = np.sort(rng.choice(total, cap, replace=False)) if total > cap \
+            else np.arange(total)
+        parts = {k: [] for k in keys}
+        offset = lo = 0
+        for f, n in zip(fs, counts):
+            hi = offset + n
+            end = lo
+            while end < len(keep) and keep[end] < hi:
+                end += 1
+            local = keep[lo:end] - offset
+            lo = end
+            if len(local):
+                d = np.load(f)
+                for k in keys:
+                    parts[k].append(d[k][local])
+            offset = hi
+        return {k: np.concatenate(v) for k, v in parts.items()}
+
+    tr = stack_capped(train_files, max_samples, seed) if max_samples else stack(train_files)
+    va = stack(val_files)
     print(f'train {len(tr["z"]):,} samples   held-out {len(va["z"]):,} samples   '
           f'z std={va["z"].std():.4f}')
     return tr, va

@@ -1,11 +1,12 @@
 # WarChestEnv API
 
 `WarChestEnv` follows the [Gymnasium](https://gymnasium.farama.org/) interface. This
-describes the current full-base-game schema (`OBS_VERSION = 10`, `ACTION_SPACE_SIZE = 1875`).
+describes the current full-base-game schema (`OBS_VERSION = 11`, `ACTION_SPACE_SIZE = 1875`).
 Action-space constants are defined in `src/services/environment/warchest_env.py`; the
 observation-schema constants (`OBS_VERSION`, `GLOBAL_DIM`, `BOARD_CHANNELS`, `PRIV_DIM`,
 `PENDING_KINDS`, …) live in the versioned encoder
-`src/services/environment/obs_encoders/v10.py` (import them from there).
+`src/services/environment/obs_encoders/v11.py` (import them from there; `v10.py` is kept
+registered so the gauntlet can still reconstruct that era's checkpoints).
 `generate_observation()` / `get_privileged_features()` delegate to the encoder the env was
 constructed with (`WarChestEnv(obs_encoder=…)`, default: latest).
 
@@ -61,14 +62,20 @@ Opens an interactive matplotlib window with Previous / Next buttons and keyboard
 }
 ```
 
-`BOARD_CHANNELS = 48`, `GLOBAL_DIM = 211`, `ACTION_SPACE_SIZE = 1875` for the current schema
-(bump `OBS_VERSION` — currently `10` — whenever any of these change). Board planes and global
+`BOARD_CHANNELS = 48`, `GLOBAL_DIM = 245`, `ACTION_SPACE_SIZE = 1875` for the current schema
+(bump `OBS_VERSION` — currently `11` — whenever any of these change). Board planes and global
 layout are documented in full in `docs/policy_network.md` (board encoder / global features
-sections); in short: 6 base/terrain planes, 16 own + 16 opponent per-unit-type stack planes,
+sections). Note that the *network* no longer consumes the per-type blocks slot-by-slot: from
+`policy_factored_v2`/`critic_v5` it contracts them against a shared unit-type table
+(`docs/IDEAS.md` A1). That happens **inside the net**, so this schema is unaffected and needed no
+`OBS_VERSION` bump; v11 only additionally publishes where those blocks sit
+(`deck_block_offsets`, `unit_block_offsets`, `deck_unit_positions`, `deck_royal_position`).
+In short the layout is: 6 base/terrain planes, 16 own + 16 opponent per-unit-type stack planes,
 6 threat planes (own/enemy × melee/ranged/charge), 2 static coordinate planes, and **2
 base-control reach planes** (own/enemy: base cells a side could move onto and claim this turn).
-The global vector adds (OBS_VERSION 10) 2 material-at-risk scalars, a 17-wide expected-opponent-hand
-vector, and 3 base-control reach scalars — see `docs/observation_improvement.md`. A
+The global vector adds 2 material-at-risk scalars, a 17-wide expected-opponent-hand
+vector, 3 base-control reach scalars, and (OBS_VERSION 11) the two 17-wide draw-share vectors
+`p_soon`/`p_mean` — see `docs/observation_improvement.md`. A
 `PRIV_DIM = 51`-wide privileged (critic-only) opponent hidden-coin vector is obtained separately
 (not part of the public `generate_observation()` dict — see `Critic.value_single`).
 

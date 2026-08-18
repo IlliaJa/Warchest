@@ -28,6 +28,11 @@ fraction). The gauntlet's Bradley-Terry ranking + cycle metric (`app/gauntlet.py
 measurement of record; per-behaviour rates (bolster/tactic/recruit/chain) are the
 opponent-independent complement.
 
+> **Read [State review (2026-08-16)](#state-review-2026-08-16--the-strength-is-already-in-the-box-nothing-is-taking-it-out)
+> at the bottom of this file first.** It audits the whole list against four measurements and
+> concludes that no item here is worth a step change, while a 0.74-vs-current agent already
+> exists (the current checkpoint + 1 s of PUCT). It re-sequences §N.4.
+
 Current state: the live plan is **not** in this file — it is
 [next_iteration.md](next_iteration.md) §5, which supersedes both the sequencing in
 [independent_opponents.md](independent_opponents.md) §7 and this file's *Recommended next steps*.
@@ -567,6 +572,11 @@ it its own `OPP_GROUP_IDX` entry or its advantages land in the warned fallback b
 
 #### A1. Unit-type embeddings instead of 32 one-hot planes
 
+> **DONE — shipped 2026-08-16 (`policy_factored_v2` + `critic_v5`), measured 2026-08-18.**
+> Implemented and in the default path; the *mechanism* is in place and partially trained, and
+> the *strength* gate came back negative (pooled +4.0 % [−3.9 %, +11.9 %]). Nothing here is
+> pending work — see the two blocks at the end of this item before reopening it.
+
 Table B: **62 % of board planes and 82 % of global dims are exactly zero on any given forward
 pass**, and the structural floor — 24 planes, ~156 globals — never fills in, because only 4 of 16
 unit types are drafted per side. Worse, *which* 24 changes every game. So the network maintains
@@ -620,6 +630,27 @@ only from the ~1/4 in which that type was drafted. The gate is a run: the win is
 up on rare compositions, so `eval_bucketed.py` (per-composition buckets) is the measurement, not
 the pooled win rate.
 
+**Measured 2026-08-18 (`src/app/eval_a1_a3.py`), and the strength gate is NOT met.** First v2 run
+(`warchest_ppo_20260817-2102`, hidden 128) against the v1 baseline (`warchest_ppo_20260810-0802`):
+
+* **The table did partially learn.** Learned row norms 0.73 → 0.92, mean pairwise distance
+  1.04 → 1.33. Of the three planted frozen-row collisions, Knight/Pikeman separated to 2.24x the
+  init scale and Ensign/Marshall to 1.47x, but **Swordsman/Berserker/Mercenary stayed at 1.15x**,
+  i.e. still indistinguishable. Gradient share across the frozen columns is uneven:
+  `has_defensive_trait` 22.6 %, `coin_count` 16.6 %, down to `tactic_deals_damage` 4.4 %.
+* **No detectable effect on play.** `comps` mirrors each forced archetype across both nets, so a
+  composition's own strength cancels: pooled difference **+4.0 % [−3.9 %, +11.9 %]** over 300
+  decided games per arm. `tempo` came up **+24 % [+4.5 %, +41.1 %]** and did not survive
+  Bonferroni across the six archetypes; a confirmatory single-archetype run at a fresh seed and 6x
+  the games returned **+3.3 % [−4.6 %, +11.2 %]**. Textbook winner's curse — the lead is dropped.
+
+So A1 is not harmful and is cheap, but nothing yet shows it buying strength. Two traps this run
+exposed, both worth knowing before reading any future number here: forcing the archetype onto one
+arm only confounds "this net plays the deck worse" with "the deck is weak" (unmirrored, `support`
+read 0 % for v2 when the mirror shows v2 *ahead*), and `Policy.act` output must go through
+`WarChestEnv.remap_action` for P2 or every P2 ply silently degrades to a random legal move and P1
+wins nearly every game.
+
 #### A2. Read the board where the game happens — a base-cell + unit-cell gather readout
 
 `_split_pool` compresses 49 cells into **two numbers per channel**. Against a win condition that
@@ -653,6 +684,12 @@ cannot support it (no raw board) and now raises rather than silently pooling wro
 
 #### A3. FiLM the globals into the trunk instead of broadcasting 245 constant planes into the head
 
+> **DONE — shipped 2026-08-16 (`policy_factored_v2`), measured 2026-08-18.** The one item in
+> this section whose mechanism is *confirmed against a provable control*: the hand now re-ranks
+> the board (46.4 % of verbs change their top-1 cell) where v1 was arithmetically incapable of
+> it (0.00 %). Strength effect: none detected. Policy only — `critic_v5` deliberately has no
+> FiLM, see the last paragraph of this item.
+
 Today the trunk never sees the globals at all: `policy_head` is `Conv2d(hidden + 245 → 32, k=1)`,
 so 245 constant planes are pasted onto every cell and the head spends 245×32 weights turning them
 into a per-cell bias. But **what a board means depends on the hand** — a Berserker threat cell is
@@ -675,6 +712,21 @@ The conditioning MLP's output layer is zero-initialised, so at step 0 γ = β = 
 exactly the identity — a fresh v2 net starts from v1's trunk behaviour rather than a random
 perturbation of it. The usual zero-init consequence applies: on the first step only that output
 layer has a gradient, and the layers below it start moving from the second.
+
+**Measured 2026-08-18 (`eval_a1_a3.py hand`) — A3's mechanism is confirmed, its payoff is not.**
+The test holds a board *and its legal-action mask* fixed, substitutes other states' `global`
+vectors, and asks how much the within-verb preference over the 49 cells moves. It comes with a
+control that cannot be argued with: on v1 the answer is **provably exactly zero**, because the
+broadcast globals shift all 49 logits of a verb by the same constant and cancel in the softmax
+across cells. Result on the first v2 run: **0.419 mean total-variation distance and 46.4 % of
+verbs changing their top-1 cell**, against v1's 0.00000 / 0.00 %. FiLM is also demonstrably not
+stuck at its zero init — mean |γ| 1.83 / 1.77 / 1.13 across the three blocks, and, the number that
+matters, per-channel γ spread *across observations* 0.74 / 0.60 / 0.38 (a large but constant γ
+would be a learned per-channel gain, not conditioning).
+
+So the hand now re-ranks the board where it structurally could not before. That is the capability
+A3 was for, and it is installed. What it has **not** yet produced is strength: see A1's measurement
+block above — the pooled head-to-head difference is +4.0 % [−3.9 %, +11.9 %], consistent with zero.
 
 **Deliberately not applied to the critic.** `critic_v5` gets A1 but *not* FiLM. `board_only_head`
 reads `pool(trunk(board))` and exists precisely so its loss cannot be satisfied from the globals
@@ -720,6 +772,23 @@ gets a **calibrated win probability**, and the calibration hack is deleted. Pair
 **categorical / HL-Gauss value loss** in place of MSE — one head and one loss change, and a
 well-documented improvement in value regression. Difficulty: low-moderate. Run *after* §5 row 2b
 has settled which target is better, since 2b is the experiment this builds on.
+
+**DEFERRED 2026-08-16 — measured, and the cheap fix wins. Full record in `docs/decision.md`.**
+Both prerequisites were run. §5 row 2b (`src/app/eval_critic_target_ab.py`): at matched arch,
+`hidden_dim` and data the shaped-return advantage is **~1.3×, not ~2×**, and the board-blind
+control gains almost as much as the board arm — so most of it is "a less noisy target for
+everyone". A6 itself (`src/app/eval_value_calibration.py`): against `as_is` / `platt` /
+`isotonic` — three monotone maps of the same scalar, sharing one AUC by construction, with
+isotonic the ceiling on *any* recalibration — a frozen-trunk `z`-head buys **+0.008 AUC** and
+is **worse calibrated** than plain rescaling (ECE 0.036 vs 0.018). Two Platt floats capture
+**78 %** of the total achievable Brier gain (ECE 0.118 → 0.031). And the search half of the
+argument does not hold either: Q-spread / typical-PUCT-U = **1.27**, so the shaped scale is
+already commensurate with `c_puct`. **Do instead:** save `a`/`b` next to
+`return_mean`/`return_std` in `save_critic_checkpoint` and delete
+`LookaheadCriticBot._calibrate_value_scale`. Blind spot that could reopen this: the gate's head
+sits on a **frozen** trunk, so it cannot see what joint training would buy — but proving that
+now costs a full PPO run. If revived, build it KataGo-style (shared trunk; separate winrate /
+margin / ownership-like heads) **together with A7**, not as a standalone arch.
 
 #### A7. Auxiliary heads = one-to-two-ply lookahead installed in the representation
 
@@ -1004,7 +1073,7 @@ Not sequenced ahead of `next_iteration.md` §5 rows 2b/3. After those report:
 | 5 | **B3** | the falsifiable read on whether the race framing is right | moderate |
 | 6 | ~~**B2**~~ | ~~interpretable exploitability; subsumes the expensive half of #12~~ **Deprioritised 2026-08-09** — B1 measured the class ceiling at 0.00–0.08 vs the current policy (`greedy_sim` itself: 0.17), so a θ search cannot reach the 65 % decision threshold. Re-scope onto a stronger base bot first | low-mod |
 | 7 | **L1**, **B4** | 2× data and ~3× rollout throughput; B4 also unlocks L6, L7 and independent ExIt | moderate |
-| 8 | ~~**A1 + A3**~~ together | ~~one `OBS_VERSION` bump buys both~~ **Shipped 2026-08-16** as `policy_factored_v2` + `critic_v5`, and the premise was wrong: neither needs an obs bump, because the contraction runs inside the net and v11 is byte-identical. Both gates still need a run — A1's on `eval_bucketed.py` (rare compositions, not pooled WR), A3's on the gauntlet | moderate |
+| 8 | ~~**A1 + A3**~~ together | ~~one `OBS_VERSION` bump buys both~~ **Shipped 2026-08-16** as `policy_factored_v2` + `critic_v5`; the bump premise was wrong (the contraction runs inside the net, v11 is byte-identical). **Measured 2026-08-18 via `eval_a1_a3.py`: A3's mechanism confirmed (46.4 % of verbs re-rank their top-1 cell when only the hand changes, against a provable 0.00 % for v1), A1's table partially learned (2 of 3 planted collisions separated), and NEITHER moved strength — pooled +4.0 % [−3.9 %, +11.9 %].** Not harmful, not yet paying. Next lever is elsewhere: row 7 (L1, B4) is still open and is data/throughput rather than architecture | moderate |
 | 9 | **A6**, **A7**, **L3**, **L4** | each depends on something above having reported | moderate |
 | 10 | **A5** | only if A2/A3 leave a gap worth a rebuild | high |
 
@@ -1141,3 +1210,649 @@ pick them up when adjacent work already pays their setup cost (an `OBS_VERSION` 
 action-space rebuild, a parallel-rollout tuning pass).
 
 C8 (LR decay) and C9 (clean true-greedy eval) are **done**; ideas 1–9 are retired (above).
+
+---
+
+## State review (2026-08-16) — the strength is already in the box; nothing is taking it out
+
+Written in answer to a direct question: *looking at what is left on this list, is there anything
+that would put a new model at ~70 % against the previous one?* Read on its own terms — it is not
+a new idea, it is an audit of where the remaining strength is, with four measurements taken for
+it. Two of them are **§5 row 9 of `next_iteration.md`, which had never been run** in ~6 weeks of
+it sitting at the bottom of the sequencing table.
+
+**The short answer.** No single item on the B/A/L list is worth 70 %. But a **0.74 agent against
+the current checkpoint already exists today** — it is the current checkpoint with one second of
+PUCT in front of it. The whole gap is that nothing puts that strength back into the weights. The
+list below has spent five weeks improving the *evaluator* (critic_v2 → v3 → v4 → v5, each worth
+a few pp on a sibling-ranking metric) and zero weeks on the thing that consumes an evaluator.
+
+### R.0 The four numbers this review rests on
+
+None appears in any other doc. R.0.1/R.0.2 are new runs; R.0.3/R.0.4 are arithmetic on an
+existing training log. Commands in R.7; the whole set is reproducible in ~15 min.
+
+**R.0.1 — Search beats the raw policy, and it scales.** `next_iteration.md` §5 row 9, first run.
+`ckpt_20260810-0802` against `PuctBot` built on *that same policy* (priors) plus
+`lookahead_critic_v5.pth` (`critic_v2`, alive trunk). 100 games per pair, colours balanced,
+`se(WR) ≈ 4.7 pp`:
+
+| PUCT budget | node expansions / move (measured) | WR of **PUCT** vs the raw policy | Elo gap |
+|---|---|---|---|
+| 0.1 s | **~14** (12–19 under 12-way contention; ~30 idle; 2 on a loaded box) | **0.66** | +114 |
+| 1.0 s | **~97** | **0.74** | +180 |
+
+Both resolve — 0.66 and 0.74 are 3.4 σ and 5.1 σ from 0.5. (The gauntlet prints
+"intransitive-triple fraction 0.000", but a two-agent field has no triples; ignore it.)
+
+**Amended by R.8 (2026-08-18).** Repeated on the same checkpoint with a *different* tool and
+the newer `critic_v4` leaf, the 0.1 s row measures **0.562 ± 0.055** rather than 0.66 — 1.4 σ
+apart, so read the thin-search row as *"somewhere around 0.5–0.6, i.e. little to nothing"*,
+which is what R.0.2 predicts and what R.8 confirms on a second checkpoint (0.487). The 1.0 s
+row reproduced almost exactly (0.725 on the new checkpoint). **The load-bearing claim is the
+slope, and the slope got steeper, not flatter.**
+
+Two readings, and the second is the one that matters:
+
+- **Search works in this game.** Every previous statement to the contrary
+  (`independent_opponents.md`'s ExIt collapse, "more search budget is not a strength lever" in
+  *Checked and rejected*) was measured with a **board-blind critic** —
+  `next_iteration.md` §3.4 says so explicitly ("every search result on record has a
+  board-blind leaf", `lookahead_critic_v4.pth` md5-identical to the dead
+  `warchest_critic_20260727-0506.pth`). This is the first search measurement on a live trunk,
+  and the sign flipped.
+- **The scaling is ordinary and therefore extrapolable.** 14 → 97 expansions is 2.8 doublings
+  for +66 Elo, i.e. **~23 Elo per doubling of search**. That is a normal MCTS curve. Three more
+  doublings (~800 expansions, AlphaZero's actual setting) projects to ~0.81 and is affordable
+  *offline*, which is exactly where a distillation teacher lives.
+
+**R.0.2 — The game tree is tiny, and the search budget is smaller.** Over 12 random-play games:
+**mean 10.5 legal actions per decision, median 9, p10 3, p90 19, max 37.** Against that,
+`PuctBot`'s shipped configuration (`max_branching=8`, `time_budget=0.1`, and the *same* 0.1 s in
+`ppo.py`'s `puct_time_budget` **and** in `expert_iteration.py`'s `--time-budget` default) buys
+~14–30 expansions. The root alone consumes 8 of them.
+
+**So the ExIt teacher's visit distribution is built from ~3 visits per root child.** PUCT's first
+`b` selections visit each child exactly once (the `U` term dominates at `N=0`), so at 14
+expansions the visit counts are *the prior, plus about one bit of information per child*. The
+recorded ExIt symptom — teacher/student agreement **0.94–0.95**, every round weaker than base —
+is not a tuning failure or a self-play-collapse subtlety. **It is arithmetic.** Compounding it,
+`--dirichlet-frac` defaults to **0.03** where AlphaZero uses 0.25, so root exploration is 8×
+weaker than the reference too.
+
+Cost breakdown for why 14: an expansion is one policy forward (0.86 ms) + one critic forward
+(0.85 ms) + clone/apply, unbatched, single-threaded CPU — ~3.3 ms measured end to end. Table A
+already had every input to this number; nobody divided.
+
+*Correction to a figure in circulation:* `independent_opponents.md` §2 mechanism 1 says
+"~100–300 sims/move on a 1875-wide action space with `max_branching=8`". Both halves are off.
+The expansion count is **14–30** at the shipped budget (measured from `PuctBot`'s own
+`nodes_visited`, printed per worker by the gauntlet), and the *effective* branching factor is
+**10.5 legal actions**, not 1875 — `max_branching=8` is therefore only mildly truncating
+(p90 = 19), which is worth knowing because it means widening it is **not** the fix. The fix is
+the number of evaluations, and what is done with them.
+
+**R.0.3 — The dense reward is 41 : 1 base-differential over material, and out-earns winning.**
+From `logs/ppo_20260809-195643.log`, the last completed run, per-episode score decomposition at
+batch 1497–1500 (anneal at its 0.1 floor):
+
+```
+shaping=0.205   terminal=0.125   material=0.005   holding=0.001   tempo=-0.060   attack=0.000
+```
+
+`r_shaping` is the base-diff PBRS **only** (`rollout_core.py:261`), and it is the one term
+deliberately **not** annealed (`ppo.py`, "Base-diff PBRS (SHAPING_C) is intentionally left
+constant"). So, late in every run:
+
+| what the agent is paid for | per unit | per game |
+|---|---|---|
+| one base of differential | `SHAPING_C` = **0.050** | up to 0.30 |
+| one boxed enemy coin | `C_MAT · anneal` = 0.015 · 0.1 = **0.0015** | 0.006–0.015 |
+| one elapsed turn | `TURN_TEMPO_REWARD` = −0.002 | −0.060 |
+| winning | ±1.0 | mean **+0.125** |
+
+**One base = 33 boxed coins.** The user's own domain note (`next_iteration.md` §6) is that real
+games box 4–6 of 16–20 coins and hard games reach ~10 — so *the entire material axis of a whole
+game is worth less than a third of one base* in this reward. And `γ^T·Φ(s_T) = 0.205` against a
+mean terminal of 0.125: **the shaping potential pays more per episode than the win does.** PBRS
+is optimal-policy-invariant in the limit, but a potential whose range (0 … 0.30) is a third of
+the terminal's (±1) and whose *realised* per-episode payout exceeds it is not a hint toward the
+objective, it is a competing objective under any finite-horizon, entropy-regularised,
+function-approximated optimiser — which is what PPO is.
+
+**R.0.4 — The policy is converged, collapsed, and not improving.** Same log, final batches:
+`ent = 0.498` against `ent_max = 2.515` (**ent_frac 0.20**), `verb_ent = 0.298` against
+`ln(11) = 2.40` (**12 %**), `bolster_per_ep` 3.5 → **0.19**. And the eval that matters:
+**`vs warchest_ppo_20260809-1734: score=0.450 (9W/11L/0D)`** — 1500 batches, ~9 h, and the
+result is a *loss* to its own predecessor. `critic_mae 0.226` against `ret std 0.617` is
+~0.37, i.e. the critic is no longer the underfit it was. **The plateau is not the critic.**
+
+### R.1 "It rushes bases and has no strategy" — the technical translation
+
+Four distinct mechanisms. They are not competing hypotheses; all four are measured, and they
+compose. Ordered by how much of the complaint each explains.
+
+**R.1.1 — There is no lookahead at inference, and that alone is 180 Elo (R.0.1).** "Plays like a
+beginner" is the standard, textbook signature of a raw policy network with no search: locally
+plausible moves, no line, no threat conversion, no prophylaxis. `next_iteration.md` §1 named this
+in the first sentence it ever wrote and then spent six weeks on the critic. The measurement now
+exists: the *same* network, given 1 second of tree, is a 0.74 agent against itself.
+
+**R.1.2 — The credit-assignment horizon is shorter than the payoff horizon of every non-race
+strategy.** `λ = 0.90` (shipped L2) gives an effective horizon `1/(1−γλ) = 9.2` **main-actor
+decisions**, against ~42 per game. A base claim pays 0.05 *now*. The kill → steal → hold chain
+that §3.3 measured as the **only** way a base ever changes hands (53 steals from occupied bases,
+0 from empty) pays 0.0015 for the kill, at t, and 0.05 for the steal, at t+1..t+4, and the hold
+is what actually decides the game 20 decisions later. Within a 9-decision window, racing to an
+uncontested base strictly dominates fighting for a contested one — *in the reward*, whatever is
+true of the game. This is the credit gap in the §*Method* table, and the diagnostic it asks for
+(is the verb sampled early then decayed?) reads **yes**: `bolster_per_ep` 3.5 → 0.19.
+
+Note the interaction with L2, which is worth stating because it looks like an argument against a
+shipped change: dropping λ was correct *for making a repaired critic count*, and it simultaneously
+shortened the window in which a slow strategy can be seen. Both are true. The fix is not to raise
+λ back — it is R.1.3.
+
+**R.1.3 — Material has no terminal consequence in the env, so the reward is not wrong so much as
+the MDP is shallow.** `docs/game_mechanics.md`: the win table has exactly **two** rows —
+control 6 bases, or truncate at round 50. There is no elimination condition. Coins in the box are
+permanently gone and the game never registers it. So a boxed coin is worth only what it opens up
+positionally, and the shaping (R.0.3) prices that at 1/33 of a base.
+
+~~**Consequence, and it is the uncomfortable one: "rush bases" may be correct play in the game as
+implemented, and the strategy the user is looking for may not be in the MDP.**~~
+
+> **ANSWERED 2026-08-18, and the escape hatch is gone (see R.8).** The user's ruling: the only
+> win condition really is 6 bases, but reaching 6 against a competent opponent goes through
+> positional control and removing enemy units — **the game cannot be won by racing alone.** So
+> the env is fine and R.0.3 is a confirmed *defect*, not a possible feature: the reward prices
+> the goal at 33× its only means. `next_iteration.md` §6 parity question 1 is **closed**; do not
+> re-open it. `L4`'s hanging-material potential is re-opened, on a rule.
+
+For the record of what the evidence looked like before that ruling, and why it was not enough:
+B1's per-dial sweep found `pos` (the racer dial) is what buys wins while `durability` takes the
+win rate 0.75 → 0.00, and B3's design rests on the rules making a parked unit an absolute lock.
+Both are measurements *inside* a pool where nothing punishes a racer, so neither could have
+settled it — which is why it took a domain answer rather than another run.
+
+**R.1.4 — The yardstick cannot see a 70 % improvement even if one happened.** `wr_vs_greedy_eval`
+is pinned at 0.95–1.00 (saturated, and the standing rule says do not optimise against it).
+`wr_vs_reference_eval` compares against *the previous checkpoint*, which drifts every run — a
+moving target in a space with a measured 0.11 intransitive-triple fraction, so "beats its
+predecessor" is compatible with going in circles. And it is 20 games (`C20`), `se ≈ 11 pp`. The
+target "70 % vs the previous model" is currently being measured with an instrument whose noise
+floor is a third of the effect. **A fixed absolute anchor is missing**, and R.0.1 supplies the
+obvious one: `PuctBot @ 1.0 s` over a frozen critic is stronger than the policy, does not drift,
+and is transitive in every field it has been placed in.
+
+### R.2 Why nothing currently on the list is worth a step change
+
+Not a criticism of the items — a statement about what class they are in.
+
+| class | items | ceiling |
+|---|---|---|
+| evaluator quality | A1, A2 ✓, A3, A4, A5, A6 ✗, critic_v2..v5 | each measured at +3 to +10 pp on a *sibling-ranking* metric. A1+A3 (running now) will land here too — the honest prior is ±0, exactly as predicted |
+| opponent coverage | B1 ✓, B3, B5 ✗, B8, #15 | B8 measured the blocker: every independent bot in the repo **loses** to the policy, and after per-opponent advantage centring a group with no spread contributes near-noise. Coverage cannot help until an opponent is *strong* |
+| data / throughput | L1, B4, B7, #11 | multipliers on a loop that is not producing improvement. 2× of ~0 is ~0 |
+| reward | L4, L8 ✓ | R.1.3 says the ceiling here is set by the win condition, not the weights |
+| measurement | #13, #14, L9, row 5 | necessary, never sufficient |
+
+The pattern is visible in the sequencing table itself: §N.4 has ten rows and **nine of them
+improve an input to a loop whose output has been flat for three runs.** The one that does not is
+B4, and its stated purpose is throughput.
+
+### R.3 The step change that is available: put the search in the loop, properly
+
+The premise ExIt needs — *a teacher measurably stronger than the student* — was **false every
+time ExIt was run** and is **true today**:
+
+| ExIt's recorded fault | status |
+|---|---|
+| "teacher ≡ student", agreement 0.94–0.95 (`independent_opponents.md`) | **explained and stale.** ~14 expansions over 8 root children cannot disagree with the prior (R.0.2), and `dirichlet_frac=0.03` is 8× below AlphaZero's. Not a property of self-play |
+| the critic objective is `MSE(critic, z)` (§3.3b) | **confirmed, and `independent_opponents.md` §1 already contains the controlled experiment nobody read as one.** Round 0 ran in `shaped` mode off the good PPO critic: **agreement 0.77, and it is the best round of the 30 (BT 1089)**. Rounds ≥1 switched to the self-distilled z-critic: agreement jumped to ~0.94 and strength fell away monotonically. The critic's *target* is the variable that moved, and row 2b independently measured its sign |
+| *(unrecorded, and the largest)* every ExIt run used the **dead-trunk** critic | §3.4 pins the byte-identity. The trunk was repaired 2026-08-07 and ExIt has never been re-run |
+| *(operational)* the search bots load `data/lookahead_critic/lookahead_critic_v{N}.pth`, not `data/warchest_critic_*.pth` | the newest there is **v5 = `critic_v2` (08-08)**. `critic_v4` (08-10, the shipped A2 default) was never copied in, so **every gauntlet and ExIt search since 08-10 has used a one-generation-stale critic** — including R.0.1, which is therefore a *lower* bound. Fix: copy the file, or make `_latest_critic_path` fall back to the newest `warchest_critic_*.pth` |
+
+So the work is a single coherent change with four parts, and each part has a named precedent.
+
+**R.3a — Make the teacher a real search (throughput).** 14 expansions is a budget problem, and
+the budget is 3.3 ms of unbatched CPU inference per node. Four multipliers, all standard, roughly
+independent:
+
+1. **Batched leaf evaluation with virtual loss** (Leela/KataGo). Table A: `value_batch(64)` is
+   0.37 ms/state vs 0.85 single. ~2.3× on the critic side alone; more once the policy prior is
+   batched with it.
+2. **Tree reuse across moves.** `_act_once` builds a fresh `_Node` root every call and throws the
+   subtree away. Reusing the chosen child's subtree is a free ~2–3× effective sims in a game
+   where the opponent's reply is one of ~10.
+3. **A small distilled net for the search leaf** — this is exactly **B4**, and R.0.1 is the first
+   argument for it that is about *strength* rather than throughput. 32-wide ≈ 0.25 ms est.
+4. **Offline is not the hot path.** ExIt data generation is not the rollout loop. Even with none
+   of the above, `--time-budget 2.0` is affordable for a distillation teacher and buys ~500
+   expansions today.
+
+**R.3b — Use a search target that is valid at low simulation counts: Gumbel AlphaZero.**
+*Policy improvement by planning with Gumbel*, Danihelka et al., ICLR 2022. Gumbel top-k sampling
+at the root + sequential halving over the sampled actions + a policy target built from
+**completed Q-values** instead of raw visit counts. Its entire point is that it gives a
+**guaranteed** policy improvement at **n = 16–32 simulations**, where vanilla AlphaZero's
+visit-count target is provably not an improvement operator. Warchest's numbers could not fit the
+paper's premise better: branching **10.5** (its worked examples are 9×9 Go and smaller), and a
+budget that currently delivers **14**. This is the single highest-leverage borrowed idea in this
+document — it converts the existing 14-expansion search from "noise around the prior" into a
+valid teacher *without buying any throughput at all*, and the throughput work in R.3a then
+compounds on top.
+
+**R.3c — Train the ExIt critic on n-step bootstrapped returns, not `z`.** Row 2b's re-scoped
+conclusion, never applied. This is MuZero's value target and it is the correct one the moment
+intermediate rewards exist (`docs/decision.md` 2026-08-16 already writes this down).
+
+**R.3d — Re-derive the exploration constants at the new budget — do *not* just restore
+AlphaZero's.** An earlier draft of this item said "`--dirichlet-frac 0.03 → 0.25`". That is
+wrong as an instruction: **0.03 is a measured value, not an oversight.** The CLI's own help
+records why — at 0.25 the mean visit entropy came out 0.87 nats against a pre-distill policy
+entropy of ~0.6, so distillation *flattened* the policy every round, and 0.03 measured 0.586.
+The correct reading is that **noise fraction and search budget are not independent**: 0.25 is
+affordable exactly when Q has enough visits to outcompete a noisy prior, and at 14 expansions it
+does not. So raise the budget first, then re-test 0.25 and read the entropy pair
+(`preflight` gate 4 prints it before a full generation). Same treatment for
+`--temperature`/`--temp-moves` against the ~42-decision game length, and for `c_puct` now that
+`eval_value_calibration.py puct` has measured Q-spread/U = 1.27.
+
+**The gate, and it is cheap.** Before generating a single game of ExIt data, measure the teacher
+against the student in the gauntlet — the R.0.1 command. **A teacher below ~0.65 is not worth
+distilling**; today, at 1.0 s, it is 0.74. Then, and only then, one distillation round with the
+agreement metric read against something that is not the student (B4's net, or the pre-round
+policy frozen).
+
+### R.4 What to borrow from outside, and what each is evidence for
+
+Ordered by expected value here, not by fame. Every row names why it applies to *this* project's
+measured numbers rather than in general.
+
+| # | Idea | Source | Why it fits Warchest specifically | Cost |
+|---|---|---|---|---|
+| 1 | **Gumbel AlphaZero** — Gumbel top-k root sampling + sequential halving + completed-Q policy target | Danihelka et al., ICLR 2022 | valid policy improvement at n=16–32 sims; branching is 10.5 and the current budget is 14 (R.0.2). Directly repairs the mechanism that made ExIt's teacher ≡ its student | mod |
+| 2 | **Ownership + score auxiliary heads** | KataGo (Wu 2019) | KataGo's headline sample-efficiency result. The Warchest analogue is *free*: **per-base final-control** (10 bases, a 10-way label straight off the trajectory) and **final base differential**. This is `A7` with a concrete high-signal target, and it installs "which bases will I hold" — the exact quantity §1's thesis says the net cannot compute — at zero inference cost | mod |
+| 3 | **Playout-cap randomisation** | KataGo | most self-play moves get a cheap search, a small fraction get a full one, and **only full-search moves produce a policy target**. Exactly the right trade when a full search costs 500× a policy forward (Table A) and games are 85 plies | low |
+| 4 | **Tree reuse + virtual loss + batched leaf eval** | Leela Chess Zero, KataGo | R.3a. ~5× on the same hardware, no new ideas | mod |
+| 5 | **Forced playouts + policy-target pruning** | KataGo | makes root exploration noise usable at low visit counts instead of poisoning the target — the failure mode `dirichlet_frac=0.03` was presumably set to avoid | low |
+| 6 | **n-step bootstrapped value target** | MuZero | R.3c; row 2b already measured the direction | trivial |
+| 7 | **Supervised warm start from the search** | AlphaStar | `L6`, but the teacher is now the PUCT bot rather than a 200-line heuristic. Also removes "how fast did it escape the random phase" as a confound in every A/B (the standing-rule problem this file opens with) | low |
+| 8 | **League / main-exploiter play** | AlphaStar; PSRO | the principled fix for B8's blocker (no independent opponent is strong enough to be worth pool weight). Expensive, and it is a *robustness* lever — park it behind R.3 | high |
+| 9 | **R-NaD** | DeepNash | unexploitability, not strength. `docs/decision.md` 2026-07-03 already argues it is orthogonal. Not the constraint |  — |
+| 10 | **Transposition table + make/unmake + killer moves** | classical chess engines | `B7`. At branching 10.5 a real engine reaches depth 6–8, which would make `LookaheadBot` a genuinely strong independent opponent and unblock B8 from the other side | mod |
+
+Row 2 deserves one extra sentence, because it is the cheapest thing in this document that is not
+a measurement: **the ownership head is a supervised, dense, per-cell label available for free in
+every trajectory already being collected**, it cannot leak at inference, it is independently
+A/B-able, and the precedent (`critic_v2`'s board-only aux head, which took the positional tie
+rate 93 % → 0 %) is *in this repo*.
+
+### R.5 Direct answer — should a PUCT model be trained?
+
+**The measurement was worth an hour and it changed the picture; the training run is worth doing
+next, but not with today's ExIt defaults.**
+
+- The *measurement* (R.0.1) is done and is the most informative hour spent on this project in
+  weeks. It is `next_iteration.md` §5 row 9 and it should have been run before the last three
+  critic architectures.
+- A *training* run of ExIt as currently configured would reproduce the recorded collapse, because
+  R.0.2 shows the teacher is the student by arithmetic at `--time-budget 0.1`. Do not spend the
+  compute.
+- A training run with **R.3b (Gumbel) + R.3d (noise) + `--time-budget 1.0` + R.3c (value target)**
+  is the highest-expected-value run available, and it is the only route on this whole list with a
+  plausible path to 70 %: the teacher is *measured* at 0.74 today, before any of the four fixes.
+- Cheapest possible first step, ~2 h, no new code: copy `warchest_critic_20260810-0802.pth` to
+  `data/lookahead_critic/lookahead_critic_v6.pth`, re-run R.0.1 (does the newer critic search
+  better?), then one ExIt round at `--time-budget 1.0 --dirichlet-frac 0.25` and read the
+  agreement metric. If agreement drops off 0.94 and the distilled policy beats base, the whole
+  R.3 programme is justified by a two-hour experiment.
+
+### R.6 Suggested order
+
+Supersedes §N.4 for anything not already in flight. The A1+A3 run should finish first — not
+because it will move the needle, but because interleaving arches with a search change would make
+both unattributable.
+
+| order | work | why | cost |
+|---|---|---|---|
+| 0 | ~~**Env parity audit** (R.1.3)~~ | **done 2026-08-18** — 6 bases is the only win condition, but it is reached through control and removing units; racing alone cannot win. So the reward *is* the defect and every reward item below is unblocked (R.8) | ~0 |
+| 1 | **Fix `_latest_critic_path`** + re-run R.0.1 on `critic_v4` | one-line staleness bug silently affecting every search measurement since 08-10 | ~0 |
+| 2 | **Absolute anchor** — add frozen `PuctBot @ 1.0 s` as a permanent eval opponent, and raise eval to 50 games (`C20`) | R.1.4: no current instrument can resolve the improvement being aimed for | low |
+| 3 | **R.3b Gumbel root** + **R.3d exploration constants** + `--time-budget 1.0` | the teacher repair. No throughput work needed to test it | mod |
+| 4 | **One ExIt round**, gated on teacher-vs-student ≥ 0.65 and agreement measured off-student | the two-hour experiment that justifies or kills the programme | low |
+| 5 | **R.4 row 2 — ownership + base-diff auxiliary heads** (= A7, concretised) | cheapest non-measurement item with a strong outside precedent; independent of 3–4, so it can run in parallel | mod |
+| 6 | **R.0.3 reward re-balance** — ~~anneal `SHAPING_C` like the others~~ **done 2026-08-18**, `SHAPING_C` now rides `shaping_anneal` (`base_shaping_anneal` in `rollout_core.play_episode`, `--no-anneal-base-shaping` for the old arm). Holds base : material flat at 3.3 : 1 instead of drifting to 33 : 1, and puts the late-run dense payout ~6× under the terminal. **Not yet A/B'd.** Still open: add **L4's `Φ_risk`** | no longer conditional (row 0 answered). Stop paying more for base differential than for winning, and install the prophylaxis the teacher provably does *not* carry (R.8.1) | trivial–low |
+| 7 | **R.3a throughput** (batched leaf + tree reuse + B4) | only worth it once 3–4 say search is the lever; then it is a 5× on the lever | mod |
+| 8 | **B7 / #14** — real engine for `LookaheadBot`; blunder finder | unblocks B8 from the strength side; turns "plays like a beginner" into a per-move number | mod |
+
+### R.7 Reproducing R.0
+
+```bash
+# R.0.1 — next_iteration.md §5 row 9, the search-vs-policy head to head
+python src/app/gauntlet.py --bots policy puct \
+    --checkpoints data/warchest_ppo_20260810-0802.pth \
+    --k-games 100 --puct-time-budget 0.1 --n-workers 12
+python src/app/gauntlet.py --bots policy puct \
+    --checkpoints data/warchest_ppo_20260810-0802.pth \
+    --k-games 100 --puct-time-budget 1.0 --n-workers 12
+# read `nodes_visited avg` in the per-worker puct log lines — that is R.0.2's expansion count
+```
+
+R.0.2's branching factor is 12 random games under `env.get_possible_actions()`; R.0.3 and R.0.4
+are `grep score_parts` / the final `[eval]` line of `logs/ppo_20260809-195643.log`.
+
+**Standing caveats.** R.0.1 is 100 games per budget, one policy checkpoint, one critic — it
+establishes *that* search helps and roughly *how much per doubling*, not a precise curve, and it
+has not been repeated across checkpoints. The 0.81-at-800-expansions projection is a linear
+extrapolation in log-sims from two points and should be treated as a hypothesis, not a number.
+R.1.3 is the one item here that could invalidate several others, and it is unresolved.
+
+---
+
+## R.8 Pre-flight for the ExIt run (2026-08-18)
+
+R.1.3 is **answered by the user, and the answer removes the escape hatch**: the only win
+condition really is 6 bases, but reaching 6 against a competent opponent goes through positional
+control and removing enemy units — *the game cannot be won by racing alone.* So the env is not
+the problem, and every consequence flips:
+
+* **R.0.3 is no longer a suspicion, it is a confirmed defect.** A reward that pays 0.05 for a
+  base and 0.0015 for a boxed coin prices the goal at 33× the only means of reaching it. The
+  agent's base-rushing is not correct play that merely looks bad — it is the local optimum this
+  reward defines, and it survives only because no opponent in the pool punishes it. The user
+  confirms a human punishes it immediately.
+* **`L4`'s hanging-material potential moves up**, and the reward axis is properly re-opened —
+  on a rule this time, per L4's own argument.
+* The parity branch of `next_iteration.md` §6 is **closed**. Do not re-open it.
+
+Everything below was built and measured to make the next ExIt run count.
+
+### R.8.1 What the search actually adds — `src/app/eval_search_delta.py` (new)
+
+R.0.1 said search is worth ~180 Elo; it did not say what of. That matters, because you only
+distil what the teacher has. New tool: plays `PuctBot` against the raw policy that supplies its
+priors, colours balanced on shared seeds, and records per side the verb mix, `own_at_risk` /
+`opp_at_risk` read off the mover's own ego observation (globals 208/209 — which, per B5, nothing
+in the repo had ever read), enemy coins boxed, and bases held at the end.
+
+80 games, `ckpt_20260817-2102` + `critic_20260817-2102` (`policy_factored_v2` / `critic_v5` — the
+A1+A3 run), 1.0 s budget:
+
+| | puct | policy | Δ |
+|---|---|---|---|
+| WR | **0.725** | 0.275 | ±0.050 |
+| enemy coins boxed / game | **6.09** | 4.78 | **+1.31 (+27 %)** |
+| bases held at end | **5.16** | 4.01 | **+1.15** |
+| `own_at_risk` while to move | 0.0220 | 0.0220 | **±0.0000** |
+| attack share | 0.1055 | 0.0928 | +1.3 pp |
+| control share | 0.0854 | 0.0743 | +1.1 pp |
+| tactic / select share | 0.0664 / 0.0471 | 0.0575 / 0.0356 | +0.9 / +1.2 pp |
+| deploy / move share | 0.1512 / 0.2719 | 0.1719 / 0.2916 | −2.1 / −2.0 pp |
+
+**The answer is half of what was hoped, and the half that is missing is the half the user's
+domain claim is about.** Search wins by *cashing* material and converting it — 27 % more enemy
+coins boxed, more attacks, more tactics, more control, less aimless deploying and walking. It
+does **not** win by hanging less: `own_at_risk` is identical to four decimal places. So the
+teacher is a better *attacker and converter*, not a better *defender*.
+
+Two consequences, and they are the operative ones:
+
+1. **ExIt is still the right lever, and its target is legible.** "Take the kill, then convert" is
+   exactly the mechanism §3.3 measured as the only way a base ever changes hands, and it is what
+   the raw policy does not do. Distilling it teaches a real, named skill.
+2. **Search will not supply prophylaxis, so something else has to.** "You attack so your unit is
+   not attacked" is not in the teacher. That is a direct argument for the two items that install
+   it *supervised* rather than by search: **L4's `Φ_risk = −c · own_at_risk`** potential (which
+   cannot distort the optimum) and **A7's survival head** (will this stack lose a coin within 2
+   plies). These are now complements to ExIt, not alternatives to it.
+
+### R.8.2 The A1+A3 run did not come back worse — the in-run eval is too noisy to tell
+
+The run's own final line reads `vs warchest_ppo_20260810-0802: score=0.350 (7W/13L/0D)`, which
+looks like a regression. It is 20 games, `se ≈ 11 pp`. Re-measured in the gauntlet at **200
+games**:
+
+| | WR vs the other | BT Elo |
+|---|---|---|
+| `ckpt_20260817-2102` (A1+A3, `policy_factored_v2`) | **0.55 ± 0.035** | 1015.6 |
+| `ckpt_20260810-0802` (baseline) | 0.46 | 984.4 |
+
+So ~+31 Elo, 1.4 σ — a small positive, not the loss the log implied. **This is R.1.4 biting in
+practice: the shipped instrument reported a 0.55 as a 0.35.** Raising eval to 50 games (`C20`) is
+no longer cosmetic; it is the difference between reading a run correctly and abandoning a change
+that worked.
+
+And A1's *own* gate — behaviour on the mechanics the embedding was supposed to make legible —
+moved a long way, which the pooled win rate hides entirely:
+
+| | old ckpt | A1+A3 ckpt |
+|---|---|---|
+| `bolster_per_ep` (training log) | 0.20 | **2.52** |
+| bolster share of decisions (gauntlet) | 0.0071 | **0.0746** — ~10× |
+| plies / game | 73.5 | 83.9 |
+| enemy coins boxed / game | 4.38 | 4.78 |
+
+The unit-type embedding did what A1 argued it would: unit-specific mechanics came back into the
+repertoire. `next_iteration.md` §3.7's "bolster is a collapsed mode at `P̄ = 0.029`" is **out of
+date as of this checkpoint**.
+
+### R.8.3 What shipped to make the run work
+
+**`src/app/expert_iteration.py preflight` (new)** — one command that checks the four gates that
+have each cost a run at least once, before paying for another. It exits with a verdict block:
+
+| gate | what it measures | threshold | why it exists |
+|---|---|---|---|
+| 1 staleness | is the critic in force the newest one? | — | `--critic` resolves `data/lookahead_critic/`, which PPO does not write; the two drifted a full generation for a week (R.3, last row) |
+| 2 search depth | real expansions/move at the configured budget | ≥ 50 | R.0.2. Run it on an **idle** box: measured 30/move idle, 14 under 12 busy workers, **2** on a loaded one, all at 0.1 s |
+| 3 teacher strength | `PuctBot` vs the raw policy, head to head | ≥ 0.60 | `next_iteration.md` §5 row 9 — never checked before the 30-round run that got monotonically weaker |
+| 4 target sharpness | `visit_entropy` vs `policy_entropy`, and agreement | visit ≤ policy, agree < 0.90 | the recorded `--dirichlet-frac 0.25` flattening failure, now readable on 6 games instead of a full generation |
+
+Verified against the current checkpoint at the old 0.1 s budget, and it correctly refuses:
+`search depth 2/move FAIL`, `teacher strength 0.500 FAIL`, `teacher divergence agreement 0.903
+FAIL`, `target sharpness ok`. That is the run the project was about to launch.
+
+**`--freeze-critic`** (`src/app/expert_iteration.py` + `distill(train_critic=False)`) — distils
+the policy only, keeps the critic bit-identical and keeps the search in `value_mode='shaped'` for
+every round. This is the configuration the record argues for and nobody ever ran: ExIt's only
+round that made the policy stronger was **round 0**, the one round still on the PPO shaped-return
+critic (agreement 0.77, BT 1089, best of 30), and every round on the self-distilled `z`-critic got
+monotonically weaker. Freezing also removes the one place a scale bug can enter — the
+`return_mean=0 / return_std=1` overwrite, which is correct for a `z`-critic and wrong for a
+shaped one. With it, the loop has exactly **one** moving part, so a negative result is
+attributable.
+
+**`--time-budget` default 0.1 → 1.0**, with the reasoning in the help. Generation is offline; a
+teacher that is the student by arithmetic costs 100 % of a run and returns nothing.
+
+**Agreement guard in `_run_distill`** — warns loudly when pre-distill agreement ≥ 0.90, which
+`independent_opponents.md` §7 asked for in July and which was never added.
+
+312 tests pass.
+
+### R.8.4 The run to launch, in order
+
+```bash
+# 0. the critic the search will use must be the newest one (R.3, last row)
+cp data/warchest_critic_20260817-2102.pth data/lookahead_critic/lookahead_critic_v6.pth
+
+# 1. gates, on an idle box. Tune --time-budget until gate 2 clears ~50 expansions/move
+#    and gate 3 clears 0.60; expect somewhere around 0.5-1.0 s.
+python src/app/expert_iteration.py preflight --time-budget 1.0 --preflight-games 60
+
+# 2. once (and only once) all four gates pass — policy-only distillation, shaped critic,
+#    small rounds so a regression is visible early
+python src/app/expert_iteration.py loop --rounds 3 --games 300 \
+    --time-budget 1.0 --freeze-critic --gauntlet-k-games 50
+
+# 3. read, per round: post-round gauntlet BT (the only real answer), agreement before->after,
+#    and re-run the behaviour delta on the distilled policy to check WHAT moved
+python src/app/eval_search_delta.py --policy data/exit/round0_policy.pth \
+    --critic data/warchest_critic_20260817-2102.pth --games 80 --puct-time-budget 1.0
+```
+
+The success condition is not CE/MSE falling. It is: **the distilled policy beats the base policy
+in the post-round gauntlet at ≥ 50 games/pair, and `eval_search_delta` shows its boxed-coins and
+control shares have moved toward the teacher's** — i.e. it absorbed the conversion skill rather
+than just the prior. If round 1 is flat, stop and do not run rounds 2–3; the earlier 30-round run
+is the cautionary case.
+
+Two things to do **in parallel**, because they are independent of the loop and target the half of
+the gap the teacher does not carry (R.8.1): **L4's `Φ_risk` potential** and **A7's survival head**.
+And one thing to do **before the next PPO run** rather than this ExIt one: R.0.3's shaping
+re-balance, now that R.1.3 has confirmed it is a defect.
+
+---
+
+## R.9 Pre-launch checklist for the reward-rebalance run (2026-08-18)
+
+Context: R.0.3's re-balance is being implemented (base-diff PBRS joins the holding/material
+anneal, `--no-anneal-base-shaping` reproduces the old arm). That fix is correct and correctly
+plumbed — `annealed_base = base_shaping_anneal * (γΦ′ − Φ)` with one multiplier per episode, so
+the telescope is intact; the knob reaches the parallel workers through
+`rollout_collector.py`; `tests/test_shaping_anneal.py` pins it. What follows is what *else* the
+run needs, ordered by what it costs to skip. **The constraint is that there is no budget for
+small runs**, so everything here is either free, or buys the one run more batches.
+
+### R.9.1 The blast radius of a reward change — one blocker, now fixed
+
+`HeuristicEvaluator` imported `SHAPING_C` and `C_MAT` straight from `rollout_core`, and **five of
+its eight coefficients derived from them** (`_c_base`, `_c_mat`, `RISK_COEFF`, `DUR_COEFF`,
+`ECON_COEFF`). Everything downstream inherits that: `greedy_sim`, `lookahead`,
+`lookahead_critic`, `policy_theta`, `random_eval`, and `PuctBot`'s `_leaf_potential` — which is
+to say **the gauntlet's entire fixed agent field, the measurement of record**, plus the ExIt
+teacher's leaf.
+
+So re-balancing the training reward would have silently re-tuned every baseline it is measured
+against. The yardstick would move with the treatment, in the one place the project has decided
+it must not: every historical gauntlet number is quoted against these bots.
+
+**Fixed 2026-08-18:** `evaluation.py` now defines its own `EVAL_BASE_C = 0.05` /
+`EVAL_MAT_C = 0.015` — the values in force from the project's start through today, so every bot
+is bit-identical to what produced every recorded result — and no longer imports from
+`rollout_core`. `tests/test_evaluation.py::test_evaluator_scales_are_decoupled_from_the_training_reward`
+pins it both ways (the module must not re-acquire the constants, and the values must not drift),
+so this cannot come back as a side effect of touching the reward.
+
+This is the same reasoning the concurrent
+`test_shaping_anneal_scales_only_material_not_base` already applies to `shaping_anneal`: the
+evaluator scores *leaf positions* for search bots and is deliberately not a mirror of the
+training reward. R.9.1 extends that to the two anchor scales. If a *reward-matched* bot is
+wanted later, add it as a θ member (`theta['base']` / `theta['material']` scale exactly these
+two) so the frozen yardstick and the matched variant can both stand in the field.
+
+### R.9.2 The one change that makes the run bigger: cut the finetune search opponents
+
+Finetune is `p_pool 0.5 / p_lookahead_critic 0.3 / p_puct 0.2`. Arithmetic on the last run
+(`logs/ppo_20260817-063713.log`, `rollout=34.1s`, `model_play=185.4s` aggregate over 6 workers,
+`env=10.6s`), at 64 episodes × ~42 opponent plies × 0.1 s/move:
+
+| slice | weight | core-s / batch |
+|---|---|---|
+| `lookahead_critic` | 0.30 | ~81 |
+| `puct` | 0.20 | ~54 |
+| `pool` snapshots | 0.50 | ~1 |
+| main policy + env | — | ~13 |
+
+**Two search opponents consume ~68 % of rollout core time for half the episodes** — and both are
+now *measured to be weaker than the policy they are teaching*: the run's own final line reads
+`wr_lookahead=0.710`, and R.0.1/R.8.1 put `PuctBot` at the same 0.1 s budget at **0.49–0.56**
+against the raw policy. They also both load `data/lookahead_critic/lookahead_critic_v5.pth` —
+`critic_v2`, 2026-08-08, two critic generations stale (R.3, last row).
+
+So this is not B8's throughput argument any more, it is a strength argument: **the compute is
+being spent on opponents that are no stronger than a pool snapshot costing 1/100th as much.**
+Cutting `p_lookahead_critic_finetune 0.3 → 0.10` and `p_puct_finetune 0.2 → 0.0` into `p_pool`
+takes rollout core time from ~196 s to ~55 s per batch, i.e. **roughly 3× the batches in the same
+wall-clock** — 1500 batches in ~3 h instead of ~9 h, or ~4500 batches in the same 9 h.
+
+Keep the *initial*-phase slice as it is (`p_lookahead_critic_initial = 0.30`): at batch 10 the
+policy scored 0.04 against it, so early on it is a genuine teacher. It is only the finetune
+slice, where the policy wins 71 %, that is pure waste. B8 predicted exactly this shape
+("anneal it rather than flat-cut it") and now has the strength half of the argument too.
+
+If some of the freed budget should buy *independence* rather than batches, the only
+policy-independent option that is cheap enough is B1's `--p-random-eval-finetune 0.10` (~18 ms/move
+against the search bots' ~100). Note B8's caveat honestly: `RandomEvalBot` is also weaker than the
+policy, so it buys **state coverage**, not pressure — the θ family's measured contribution is a
+4–5× behaviour spread, not Elo.
+
+### R.9.3 Without this, the run cannot be read
+
+R.8.2 is the direct evidence: the in-run eval reported **0.35** for a checkpoint that measures
+**0.55 ± 0.035** over 200 games. At 20 games `se ≈ 11 pp`, which is a third of the effect being
+looked for. Two fixes, both trivial, and they are the difference between reading an expensive run
+and guessing at it:
+
+1. **`eval_episodes` 20 → 50** (`C20`, on the list since forever, still cosmetic-tier in the
+   table — it is not cosmetic for a single-run project).
+2. **Pin the reference opponent.** `reference_policy_path` defaults to
+   `latest_policy_checkpoint()`, so the yardstick drifts every run and "beats its predecessor"
+   is measured against a moving target in a field with a recorded 0.11 intransitive-triple
+   fraction. Pass `--reference-policy data/warchest_ppo_20260810-0802.pth` explicitly and keep
+   that same path for every arm on this side of the reward boundary.
+
+Also worth having, and nearly free at this point: a **frozen `PuctBot @ 1.0 s`** as a second eval
+opponent (R.1.4). It does not drift, it is measurably stronger than the policy (0.725), and it is
+the only absolute anchor available.
+
+### R.9.4 What belongs in *this* reward edit, because it costs no extra run
+
+**L4's two potentials.** R.8.1 is the argument, and it is a measurement rather than an intuition:
+the search — the strongest thing in the repo — wins by boxing **27 % more** enemy coins while its
+`own_at_risk` is *identical* to the raw policy's. So search does **not** carry prophylaxis, and
+distilling it never will. The reward is the only place "you attack so your unit is not attacked"
+can enter, and the reward is already open on the bench:
+
+- **`Φ_risk = −c · own_at_risk`** — the encoder already computes the scalar (global 208), and
+  `HeuristicEvaluator` already has the term. PBRS, so policy-invariant.
+- **Lock potential** — `w = 1.0` for a base controlled *and* occupied, `0.6` for
+  controlled-and-empty, replacing the flat `base_diff`. Justified by §3.3's 53-steals-from-occupied
+  / 0-from-empty and by `is_valid_claim` making a parked unit an absolute lock. The current
+  potential prices a lock and a walk-in-able base identically, which is not how the game works.
+
+Note what R.0.3's fix does and does not do. Annealing the base term holds the base : material
+ratio flat at **3.3 : 1** for the whole run instead of letting it widen to 33 : 1 — the whole
+material axis of a game goes from ~2 % of the base axis to ~25 %. That is the big correction. But
+`C_MAT` still prices only material *already boxed*; nothing prices material *hanging*, which is
+the two-ply quantity §1's thesis is about. `Φ_risk` is that term.
+
+### R.9.5 Is R.3b (Gumbel AlphaZero) worth doing before the launch? — No, during it
+
+**It is the right next piece of work and it is not on this run's critical path.**
+
+- Gumbel changes `PuctBot`'s search and ExIt's policy target. Neither touches PPO's gradient.
+- The only way it could help *this* run is as a better training opponent — and R.9.2 says the
+  right move for that slice is to **remove** it, because the cost is what is capping the run's
+  size. Improving a 100 ms opponent does not fix a 100 ms opponent.
+- ExIt has to come *after* a PPO run on the re-balanced reward anyway: you distil from a
+  policy/critic trained on the objective you actually want, and every checkpoint on disk is
+  trained on the old one. Running ExIt now would distil the 33 : 1 objective.
+- The PPO run is 3–9 h of wall-clock in which nothing else is happening. That is exactly the
+  window for a moderate, self-contained search change with its own tests.
+
+What Gumbel buys, restated so it is not lost: it makes a **low-simulation** search a valid policy
+improvement operator (completed-Q targets + sequential halving over Gumbel-sampled root actions),
+which is the regime this project is structurally stuck in — 0.86 ms unbatched CPU forwards,
+branching 10.5, ~14–30 expansions at 0.1 s. It also **dissolves** the `--dirichlet-frac`
+question (R.3d) rather than answering it, since Gumbel root sampling replaces Dirichlet noise
+outright. Build it against `preflight`, whose four gates are the acceptance test.
+
+### R.9.6 The list, in order
+
+| # | do | cost | why it is here |
+|---|---|---|---|
+| 1 | ~~decouple `HeuristicEvaluator` from `SHAPING_C`/`C_MAT`~~ | **done** | otherwise the reward change re-tunes every gauntlet baseline and the ExIt teacher's leaf (R.9.1) |
+| 2 | `eval_episodes` 20 → 50; pin `--reference-policy` | trivial | R.8.2 — the current instrument misread a 0.55 as a 0.35 (R.9.3) |
+| 3 | `p_lookahead_critic_finetune` 0.3 → 0.10, `p_puct_finetune` 0.2 → 0.0, into `p_pool` | trivial | ~3× the batches in the same wall-clock, on opponents measured weaker than the policy (R.9.2) |
+| 4 | L4: `Φ_risk` + lock potential, in the same reward edit | low | the only source of prophylaxis; search provably does not supply it (R.9.4) |
+| 5 | copy the newest critic into `data/lookahead_critic/lookahead_critic_v6.pth` | ~0 | the remaining search opponent otherwise runs a 2026-08-08 critic |
+| 6 | raise the verb-entropy floor (`verb_entropy_coeff_final` 0.01 → ~0.015) | trivial | judgement call. `verb_ent` ends at 0.276 of a 2.40 max; a reward change meant to induce new behaviour needs exploration to find it, and the floor was tuned for the old reward. Bundling it does cost attribution — skip it if that matters more |
+| 7 | `--dump-returns-dir` off unless another target A/B is planned | ~0 | 252 shards / 4.34 M samples last time, and the reader was OOM-prone (`decision.md` 2026-08-16) |
+| 8 | R.3b (Gumbel) — **during** the run, not before | mod | R.9.5 |
+
+Standing caveat, unchanged: items 3, 4 and 6 all land on the same side of a reward boundary as
+R.0.3, so `score`, `score_parts`, returns and `critic_mae` are **not** comparable across it.
+Win rate and the gauntlet are. That is what item 2 exists to protect.

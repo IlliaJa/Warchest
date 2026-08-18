@@ -82,17 +82,21 @@ This raises the training bar automatically as the policy matures, without any on
 
 | Parameter | Value | Effect |
 |---|---|---|
-| `n_batches` | 400 | Total batch updates |
+| `n_batches` | 1500 | Total batch updates |
 | `collect_episodes` | 64 | Episodes collected per batch before update |
 | `max_t` | 1000 | Hard cap on steps per episode |
 | `ppo_epochs` | 4 | Inner gradient epochs per batch (KL early stop active) |
 | `ppo_eps` | 0.2 | PPO clip parameter |
 | `KL_TARGET` | 0.015 | Approx-KL threshold for early stopping an epoch |
 | `gamma` | 0.99 | Discount factor |
-| `lam` | 0.95 | GAE trace decay |
-| `lr_actor` / `lr_critic` | 3e-4 | Adam LR, both actor and critic; linearly decayed to `lr_final_frac * init` (`lr_final_frac=0.0` ⇒ decays to 0) over the run |
-| `hidden_dim` (Policy) | 64 | Policy network width |
-| `critic_hidden_dim` (Critic) | 128 | Critic widened alone first — the densifier of the sparse terminal reward (`docs/decision.md`, 2026-07-03) |
+| `--lam` | 0.90 | GAE trace decay. Lowered from 0.97 together with the critic trunk fix — at 0.97 only ~3 % of the discriminative signal came from `V(s_{t+1})`, so a better critic bought PPO nothing (`docs/IDEAS.md` L2) |
+| `lr_actor` / `lr_critic` | 3e-4 | Adam LR, both actor and critic; linearly decayed to `lr_final_frac * init` (`lr_final_frac=0.1`) over the run |
+| `hidden_dim` (Policy) | 128 | Policy network width |
+| `critic_hidden_dim` (Critic) | 192 | Critic widened alone first — the densifier of the sparse terminal reward (`docs/decision.md`, 2026-07-03) |
+| `--policy-arch` | `policy_factored_v2` | Unit-type embedding + FiLM trunk conditioning (`docs/IDEAS.md` A1 + A3). `policy_factored_v1` reproduces the pre-2026-08-16 net as an A/B baseline |
+| `--critic-arch` | `critic_v5` | `critic_v4` + the same unit-type embedding; no FiLM, deliberately (it would leak globals into the board-only auxiliary head). Older archs are selectable to reproduce a baseline; `critic_v1`'s trunk provably dies |
+| `--aux-board-coeff` | 0.1 | Weight of the `critic_v2`+ board-only auxiliary loss — the gradient pressure that keeps the trunk carrying board signal |
+| `--adv-norm` | `per_opponent` | Centre advantages within each opponent group (mean-only, one shared std). Pairs with `critic_v3`+ dropping the opponent one-hot; `global` reproduces pre-2026-08-09 runs |
 | `entropy_coeff` | 0.025 → `entropy_coeff_final` 0.003 | Entropy bonus coefficient, linearly annealed over the run |
 | `SHAPING_C` | 0.05 | Base-diff potential-shaping scale factor (constant, not annealed) |
 | `C_MAT` | 0.015 | Material (boxed-coin) potential-shaping scale factor |

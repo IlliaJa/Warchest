@@ -26,7 +26,7 @@ This doc is organised in four parts:
 | Invalid action attempt | −0.02 |
 | Any completed turn (tempo) | −0.002 |
 
-Constants are defined at the top of `src/services/environment/warchest_env.py`. Raw environment rewards are augmented with potential-based shaping (base-diff **and** material), a holding reward, and per-run **annealing** of the holding + material terms in `src/app/ppo.py` before being stored in the rollout buffer. The tempo cost is charged once per *turn* — equivalently, once per coin spent from hand — not once per action; directional pull toward bases is handled entirely by shaping and the holding reward.
+Constants are defined at the top of `src/services/environment/warchest_env.py`. Raw environment rewards are augmented with potential-based shaping (base-diff **and** material), a holding reward, and per-run **annealing** of all three dense terms in `src/app/ppo.py` before being stored in the rollout buffer. The tempo cost is charged once per *turn* — equivalently, once per coin spent from hand — not once per action; directional pull toward bases is handled entirely by shaping and the holding reward.
 
 > **Updated 2026-08-09 (`docs/IDEAS.md` L8).** Three hygiene changes shipped together. (1) The step penalty moved from "every move-shaped result" to the turn boundary, so a turn that produces several maneuvers pays it once. (2) `ATTACK_REWARD` 0.02 → **0.0**, since material PBRS pays the same box-a-coin event. (3) `holding_reward_rate` re-derived on the measured main-actor turn count instead of the `max_rounds` worst case, ~**4.05×** stronger. All three are reward-scale changes, so `score`, `critic_mae` and returns are **not** comparable across this boundary; win rate and the gauntlet are.
 
@@ -37,11 +37,11 @@ Constants are defined at the top of `src/services/environment/warchest_env.py`. 
 Applied by the training loop, not the environment:
 
 ```python
-shaped_r = r + gamma * phi(s_next) - phi(s)
+shaped_r = r + shaping_anneal * (gamma * phi(s_next) - phi(s))
 phi(s)   = SHAPING_C * (my_bases - opp_bases)    # SHAPING_C = 0.05
 ```
 
-A theoretically clean way to add dense rewards without changing the optimal policy (Ng et al. 1999): the `gamma * phi(s') - phi(s)` terms telescope and nearly cancel over a full trajectory, leaving only boundary terms. Fires a positive pulse (~+0.05) when the agent claims a neutral base and (~+0.10) when stealing an enemy base. Fires a negative pulse when the opponent claims. Advantages are z-scored batch-wide; returns are kept in the original reward scale. `SHAPING_C` is **not** annealed (only the holding + material terms are — see below).
+A theoretically clean way to add dense rewards without changing the optimal policy (Ng et al. 1999): the `gamma * phi(s') - phi(s)` terms telescope and nearly cancel over a full trajectory, leaving only boundary terms. Fires a positive pulse (~+0.05 at `shaping_anneal = 1`) when the agent claims a neutral base and (~+0.10) when stealing an enemy base. Fires a negative pulse when the opponent claims. Advantages are z-scored batch-wide; returns are kept in the original reward scale. `SHAPING_C` rides the same `shaping_anneal` as the holding + material terms (since 2026-08-18 — see below).
 
 ### Material potential-based shaping (coin economy)
 
@@ -70,7 +70,7 @@ Design rationale & caveats:
 
 ### Shaping annealing
 
-The holding reward and the material shaping term are multiplied by `shaping_anneal`, linearly decayed **1.0 → 0.1 over the first half of the run**, then held at the 0.1 floor:
+All three dense terms — the holding reward, the material shaping term and (since 2026-08-18) the base-diff shaping term — are multiplied by `shaping_anneal`, linearly decayed **1.0 → 0.1 over the first half of the run**, then held at the 0.1 floor:
 
 ```python
 half = max(n_batches * 0.5, 1.0)          # tracks n_batches: 200 @400, 250 @500
@@ -78,7 +78,9 @@ anneal_frac = min((batch_num - 1) / half, 1.0)
 shaping_anneal = 1.0 + anneal_frac * (0.1 - 1.0)
 ```
 
-Base-diff PBRS (`SHAPING_C`) is deliberately left constant — it's already policy-invariant (proper PBRS), so it has nothing to anneal away. The holding reward and material term are annealed because dense guidance is most valuable *early* (bootstraps exploration while the critic is weak and entropy is high) and becomes a source of distortion *late*, once the policy is capable enough that the proxy signal and the true win objective can diverge (the measured symptom on `ppo_20260630-060400`: shaped `score` rose +50% over ~500 batches while `wr_greedy` stayed flat — see `docs/history.md`). This mirrors OpenAI Five's `team_spirit` coefficient, annealed 0→1 over training to shift from easy-to-learn selfish rewards toward the true team objective; Warchest anneals the *dense* terms down toward the *terminal* one instead, same idea in reverse direction. Cross-project grounding: this doc's [What is discussed](#4-what-is-discussed) below (*The synthesis for Warchest*). Logged per batch as `shaping_anneal`; the annealed holding/material contributions are logged as `score_holding` / `score_material`.
+> **Base-diff PBRS joined the anneal 2026-08-18 (`IDEAS.md` R.0.3 → R.6 row 6).** It used to be held constant, on the argument that proper PBRS is policy-invariant and so has nothing to anneal away. That argument is about the *optimum*, and R.0.3 measured what it costs before the optimum: on `logs/ppo_20260809-195643.log` at the 0.1 floor, one base of differential paid `SHAPING_C = 0.050` against `C_MAT · anneal = 0.0015` per boxed enemy coin — **33 : 1**, up from 3.3 : 1 at batch 1, so the anneal was itself widening the gap and pricing the entire material axis of a whole game below a third of one base. Meanwhile the realised per-episode payout `γ^T·Φ(s_T) = 0.205` exceeded the realised terminal, `0.125` (that is the mean of ±1 over wins, losses and truncations — not `1`). Annealing `SHAPING_C` with the others (a) holds the base : material ratio flat at 3.3 : 1 for the whole run instead of letting it drift to 33 : 1, and (b) puts the late-run dense payout ~6× *under* the terminal. Scaling a potential is still proper PBRS — `c·(γΦ' − Φ)` telescopes exactly like the potential `c·Φ`, and `c` is constant within an episode (set once per batch) — so nothing leaks across the telescope. `--no-anneal-base-shaping` restores the old arm; it changes the reward, hence the critic's regression target, so `critic_mae` and `score_*` are **not** comparable across arms. Logged per batch as `base_shaping_anneal`. Not yet A/B'd against the old arm.
+
+The holding reward and material term are annealed because dense guidance is most valuable *early* (bootstraps exploration while the critic is weak and entropy is high) and becomes a source of distortion *late*, once the policy is capable enough that the proxy signal and the true win objective can diverge (the measured symptom on `ppo_20260630-060400`: shaped `score` rose +50% over ~500 batches while `wr_greedy` stayed flat — see `docs/history.md`). This mirrors OpenAI Five's `team_spirit` coefficient, annealed 0→1 over training to shift from easy-to-learn selfish rewards toward the true team objective; Warchest anneals the *dense* terms down toward the *terminal* one instead, same idea in reverse direction. Cross-project grounding: this doc's [What is discussed](#4-what-is-discussed) below (*The synthesis for Warchest*). Logged per batch as `shaping_anneal` / `base_shaping_anneal`; the annealed contributions are logged as `score_holding` / `score_material` / `score_shaping`.
 
 ### Per-turn holding reward
 

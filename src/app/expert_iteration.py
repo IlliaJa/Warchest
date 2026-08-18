@@ -41,6 +41,7 @@ import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
+import numpy as np
 import torch
 
 from src.services.expert_iteration import (
@@ -198,11 +199,21 @@ def _run_distill(dataset, policy_path, critic_path, args, *, out_policy, out_cri
     if pmeta['obs_version'] != cmeta['obs_version']:
         raise SystemExit('policy/critic obs_version mismatch (see gen).')
 
-    logger.info('distill: %d samples, %d epochs, minibatch=%d, lr=%.1e',
-                len(dataset), args.epochs, args.minibatch, args.lr)
+    freeze = getattr(args, 'freeze_critic', False)
+    logger.info('distill: %d samples, %d epochs, minibatch=%d, lr=%.1e, critic=%s',
+                len(dataset), args.epochs, args.minibatch, args.lr,
+                'FROZEN (policy-only distillation)' if freeze else 'trained on z')
     before = evaluate_distillation(dataset, policy, critic, device=args.device)
+    if before.get('agreement', 0.0) >= 0.9:
+        logger.warning(
+            'distill: pre-distill policy/search agreement is %.3f (>= 0.90) — the search is '
+            'reproducing the prior it was seeded with, so the distillation target is the policy '
+            'itself and this round cannot teach it anything (independent_opponents.md §1 fact 2; '
+            'the mechanism is IDEAS.md R.0.2). Raise --time-budget and re-run `preflight` before '
+            'spending the compute.', before['agreement'])
     res = distill(dataset, policy, critic, epochs=args.epochs, minibatch_size=args.minibatch,
-                  lr_policy=args.lr, lr_critic=args.lr, device=args.device, val_frac=args.val_frac)
+                  lr_policy=args.lr, lr_critic=args.lr, device=args.device,
+                  val_frac=args.val_frac, train_critic=not freeze)
     after = res['val']
     logger.info('distill: held-out n_val=%d', res['n_val'])
     logger.info('distill: before %s', _fmt(before))
@@ -218,18 +229,196 @@ def _run_distill(dataset, policy_path, critic_path, args, *, out_policy, out_cri
         )
 
     os.makedirs(os.path.dirname(out_policy) or '.', exist_ok=True)
-    os.makedirs(os.path.dirname(out_critic) or '.', exist_ok=True)
     # Distillation fine-tunes the loaded nets in place, so the saved copies are the same
     # architecture they came in as — never the current default.
     save_policy_checkpoint(policy, out_policy, obs_version=pmeta['obs_version'],
                            hidden_dim=pmeta['hidden_dim'], arch=pmeta['arch'])
-    # z-scale critic: return_mean=0 / return_std=1 so PuctBot's denormalisation is
-    # identity and it consumes the outcome-scale value directly (value_mode='outcome').
-    save_critic_checkpoint(critic, out_critic, obs_version=cmeta['obs_version'],
-                           hidden_dim=cmeta['hidden_dim'], arch=cmeta['arch'],
-                           return_mean=0.0, return_std=1.0)
-    logger.info('distill: saved policy=%s critic=%s', out_policy, out_critic)
-    return before, after
+    if freeze:
+        # Nothing to write: the critic is untouched, and re-saving it would be the one place
+        # a scale bug could enter (the z-scale branch below overwrites return_mean/return_std,
+        # which a shaped-return critic must keep). Callers get the original path back.
+        critic_in_force = critic_path
+        logger.info('distill: saved policy=%s; critic frozen at %s', out_policy, critic_path)
+    else:
+        os.makedirs(os.path.dirname(out_critic) or '.', exist_ok=True)
+        # z-scale critic: return_mean=0 / return_std=1 so PuctBot's denormalisation is
+        # identity and it consumes the outcome-scale value directly (value_mode='outcome').
+        save_critic_checkpoint(critic, out_critic, obs_version=cmeta['obs_version'],
+                               hidden_dim=cmeta['hidden_dim'], arch=cmeta['arch'],
+                               return_mean=0.0, return_std=1.0)
+        critic_in_force = out_critic
+        logger.info('distill: saved policy=%s critic=%s', out_policy, out_critic)
+    return before, after, critic_in_force
+
+
+def _check_critic_staleness(critic_path):
+    """Warn when a newer critic exists that this CLI will not pick up.
+
+    `_latest_critic_path` resolves `data/lookahead_critic/lookahead_critic_v{N}.pth`, a
+    hand-maintained directory, while PPO writes `data/warchest_critic_<stamp>.pth`. Those
+    drift: as of 2026-08-16 the newest file here was `v5` (`critic_v2`, 2026-08-08) while
+    PPO had since shipped `critic_v4` (2026-08-10), so every gauntlet and ExIt search for
+    a week ran a critic one generation behind without saying so (IDEAS.md R.3, last row).
+    A silent stale leaf is the single easiest way to spend a training run measuring the
+    wrong thing, so it is checked out loud rather than left to the reader.
+    """
+    newest_ppo = sorted(glob.glob('data/warchest_critic_*.pth'), key=os.path.getmtime)
+    if not newest_ppo or critic_path is None:
+        return
+    newest = newest_ppo[-1]
+    if os.path.getmtime(newest) > os.path.getmtime(critic_path):
+        logger.warning(
+            'STALE CRITIC: using %s (mtime %s) but %s is newer (mtime %s). '
+            '`--critic` resolves data/lookahead_critic/, which PPO does not write. '
+            'Either pass --critic %s explicitly, or copy it in as the next '
+            'lookahead_critic_v{N}.pth.',
+            os.path.basename(critic_path),
+            time.strftime('%Y-%m-%d', time.localtime(os.path.getmtime(critic_path))),
+            os.path.basename(newest),
+            time.strftime('%Y-%m-%d', time.localtime(os.path.getmtime(newest))),
+            newest)
+
+
+def cmd_preflight(args):
+    """Check every gate that decides whether an ExIt run can work, before paying for one.
+
+    Four gates, cheapest first. Each one has cost a run at least once in this project's
+    history, and each is a single number:
+
+      1. **Staleness** — is the critic in force actually the newest one (R.3, last row)?
+      2. **Teacher budget** — how many node expansions does `--time-budget` really buy?
+         Below ~50 on a mean-10.5 branching tree the visit counts are the prior plus noise
+         and the distillation target is the student (IDEAS.md R.0.2).
+      3. **Teacher strength** — does the search actually beat the raw policy it is seeded
+         with, head to head? This is `next_iteration.md` §5 row 9. A teacher under ~0.60
+         is not worth distilling, and this is the gate that was never checked before the
+         30-round run that got monotonically weaker.
+      4. **Target sharpness** — on a handful of real self-play games, is the visit-count
+         entropy *below* the policy's own? If it is above, distilling flattens the policy
+         (the recorded `--dirichlet-frac 0.25` failure). This pair is coupled to the
+         budget, so it must be re-read whenever either moves.
+    """
+    from src.services.bots.puct_bot import PuctBot
+    from src.services.gauntlet import build_agent
+    from src.services.gauntlet_parallel import round_robin_parallel
+    from src.services.environment.warchest_env import WarChestEnv
+
+    policy_path = args.policy or _latest_policy_path()
+    critic_path = args.critic or _latest_critic_path()
+    if policy_path is None or critic_path is None:
+        raise SystemExit('preflight needs a policy and a critic checkpoint (none found).')
+    pmeta = load_policy_checkpoint(policy_path, map_location='cpu')
+    cmeta = load_critic_checkpoint(critic_path, map_location='cpu')
+    verdicts = []
+
+    logger.info('--- gate 1: checkpoints ---')
+    logger.info('policy = %s (arch %s, obs v%d, hidden %d)', policy_path,
+                pmeta['arch'], pmeta['obs_version'], pmeta['hidden_dim'])
+    logger.info('critic = %s (arch %s, obs v%d, hidden %d)', critic_path,
+                cmeta['arch'], cmeta['obs_version'], cmeta['hidden_dim'])
+    _check_critic_staleness(critic_path)
+
+    logger.info('--- gate 2: what --time-budget %.2fs actually buys ---', args.time_budget)
+    bot = PuctBot(policy_path=policy_path, critic_path=critic_path, c_puct=args.c_puct,
+                  max_branching=args.max_branching, time_budget=args.time_budget,
+                  device='cpu', stats_log_every=0)
+    env = WarChestEnv(save_game_history=False)
+    np.random.seed(args.seed or 0)
+    env.reset()
+    expansions, depths, legal = [], [], []
+    for _ in range(args.preflight_moves):
+        legal.append(len(env.get_possible_actions()))
+        action = bot.act(env)
+        st = bot.last_stats or {}
+        expansions.append(st.get('nodes_visited', 0))
+        depths.append(st.get('depth_reached', 0))
+        _, _, term, trunc, info = env.step(action)
+        if not info['action'].is_valid:
+            _, _, term, trunc, info = env.make_random_step()
+        if term or trunc:
+            break
+    mean_exp = float(np.mean(expansions)) if expansions else 0.0
+    logger.info('expansions/move %.1f (min %d max %d) | max depth %.1f | legal at root %.1f',
+                mean_exp, min(expansions or [0]), max(expansions or [0]),
+                float(np.mean(depths or [0])), float(np.mean(legal or [0])))
+    if mean_exp < 50:
+        logger.warning(
+            'THIN SEARCH: %.1f expansions/move against ~%.1f legal actions at the root. The '
+            'root expansion alone consumes one per child, so the visit counts carry roughly '
+            'one bit per child and the target is the prior. Raise --time-budget.',
+            mean_exp, float(np.mean(legal or [0])))
+        verdicts.append(('search depth', 'FAIL', f'{mean_exp:.0f} expansions/move, want >= 50'))
+    else:
+        verdicts.append(('search depth', 'ok', f'{mean_exp:.0f} expansions/move'))
+
+    logger.info('--- gate 3: teacher vs student, %d games ---', args.preflight_games)
+    specs = [
+        {'kind': 'policy', 'path': policy_path},
+        {'kind': 'puct', 'name': 'puct', 'kwargs': {
+            'policy_path': policy_path, 'critic_path': critic_path,
+            'c_puct': args.c_puct, 'max_branching': args.max_branching,
+            'time_budget': args.time_budget, 'stats_log_every': 0,
+        }},
+    ]
+    device = torch.device('cpu')
+    names = [build_agent(sp, device=device).name for sp in specs]
+    out = round_robin_parallel(specs, names, k_games=args.preflight_games,
+                               seed=args.seed or 0, n_workers=max(1, args.n_workers))
+    _log_gauntlet_report(out)
+    teacher_wr = float(out['win_rate'][1, 0])
+    se = (teacher_wr * (1 - teacher_wr) / max(args.preflight_games, 1)) ** 0.5
+    logger.info('teacher WR vs student = %.3f +/- %.3f', teacher_wr, se)
+    if teacher_wr < 0.60:
+        logger.warning(
+            'WEAK TEACHER: the search wins %.3f against the policy that supplies its own '
+            'priors. Distilling it can only teach what it already knows. Fix gate 2 first.',
+            teacher_wr)
+        verdicts.append(('teacher strength', 'FAIL', f'{teacher_wr:.3f}, want >= 0.60'))
+    else:
+        verdicts.append(('teacher strength', 'ok', f'{teacher_wr:.3f} +/- {se:.3f}'))
+
+    logger.info('--- gate 4: is the target sharper than the policy? (%d self-play games) ---',
+                args.preflight_selfplay_games)
+    encoder = get_encoder(pmeta['obs_version'])
+    sp_bot = _build_bot(policy_path, critic_path, args, value_mode=args.value_mode)
+    ds, game_stats = generate_selfplay(
+        sp_bot, args.preflight_selfplay_games, encoder=encoder,
+        temperature=args.temperature, temp_moves=args.temp_moves, seed=args.seed,
+        desc='preflight self-play')
+    gs = summarize_game_stats(game_stats)
+    policy, _ = _load_policy(policy_path, 'cpu')
+    critic, _ = _load_critic(critic_path, 'cpu')
+    ev = evaluate_distillation(ds, policy, critic, device='cpu')
+    logger.info('self-play: %d samples, agreement %.3f, mean_visit_entropy %.3f nats',
+                gs['n_samples'], gs['mean_agreement'], gs['mean_visit_entropy'])
+    logger.info('pre-distill %s', _fmt(ev))
+    if ev['visit_entropy'] > ev['policy_entropy']:
+        logger.warning(
+            'FLATTENING TARGET: visit_entropy %.3f > policy_entropy %.3f — distilling this '
+            'target makes the policy less decisive, the opposite of the intended effect. '
+            'Lower --dirichlet-frac or raise --time-budget.',
+            ev['visit_entropy'], ev['policy_entropy'])
+        verdicts.append(('target sharpness', 'FAIL',
+                         f"visit {ev['visit_entropy']:.3f} > policy {ev['policy_entropy']:.3f}"))
+    else:
+        verdicts.append(('target sharpness', 'ok',
+                         f"visit {ev['visit_entropy']:.3f} <= policy {ev['policy_entropy']:.3f}"))
+    if ev['agreement'] >= 0.9:
+        verdicts.append(('teacher divergence', 'FAIL',
+                         f"agreement {ev['agreement']:.3f}, want < 0.90"))
+    else:
+        verdicts.append(('teacher divergence', 'ok', f"agreement {ev['agreement']:.3f}"))
+
+    logger.info('=== preflight verdict ===')
+    for gate, status, detail in verdicts:
+        logger.info('  [%s] %-20s %s', status.upper(), gate, detail)
+    failed = [g for g, st, _ in verdicts if st == 'FAIL']
+    if failed:
+        logger.warning('NOT ready to run: %s. Fix these before spending a loop.',
+                       ', '.join(failed))
+    else:
+        logger.info('All gates pass. A `loop` run at these settings is justified.')
+    return verdicts
 
 
 def _fmt(d):
@@ -336,8 +525,9 @@ def cmd_loop(args):
                          collector=collector, desc=f'round {r + 1}/{args.rounds} self-play')
             out_policy = os.path.join(EXIT_DIR, f'round{r}_policy.pth')
             out_critic = os.path.join(EXIT_DIR, f'round{r}_critic.pth')
-            before, after = _run_distill(ds, cur_policy, cur_critic, args,
-                                         out_policy=out_policy, out_critic=out_critic)
+            before, after, critic_in_force = _run_distill(
+                ds, cur_policy, cur_critic, args,
+                out_policy=out_policy, out_critic=out_critic)
 
             field_specs.append({'kind': 'policy', 'path': out_policy})
             if not args.skip_gauntlet:
@@ -349,13 +539,17 @@ def cmd_loop(args):
                 before.get('agreement', 0.0), after.get('agreement', 0.0),
                 before.get('mse', 0.0), after.get('mse', 0.0),
             )
-            # From here on the critic is z-scale: pair it only with outcome-mode search.
-            cur_policy, cur_critic, cur_mode = out_policy, out_critic, 'outcome'
+            # With --freeze-critic the critic never changes scale, so the search stays in
+            # the 'shaped' mode that produced the only ExIt round that helped. Otherwise the
+            # critic is now z-scale from this round on and must be paired with outcome mode.
+            cur_policy = out_policy
+            cur_critic = critic_in_force
+            cur_mode = cur_mode if args.freeze_critic else 'outcome'
     finally:
         if collector is not None:
             collector.shutdown()
-    logger.info('ExIt loop finished. Latest nets: policy=%s critic=%s (value_mode=outcome).',
-                cur_policy, cur_critic)
+    logger.info('ExIt loop finished. Latest nets: policy=%s critic=%s (value_mode=%s).',
+                cur_policy, cur_critic, cur_mode)
 
 
 # --------------------------------------------------------------------------- #
@@ -371,23 +565,39 @@ def _add_common(p):
                         'the post-round gauntlet check in `loop`. Default: min(cpu_count, 8).')
     # search knobs (gen)
     p.add_argument('--games', type=int, default=200, help='Self-play games per generation.')
-    p.add_argument('--time-budget', type=float, default=0.1, help='PuctBot per-move search budget (s).')
+    p.add_argument('--time-budget', type=float, default=1.0,
+                   help='PuctBot per-move search budget (s). Raised 0.1 -> 1.0 2026-08-16: at '
+                        '0.1 s the search performs ~14-30 node expansions on a tree whose mean '
+                        'branching is 10.5, so the root alone eats 8 of them and the visit '
+                        'counts are the policy prior plus about one bit per child (IDEAS.md '
+                        'R.0.2). That is the arithmetic behind the recorded 0.94-0.95 '
+                        'teacher/student agreement — not a self-play subtlety. 1.0 s buys ~97 '
+                        'expansions and measures 0.74 against the raw policy vs 0.66 at 0.1 s '
+                        '(R.0.1). Generation is offline, so this is the cheap axis; run '
+                        '`preflight` if you change it.')
     p.add_argument('--c-puct', type=float, default=1.5)
     p.add_argument('--max-branching', type=int, default=8)
     p.add_argument('--dirichlet-alpha', type=float, default=0.3,
                    help='Root Dirichlet noise for self-play exploration (0 = off).')
     p.add_argument('--dirichlet-frac', type=float, default=0.03,
                    help="Root noise mixing fraction. 0.25 (AlphaZero's own default, this "
-                        "CLI's old default) measured mean_visit_entropy=0.87 nats at this "
-                        "search's ~100-300 sims/move — nearly double the pre-distill "
+                        "CLI's old default) measured mean_visit_entropy=0.87 nats at the "
+                        "0.1 s budget then in force — which is ~14-30 expansions, not the "
+                        "'100-300 sims/move' this help used to claim (IDEAS.md R.0.2) — "
+                        "nearly double the pre-distill "
                         "policy's own entropy (~0.6), so distillation flattened the policy "
                         "every round instead of sharpening it (see evaluate_distillation's "
                         "docstring / docs/bots.md's ExIt section). AlphaZero's ~800 sims/move "
-                        "lets Q signal outcompete a 25%-noisy prior; at our budget it can't. "
+                        "lets Q signal outcompete a 25%%-noisy prior; at our budget it can't. "
                         "0.03 measured 0.586 nats (essentially matching frac=0, which measured "
                         "0.508) — keeps a little self-play move diversity without recreating "
                         "the collapse. Lower only if you still see the visit_entropy-above-"
-                        "policy_entropy warning after a round.")
+                        "policy_entropy warning after a round. NOTE the coupling: that "
+                        "measurement was taken at --time-budget 0.1. Noise fraction and search "
+                        "budget are not independent — 0.25 is affordable exactly when Q has "
+                        "enough visits to outcompete a noisy prior, so re-test 0.25 at the new "
+                        "1.0 s default (via `preflight`, which reports the entropy pair before "
+                        "a full generation) rather than assuming either value transfers.")
     p.add_argument('--temperature', type=float, default=1.0, help='Visit-count sampling temperature.')
     p.add_argument('--temp-moves', type=int, default=12, help='Opening plies sampled before going greedy.')
     p.add_argument('--seed', type=int, default=None)
@@ -396,7 +606,16 @@ def _add_common(p):
     p.add_argument('--minibatch', type=int, default=256)
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--val-frac', type=float, default=0.1)
-
+    p.add_argument('--freeze-critic', action='store_true',
+                   help="Distil the POLICY only; leave the critic bit-identical and keep the "
+                        "search in value_mode='shaped' for every round. This is the "
+                        "configuration the record argues for: the only ExIt round that made "
+                        "the policy stronger was round 0 — the one round still running the PPO "
+                        "shaped-return critic (agreement 0.77, BT 1089, best of 30) — and every "
+                        "round on the self-distilled z-critic got monotonically weaker "
+                        "(independent_opponents.md §1). next_iteration.md row 2b then measured "
+                        "`z` as the worse target independently. Freezing leaves the loop exactly "
+                        "one moving part, so a negative result is attributable.")
 
 def main():
     parser = argparse.ArgumentParser(description='Warchest expert iteration (ExIt).')
@@ -425,6 +644,23 @@ def main():
     lp.add_argument('--skip-gauntlet', action='store_true',
                     help='Skip the post-round gauntlet check (faster iteration).')
     lp.set_defaults(func=cmd_loop)
+
+    pf = sub.add_parser('preflight',
+                        help='Check the four gates that decide whether an ExIt run can work, '
+                             'before paying for one (see cmd_preflight).')
+    _add_common(pf)
+    pf.add_argument('--value-mode', choices=['shaped', 'outcome'], default='shaped',
+                    help='Search mode to check; match what the run will use.')
+    pf.add_argument('--preflight-moves', type=int, default=12,
+                    help='Decisions to measure expansions/move over (gate 2). Run this on an '
+                         'otherwise idle box: the count is time-budgeted, so CPU contention '
+                         'deflates it (measured 30/move idle, 14/move under 12 busy workers, '
+                         '2/move under a loaded box at the same 0.1 s budget).')
+    pf.add_argument('--preflight-games', type=int, default=60,
+                    help='Teacher-vs-student games (gate 3). se(WR) ~ 6 pp at 60.')
+    pf.add_argument('--preflight-selfplay-games', type=int, default=6,
+                    help='Self-play games for the entropy/agreement read (gate 4).')
+    pf.set_defaults(func=cmd_preflight)
 
     args = parser.parse_args()
     run_id = time.strftime('%Y%m%d-%H%M%S')

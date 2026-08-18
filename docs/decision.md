@@ -157,3 +157,124 @@ Full comparative analysis: `docs/rewards.md` § *What is discussed*.
 
 ---
 
+## 2026-08-16 — `IDEAS.md` A6 (two value heads) is DEFERRED; ship two Platt floats instead
+
+**Decision.** Do **not** build A6's second value head. Instead save a 2-parameter
+Platt fit (`a`, `b` such that `sigmoid(a*v + b)` is a win probability) alongside the
+existing `return_mean`/`return_std` in `save_critic_checkpoint`, let the search bots
+read that, and delete `LookaheadCriticBot._calibrate_value_scale`. A6 stays on the
+list but behind a much higher bar than it had, for the reasons below.
+
+**What A6 claimed.** Two findings pointed opposite ways: §3.3b (a shaped-return
+target ranks siblings ~2× better than `z`) and §3.5 (the critic's raw output is a
+z-score of a shaped return and is therefore "meaningless to every search bot", which
+is why the moment-matching calibration hack exists). A6 proposed resolving this with
+two heads on one trunk — `V_shaped` for GAE, `V_win` for search — plus a
+categorical/HL-Gauss loss.
+
+**Why it is deferred — the measurement.** Two gates were built and run.
+
+*Gate 1, row 2b — the premise (`src/app/eval_critic_target_ab.py`, new).* §3.3b's ~2×
+was measured at `hidden_dim` 192 vs 96 on different data budgets, and the document
+said so. At matched arch, matched `hidden_dim=96`, matched 120 k samples and matched
+seed, scored on `data/la16_labels.pt`:
+
+| arm | target | corr | spearman | same-verb acc |
+|---|---|---|---|---|
+| globals (control) | `z` | 0.101 | 0.140 | 46.8 % |
+| globals (control) | shaped return | 0.206 | 0.181 | 48.0 % |
+| board | `z` | 0.142 | 0.157 | 52.8 % |
+| board | shaped return | 0.220 | 0.210 | 56.1 % |
+
+The gap survives in **direction** but not in **size**: the spearman ratio is ~1.3×,
+not ~2×. And the board-blind `globals` control improves almost as much (1.29×) as
+`board` (1.33×), so most of the pooled effect is "shaped returns are a less noisy
+target for everyone", not "the board ranks better under them". The board-specific
+part is real but modest — on the isolating same-verb bucket `board` gains +3.3 pp
+against the control's +1.2 pp. Note also that this confirms a decision already in
+production rather than opening a new one: `ppo.py::_update_critic` already regresses
+on `batch['returns']`, not on `z`. What it actually re-scopes is the claim about
+**ExIt**, which does train on `z`.
+
+*Gate 2 — the A6 decision itself (`src/app/eval_value_calibration.py`, new).* The
+naive form of this test is rigged: a shaped return scored against `z ∈ {0,1}` has a
+terrible Brier score by construction, whatever it knows, so "a z-head beats the raw
+critic" proves nothing. The decomposition that does decide it is **AUC, which no
+monotone rescaling can change**. Three arms are monotone maps of the *same* critic
+scalar and therefore share one AUC by construction — `as_is`, `platt`, and
+`isotonic` (PAV, the ceiling on *every possible* post-hoc recalibration). Only
+`zhead` — A6-lite, an MLP on the frozen critic trunk + globals + privileged, trained
+on `z` — reads the trunk, so it is the only arm whose AUC can move. Held-out 40 k
+samples, split by round, critic `warchest_critic_20260810-0802.pth` (`critic_v4`):
+
+| arm | brier | logloss | ECE | AUC | what it is |
+|---|---|---|---|---|---|
+| `as_is` | 0.2041 | 0.6102 | 0.1179 | 0.7861 | shipped scale, read as a probability |
+| `platt` | 0.1897 | 0.5588 | 0.0313 | 0.7861 | 2 floats in the checkpoint |
+| `isotonic` | 0.1883 | 0.5540 | **0.0180** | 0.7859 | best possible rescaling of that scalar |
+| `zhead` | 0.1865 | 0.5489 | 0.0364 | **0.7940** | A6-lite: new head on the frozen trunk |
+
+Three readings, and the third is the one that settles it:
+
+- **Calibration was genuinely broken, and is cheaply fixable.** ECE 0.1179 → 0.0313
+  from two floats. Of the total achievable Brier gain (`as_is` → `zhead`, −0.0184),
+  Platt captures 78 % and isotonic 86 %.
+- **Discrimination barely moves.** `zhead` buys +0.0081 AUC (+3.5 se — detectable
+  only because n = 40 k). The figure is a real ceiling and not undertraining: three
+  configs were run (lr 3e-4/4 epochs, lr 1e-4/8 epochs at hidden 128 and 256) and
+  AUC saturates at 0.7940 in the latter two.
+- **A6 loses at its own stated goal.** Its purpose was "search gets a *calibrated*
+  win probability". The `zhead` is **worse calibrated** than simply rescaling the
+  existing scalar — ECE 0.0364 (0.0518 at hidden 128) against isotonic's 0.0180. It
+  wins only on ranking, by a hair. So the two-float fix achieves A6's objective
+  *better* than A6's own mechanism does.
+
+*The consequence check (`eval_value_calibration.py puct`).* A bad probability only
+matters if it changes a move. `PuctBot._select` sums `sign*Q` with
+`c_puct*P*sqrt(ΣN)/(1+N)`, and `c_puct` is tuned on AlphaZero's assumption that Q is
+a win probability in [−1, 1]. Measured: Q's p5..p95 span is 1.74 and Q-spread /
+typical-U = **1.27**. Q and exploration are commensurate — the shaped-return scale
+landed near [−1, 1] by accident. So the "the hack distorts search" half of A6's
+argument is not supported either.
+
+**Where AlphaZero actually sits in this.** Worth recording because it is easy to cite
+backwards: vanilla AlphaZero does not solve this problem, it *never has it*. With no
+proxy reward, `z` is simultaneously the GAE-free training target, the MCTS backup
+value and the PUCT input — one object, one scale. A6-shaped tension is a consequence
+of Warchest's own choice to use shaped rewards, and the closer precedents are MuZero
+(value target is an n-step bootstrapped return, i.e. the same move §3.3b describes,
+made once intermediate rewards exist) and **KataGo**, which is the real A6: shared
+trunk, separate `winrate` / `score margin` / `ownership` heads, kept separate
+precisely because each target is best at a different job. If A6 is ever revived it
+should be built KataGo-style **together with A7** (auxiliary heads) as one
+"add structure to the value trunk" change, not as a standalone arch.
+
+**The bounded blind spot, stated because it is the one thing that could overturn
+this.** Gate 2's `zhead` reads a **frozen** trunk. It therefore measures "what is
+still recoverable from the existing representation", not "what a jointly-trained
+two-head critic could reach", where the trunk could learn features serving both
+targets. That is a real limitation. But the burden of proof has moved: A6 now has to
+argue the joint training buys something, and that costs a full PPO run rather than
+40 seconds.
+
+**Also fixed along the way.** `eval_board_value.load_exit_dataset` concatenated every
+training shard *before* subsampling to `max_samples`. On `data/exit` (30 shards) that
+was ~5 GB and went unnoticed; on `data/ppo_returns` (252 shards, 4.34 M samples) it
+tries to materialise 45+ GB and gets OOM-killed. It now counts each shard cheaply
+(reading only the small `z` array), picks the global sample indices first, and loads
+only the selected rows. Same subsample for a given seed; peak RSS on the default
+`--max-samples 120000` fell to 3.9 GB. `eval_board_value.py fit` inherits the fix.
+
+**Status of the two gates.** Both are reproducible:
+
+```bash
+python src/app/eval_critic_target_ab.py \
+    --shaped-data 'data/ppo_returns/round*.npz' --labels data/la16_labels.pt
+python src/app/eval_value_calibration.py calib \
+    --critic data/warchest_critic_20260810-0802.pth
+python src/app/eval_value_calibration.py puct \
+    --critic data/warchest_critic_20260810-0802.pth
+```
+
+---
+

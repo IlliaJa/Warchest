@@ -33,12 +33,18 @@ from src.utils.elo import EloTracker
 
 # SHAPING_C / C_MAT / OPP_TYPE_IDX are defined in rollout_core (they belong to the per-step
 # reward that lives there) and re-imported above; kept referenceable from this module.
-# The holding reward and the material PBRS term are linearly annealed from
-# SHAPING_ANNEAL_INIT down to SHAPING_ANNEAL_FINAL over the first
+# The holding reward, the material PBRS term and (since 2026-08-18) the base-diff PBRS term
+# are linearly annealed from SHAPING_ANNEAL_INIT down to SHAPING_ANNEAL_FINAL over the first
 # SHAPING_ANNEAL_HALF_FRAC of the run, then held at the floor. This keeps the dense
 # guidance early (weak critic, high entropy) and hands the final policy back toward
 # the true terminal objective — the over-shaping antidote (see docs/decision.md,
-# 2026-07-03). Base-diff PBRS (SHAPING_C) is intentionally left constant.
+# 2026-07-03).
+# Base-diff PBRS (SHAPING_C) used to be excluded from that anneal, which docs/IDEAS.md R.0.3
+# measured as the failure: at the 0.1 floor one base paid 0.050 against 0.0015 per boxed coin
+# (33 : 1, up from 3.3 : 1 at batch 1 — the anneal itself was widening the gap), and the
+# realised per-episode base payout (0.205) exceeded the realised terminal (0.125). Annealing
+# it with the others holds the base : material ratio flat for the whole run and puts the dense
+# payout ~6x under the terminal late on. --no-anneal-base-shaping restores the old arm.
 SHAPING_ANNEAL_INIT = 1.0
 SHAPING_ANNEAL_FINAL = 0.1
 SHAPING_ANNEAL_HALF_FRAC = 0.5
@@ -196,6 +202,9 @@ class PPOTrainer:
         self._holding_reward_rate = hp['holding_reward_rate']
         # anneal multiplier applied to holding + material shaping; set per batch.
         self._shaping_anneal = SHAPING_ANNEAL_INIT
+        # Whether the base-diff PBRS term rides the same anneal (docs/IDEAS.md R.0.3) or
+        # stays at full weight, which is the pre-2026-08-18 baseline arm.
+        self._anneal_base_shaping = hp.get('anneal_base_shaping', True)
         self._minibatch_size = hp['minibatch_size']
         # Parallel rollout collection (docs/parallel_rollouts.md). n_workers<=1 => in-process
         # path. Capped at collect_episodes so every worker gets >=1 episode.
@@ -370,6 +379,14 @@ class PPOTrainer:
         anneal_frac = min((batch_num - 1) / half, 1.0)
         return SHAPING_ANNEAL_INIT + anneal_frac * (SHAPING_ANNEAL_FINAL - SHAPING_ANNEAL_INIT)
 
+    def _base_shaping_anneal(self, anneal: float) -> float:
+        """Multiplier for the base-diff PBRS term given this batch's `anneal`.
+
+        Identical to the holding/material multiplier by default; pinned at 1.0 for the
+        --no-anneal-base-shaping baseline arm.
+        """
+        return anneal if self._anneal_base_shaping else 1.0
+
     def train(self):
         overlap = self._n_workers > 1 and self._overlap
         if overlap:
@@ -469,10 +486,12 @@ class PPOTrainer:
     def _submit_parallel(self, batch_num: int):
         """Broadcast weights + hand out episodes for `batch_num` to the worker pool (async)."""
         self._lazy_init_collector()
+        anneal = self._compute_shaping_anneal(batch_num)
         self._collector.submit(
             self._policy, self._pool, self._collect_episodes,
             gamma=self._gamma,
-            shaping_anneal=self._compute_shaping_anneal(batch_num),
+            shaping_anneal=anneal,
+            base_shaping_anneal=self._base_shaping_anneal(anneal),
             holding_reward_rate=self._holding_reward_rate,
             max_t=self._max_t,
         )
@@ -528,6 +547,7 @@ class PPOTrainer:
             self._env, self._policy, opp, main_pid, opp_type,
             gamma=self._gamma,
             shaping_anneal=self._shaping_anneal,
+            base_shaping_anneal=self._base_shaping_anneal(self._shaping_anneal),
             holding_reward_rate=self._holding_reward_rate,
             max_t=self._max_t,
             collect_dense=self._dense_critic,
@@ -1095,7 +1115,8 @@ class PPOTrainer:
             f'batch={batch_num} score_parts (per-ep mean): '
             f'attack={r_attack:.3f} shaping={r_shaping:.3f} holding={r_holding:.3f} '
             f'material={r_material:.3f} terminal={r_terminal:.3f} other={r_other:.3f} '
-            f'tempo={r_tempo:.3f} anneal={self._shaping_anneal:.3f}'
+            f'tempo={r_tempo:.3f} anneal={self._shaping_anneal:.3f} '
+            f'base_anneal={self._base_shaping_anneal(self._shaping_anneal):.3f}'
         )
         logger.info(
             f'batch={batch_num} bolster_per_ep={bolster_per_ep:.3f} '
@@ -1125,6 +1146,12 @@ class PPOTrainer:
                 # alive (docs/next_iteration.md §3.4). A conv at 0.0 means a board-blind
                 # critic — watch these, not just the loss curves.
                 **{k: v for k, v in s.items() if k.startswith('critic_trunk_alive')},
+                # `out_std` too, and it is the one that actually matters from critic_v2 on:
+                # GroupNorm makes the alive fraction useless as a guard (a collapsed v2+
+                # trunk reads 1.0 alive while carrying no information), so a run watching
+                # only the alive curves is blind to exactly the failure they were added for.
+                **({'critic_trunk_out_std': s['critic_trunk_out_std']}
+                   if 'critic_trunk_out_std' in s else {}),
                 'critic_board_aux': s['avg_critic_board_aux'],
                 'advantage_std': self._buffer.raw_adv_std,
                 # How much of the raw advantage was opponent identity rather than action
@@ -1146,6 +1173,7 @@ class PPOTrainer:
                 'score_other': r_other,
                 'score_tempo': r_tempo,
                 'shaping_anneal': self._shaping_anneal,
+                'base_shaping_anneal': self._base_shaping_anneal(self._shaping_anneal),
                 'bolster_per_ep': bolster_per_ep,
                 'bolster_fully_available_per_ep': bolster_fully_available_per_ep,
                 **({'aux_critic_loss': s['avg_aux_critic'], 'n_aux_samples': s['n_aux_samples']}
@@ -1201,6 +1229,15 @@ if __name__ == '__main__':
              'against a ~42-decision episode. Pass --lam 0.97 for the pre-2026-08-09 baseline '
              'arm. NOTE: lam also changes the critic\'s regression target, so critic_mae is '
              'NOT comparable across lam arms.')
+    parser.add_argument(
+        '--no-anneal-base-shaping', action='store_true',
+        help='Keep the base-differential PBRS term (SHAPING_C) at full weight for the whole '
+             'run instead of annealing it with holding + material. This is the pre-2026-08-18 '
+             'behaviour and the arm docs/IDEAS.md R.0.3 measured: at the anneal floor it prices '
+             'one base at 33 boxed coins and pays more per episode (0.205) than the win/loss '
+             'terminal does (0.125). Pass it only to reproduce a baseline. NOTE: this changes '
+             "the reward, hence the critic's regression target — critic_mae and score_* are NOT "
+             'comparable across arms.')
     parser.add_argument(
         '--adv-norm', choices=('per_opponent', 'global'), default='per_opponent',
         help="How advantages are normalised. 'per_opponent' (default) subtracts each "
@@ -1279,6 +1316,9 @@ if __name__ == '__main__':
         # delayed-payoff actions (bolster -> durable stack -> later trade/base) without
         # touching the reward. Reward-neutral, so A/B against 0.95 in isolation.
         'lam': cli_args.lam,
+        # Does the base-diff PBRS term ride the holding/material anneal (docs/IDEAS.md R.0.3)?
+        # False reproduces the pre-2026-08-18 reward.
+        'anneal_base_shaping': not cli_args.no_anneal_base_shaping,
         'ppo_epochs': 4,
         'ppo_eps': 0.2,
         'entropy_coeff': 0.025,
@@ -1422,6 +1462,8 @@ if __name__ == '__main__':
                 'learning_rate': hp['lr_actor'],
                 'gamma': hp['gamma'],
                 'lam': hp['lam'],
+                # Reward-changing, so runs on either side of it are not directly comparable.
+                'anneal_base_shaping': hp['anneal_base_shaping'],
                 # Which checkpoint `score_vs_reference_eval` is scored against — the metric
                 # is meaningless when comparing two runs that used different baselines.
                 'reference_policy': hp['reference_policy_path'],

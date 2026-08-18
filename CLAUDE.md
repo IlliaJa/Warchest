@@ -53,6 +53,10 @@ src/
                         bot (cheat vs blind, paired arms) — docs/search_under_uncertainty.md §8
     eval_privileged_ablation.py  is the Critic actually reading its privileged features,
                         and is its spatial trunk alive at all — §8.2
+    eval_a1_a3.py   did the A1 embedding / A3 FiLM pair change anything — FiLM
+                        activity + embedding drift (`weights`), the hand-re-ranks-the-
+                        board test with its provable v1 zero control (`hand`), and a
+                        mirrored forced-composition head-to-head (`comps`)
     eval_theta_family.py  does the B1 sampled-θ evaluator family actually produce
                         different bots — verb-profile spread vs a re-seeded control,
                         plus --sweep KEY to move one coefficient at a time

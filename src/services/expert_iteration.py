@@ -328,8 +328,9 @@ def _pool_onehot():
 
 
 def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=3e-4,
-            lr_critic=3e-4, grad_clip=1.0, device='cpu', val_frac=0.1, log_every=1):
-    """Distil `policy` (CE→visits) and `critic` (MSE→z) on `dataset`, in place.
+            lr_critic=3e-4, grad_clip=1.0, device='cpu', val_frac=0.1, log_every=1,
+            train_critic=True):
+    """Distil `policy` (CE→visits) and, unless `train_critic=False`, `critic` (MSE→z).
 
     Two independent Adam passes (like PPO's separate actor/critic optimisers). The
     policy CE is `-(visit_target * joint_log_probs).sum(1).mean()` over the full action
@@ -337,6 +338,14 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
     Returns per-epoch train stats plus a final held-out `(ce, mse, agreement)` from a
     `val_frac` tail split, so a caller can confirm both losses fell and the policy's
     argmax move now agrees more with the search's.
+
+    `train_critic=False` leaves the critic bit-identical and distils the policy only.
+    That is not a convenience switch — it is the configuration the record argues for
+    (`IDEAS.md` R.3, `independent_opponents.md` §1 fact 2): ExIt's *only* round that made
+    the policy stronger was round 0, the one round that still used the PPO shaped-return
+    critic; every round that ran on the self-distilled `z`-critic got weaker, and row 2b
+    independently measured `z` as the worse of the two targets. With the critic frozen the
+    leaf value cannot drift round to round, so the loop has exactly one moving part.
     """
     n = len(dataset)
     n_val = max(1, int(n * val_frac)) if val_frac else 0
@@ -344,9 +353,10 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
     val_idx, train_idx = perm[:n_val], perm[n_val:]
 
     policy.to(device).train()
-    critic.to(device).train()
+    critic.to(device)
+    critic.train() if train_critic else critic.eval()
     p_opt = torch.optim.Adam(policy.parameters(), lr=lr_policy)
-    c_opt = torch.optim.Adam(critic.parameters(), lr=lr_critic)
+    c_opt = torch.optim.Adam(critic.parameters(), lr=lr_critic) if train_critic else None
 
     history = []
     for epoch in range(epochs):
@@ -362,15 +372,18 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
             p_opt.step()
 
             # Critic: MSE to the game outcome z (raw output, no return-normaliser).
-            val = critic.value_batch(batch).reshape(-1)
-            mse = F.mse_loss(val, batch['z'])
-            c_opt.zero_grad()
-            mse.backward()
-            torch.nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
-            c_opt.step()
+            # Skipped entirely when frozen — including the forward, so a frozen run costs
+            # strictly less than a trained one rather than the same.
+            if train_critic:
+                val = critic.value_batch(batch).reshape(-1)
+                mse = F.mse_loss(val, batch['z'])
+                c_opt.zero_grad()
+                mse.backward()
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
+                c_opt.step()
+                mse_sum += float(mse.item())
 
             ce_sum += float(ce.item())
-            mse_sum += float(mse.item())
             n_mb += 1
         stats = {'epoch': epoch, 'ce': ce_sum / max(1, n_mb), 'mse': mse_sum / max(1, n_mb)}
         history.append(stats)

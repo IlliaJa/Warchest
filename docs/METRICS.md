@@ -125,8 +125,9 @@ against). A collapse to near 0 *early* still means premature convergence.
 ### `score_attack` / `score_shaping` / `score_holding` / `score_material` / `score_terminal` / `score_other` / `score_tempo`
 
 **What it measures:** the per-episode-mean decomposition of `score` into its reward sources
-(attack rewards, base-diff potential shaping `γφ′−φ`, the annealed holding reward, the annealed
-material-PBRS term, terminal win/loss/truncation, the per-turn tempo cost, and everything else).
+(attack rewards, the annealed base-diff potential shaping `γφ′−φ`, the annealed holding reward,
+the annealed material-PBRS term, terminal win/loss/truncation, the per-turn tempo cost, and
+everything else).
 The seven sum to `score`.
 
 **Why it matters:** catches **proxy/objective decoupling** — the failure mode on the
@@ -147,6 +148,26 @@ rises over training; watch `score_holding` for stalling (persistently positive +
   clean read on **episode length in turns** — and, against `n_decisions`, on how many main-actor
   clicks were free continuations rather than fresh turns (the gap is exactly the tactic and
   bonus-maneuver usage that `score_tempo` used to be charged for).
+
+**And one on 2026-08-18** (`docs/IDEAS.md` R.0.3): `score_shaping` is now annealed like the
+other two dense terms, so it decays ~10× over the first half of a run by construction. On runs
+before this date it was flat, and at the anneal floor it reached 0.205 per episode against a
+0.125 `score_terminal` — the decoupling this section describes, in the one term that was exempt
+from the anneal meant to prevent it. `score_shaping` is therefore **not** comparable across the
+boundary; `base_shaping_anneal` (below) says which side a run is on.
+
+### `shaping_anneal` / `base_shaping_anneal`
+
+**What it measures:** the multiplier on the dense reward terms this batch — 1.0 → 0.1 linearly
+over the first half of the run, then flat. `shaping_anneal` covers holding + material;
+`base_shaping_anneal` covers base-diff PBRS and equals it unless the run passed
+`--no-anneal-base-shaping`, which pins it at 1.0 to reproduce the pre-2026-08-18 reward.
+
+**Why it matters:** it is the scale of three of the seven `score_*` components, so a
+`score_shaping` / `score_holding` / `score_material` trend cannot be read without it — half of
+any decline over the first half of a run is this schedule, not the policy. It also identifies
+the reward arm a run was trained on, which is what makes `score_*` and `critic_mae` comparable
+(or not) between two runs.
 
 ---
 
@@ -219,10 +240,44 @@ Std of GAE advantages before normalisation. Should be non-zero (> 0.05) — near
 
 ---
 
+### `adv_group_spread` / `adv_group_spread_frac` — how much of the advantage was opponent identity
+
+Spread of the per-opponent-group mean advantage, i.e. the offset that `--adv-norm per_opponent` removes (`docs/next_iteration.md` §5 row 6). Win rates against the opponent mix genuinely differ (1.000 / 0.825 / 0.525 vs random / greedy / self), so a critic that cannot see who it is playing must under-predict against weak opponents and over-predict against strong ones — and `A = G − V` then carries a constant per-opponent offset that makes *every* action against a weak opponent look good, whatever the action was.
+
+**Plot `_frac`, not the raw value**: it is the same quantity in units of the raw advantage std, and the raw scale drifts as the reward shaping anneals. Smoke-measured at **0.37–0.54**, with `random` above `greedy` — that ordering is the predicted sign, so a reversal is worth investigating. Exactly **0.0** under `--adv-norm global`, which is the pre-2026-08-09 baseline.
+
+---
+
+## Critic trunk-health metrics
+
+The critic's spatial trunk **died silently for a whole generation of checkpoints** — every pre-activation of its final ReLU went ≤ 0, so the trunk output was identically zero, the value head was fed a block of hard zeros, and the critic was blind to the board while its loss curves looked ordinary. It voided every search measurement taken with those checkpoints (`docs/next_iteration.md` §3.4). These metrics exist so that cannot happen unnoticed again; they are logged every `trunk_health_every` (10) batches.
+
+### `critic_trunk_out_std` — **the one to watch**
+
+Std, across the batch, of the pooled trunk output that the value head actually receives. If this does not vary with the board, the critic cannot rank two positions no matter what the rest of the network is doing. The dead `critic_v1` trunk reads **0.000**; a healthy run reads ~0.1 and up (0.6–0.7 observed on `critic_v5` at `hidden_dim=192`). `ppo.py` alarms below 1e-6.
+
+### `critic_trunk_alive_conv1..3` — fraction of positive pre-activations per conv block
+
+Healthy is roughly **20–50 %**. `min(alive) == 0` diagnoses the `critic_v1` ReLU absorbing state, which is unrecoverable once entered (the ReLU gradient is exactly 0 and Adam's moments stay 0).
+
+**These are a useless guard on their own from `critic_v2` onward, and that is not a subtlety to skip.** GroupNorm re-centres each sample's channels, so a whole channel cannot sit permanently below zero — force the last conv to a constant −50 and `critic_v1` reports alive 0.0 with output exactly zero while `critic_v2` reports alive **1.0**. That is the fix working, but an all-positive *constant* output carries exactly as little information as an all-zero one. Pinned by `tests/test_critic_arch.py`. So: read `critic_trunk_out_std` for collapse, and use the alive curves only as supporting detail.
+
+### `critic_board_aux` — the board-only auxiliary loss
+
+MSE of `critic_v2`+'s `board_only_head`, which predicts the return from the pooled board **alone**, added to the critic loss at `--aux-board-coeff` (default 0.1). GroupNorm removes the trap but gives the trunk no *reason* to learn — the main head draws most of its sensitivity from the globals, so the board pathway sees almost no gradient. This head's loss is unsatisfiable without a board representation that carries signal.
+
+**Should decrease.** A flat `critic_board_aux` with a healthy `out_std` means the trunk is varying but not informatively. Observed falling 0.52 → 0.36 → 0.19 over the first three batches of a smoke run.
+
+---
+
 ## Quick-reference table
 
 | Metric | Early training | Healthy mid | Target late | Bad signs |
 |---|---|---|---|---|
+| `critic_trunk_out_std` | > 0 | > 0.1 | > 0.1 | **0.000 = board-blind critic; voids every measurement taken with it** |
+| `critic_trunk_alive_conv*` | 0.2 – 0.5 | 0.2 – 0.5 | 0.2 – 0.5 | 0.0 on `critic_v1`; **uninformative alone on v2+** — see above |
+| `critic_board_aux` | falling | falling | low, stable | flat while `out_std` is healthy |
+| `adv_group_spread_frac` | 0.3 – 0.6 | 0.3 – 0.6 | any | `random` group below `greedy` (sign reversal) |
 | `clip_frac` | any | 0.10 – 0.20 | 0.05 – 0.25 | < 0.02 or > 0.45 |
 | `approx_kl` | any | 0.005 – 0.010 | stable | hitting KL_TARGET every batch |
 | `return_mean` | −0.5 to −1.0 | rising | > 0 | flat or falling |

@@ -103,7 +103,7 @@ def _opponent_env_action(opp, opp_type, env, obs, acting_pid):
 
 def play_episode(env, policy, opp, main_pid, opp_type, *,
                  gamma, shaping_anneal, holding_reward_rate, max_t,
-                 collect_dense=False):
+                 base_shaping_anneal=1.0, collect_dense=False):
     """Run one episode; return (steps, episode_dict).
 
     ``steps`` is a dict of parallel per-decision lists for the main actor's transitions
@@ -121,6 +121,16 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
     ``episode_dict`` carries the score decomposition + metadata, plus ``t_env`` /
     ``t_model_play`` so the caller can accumulate timing (this function owns no trainer
     state). The critic is never called here — V(s) is computed in one batched pass later.
+
+    ``base_shaping_anneal`` multiplies the base-differential PBRS term, the way
+    ``shaping_anneal`` multiplies holding + material PBRS. Separate knobs because the base
+    term used to be deliberately un-annealed, and that is what `docs/IDEAS.md` R.0.3
+    measured as the failure: at the 0.1 floor one base paid 0.050 against 0.0015 per boxed
+    coin (33 : 1) and the realised per-episode base payout (0.205) exceeded the realised
+    terminal (0.125). Annealing both by the same multiplier holds the base : material ratio
+    at its initial 3.3 : 1 for the whole run and puts the dense payout well under the
+    terminal late on. Defaults to 1.0 (the pre-2026-08-18 behaviour) so a caller that does
+    not know about the split gets the old reward; `ppo.py` passes ``shaping_anneal`` here.
 
     ``collect_dense`` (docs/IDEAS.md #12 — dense critic targets): also emit auxiliary
     value-regression samples at every *opponent* decision node, so the critic gets
@@ -248,16 +258,20 @@ def play_episode(env, policy, opp, main_pid, opp_type, *,
             else:
                 phi_after = SHAPING_C * (state['global'][2] - state['global'][1]) * _wbc
             phi_mat_after = C_MAT * (env.boxed_total(opp_pid) - env.boxed_total(main_pid))
-            # Base-diff PBRS is constant; holding + material shaping are annealed together.
+            # All three dense terms are annealed by their own multiplier. Scaling a PBRS
+            # term is still valid PBRS: `c * (gamma*Phi' - Phi)` telescopes exactly like the
+            # potential `c*Phi`, and c is constant within an episode (it is set once per
+            # batch by the caller), so nothing leaks across the telescope.
             base_shaping = gamma * phi_after - phi_before
             material_shaping = gamma * phi_mat_after - phi_mat_before
+            annealed_base = base_shaping_anneal * base_shaping
             annealed_holding = shaping_anneal * holding_reward
             annealed_material = shaping_anneal * material_shaping
-            shaped_reward = reward + base_shaping + annealed_holding + annealed_material
+            shaped_reward = reward + annealed_base + annealed_holding + annealed_material
             main_score += shaped_reward
 
             # decompose the reward so score/win decoupling is visible in the logs
-            r_shaping += base_shaping
+            r_shaping += annealed_base
             r_holding += annealed_holding
             r_material += annealed_material
             # The per-turn tempo cost rides on every turn-ending reward, so peel it into

@@ -690,8 +690,9 @@ the input.
 
 #### Done 2026-08-09 (§5 row 6) — and why the pair is safe
 
-`critic_v3` (now the default) is v2 minus the one-hot; `RolloutBuffer.compute_gae(adv_norm=
-'per_opponent')` (now the default) subtracts each opponent group's own mean advantage before
+`critic_v3` (the default when this was written; the chain has since reached **`critic_v5`**, which
+keeps this change) is v2 minus the one-hot; `RolloutBuffer.compute_gae(adv_norm=
+'per_opponent')` (still the default) subtracts each opponent group's own mean advantage before
 applying one shared std. Full record in `docs/history.md`. Three points worth pinning here,
 because each was a live question while implementing it:
 
@@ -740,6 +741,13 @@ No verb is significant (bolster −1.1 σ). The critic's failure mode is **"adds
 information", not "adds wrong information"** — it is not why bolster is suppressed.
 
 ### 3.7 The policy suppresses bolster unconditionally *(label-independent)*
+
+> **OUT OF DATE as of `ckpt_20260817-2102`** (the A1+A3 / `policy_factored_v2` run). Bolster's
+> share of decisions went **0.0071 → 0.0746** (~10×) and `bolster_per_ep` **0.20 → 2.52**
+> (`IDEAS.md` R.8.2). The collapsed mode described below was real for the v11/`policy_factored_v1`
+> generation; the unit-type embedding brought unit-specific mechanics back into the repertoire,
+> which is A1's own gate and the only place its effect is visible. The paragraph is kept because
+> the *mechanism* it names (a location-blind verb gate) is unchanged and still untested.
 
 Over 526 decision states, bolster is legal in **63.9 %** of them with `P̄(verb) = 0.029`,
 p10 `0.0000`, p90 `0.0804` — **never** the preferred verb in any state — and its within-verb
@@ -825,7 +833,7 @@ Two methodological rules this investigation produced, worth keeping:
 | 1b | ~~Re-run at 150 states @ 16 playouts~~ | done | — | **done 2026-08-07. Both of step 1's consolations reversed** (§2 step 1): `HEURISTIC` Spearman 0.246 → **0.149**, true signal std 0.208 → **0.158**, while every learned arm *rose* and the v10 critic reached 26 % of ceiling. Verdict: distil into a network; the hand-written leaf is the worst evaluator on clean labels |
 | 1c | ~~Fit `board_solo` properly~~ | done | — | **done 2026-08-07:** pooled R² **0.1846** vs the globals-only control's 0.1633 — the board alone out-predicts every non-board feature. Trunk 43.2 % alive with no globals to hide behind (§3.1a, §3.4) |
 | 2a | ~~**Dump shaped returns** from `ppo.py`'s rollout~~ | done | — | **shipped 2026-08-07:** `--dump-returns-dir`. Writes `round*.npz` with the shaped GAE return under the key `z`, so `eval_board_value.py fit --data` reads it with no code change (verified end to end). Still needs a short run to fill it |
-| 2b | **Critic target A/B** — a `fit` arm on shaped returns vs `z`, scored on `data/la16_labels.pt` (§2 step 2, §3.3b) | hours after a run | no | does the ~2× gap survive at matched `hidden_dim` and data? If yes, ExIt's `MSE(critic, z)` is the single biggest identified defect |
+| 2b | ~~**Critic target A/B** — a `fit` arm on shaped returns vs `z`, scored on `data/la16_labels.pt` (§2 step 2, §3.3b)~~ | done | — | **run 2026-08-16, partly negative** (`src/app/eval_critic_target_ab.py`): at matched arch/`hidden_dim`/data the gap is **~1.3×, not ~2×**, and the board-blind control gains nearly as much (1.29×) as the board arm (1.33×) — most of it is "shaped returns are a less noisy target for everyone". Board-specific part is real but modest (same-verb +3.3 pp vs the control's +1.2 pp). PPO already trains on shaped returns, so what this re-scopes is the claim about **ExIt**, which still trains on `z`. Consequence: **`IDEAS.md` A6 deferred** — see `docs/decision.md` 2026-08-16 |
 | 3 | ~~**Critic trunk** — GroupNorm + board-only auxiliary head + health guard~~ | done | — | **shipped 2026-08-07, trained and verified 2026-08-08 (§3.4).** Trunk alive (`[0.425, 0.262, 0.185]`, `out_std` 0.116 vs the dead critic's 0.000); tie rate on positional pairs **93 % → 0 %**; same-verb accuracy **46.0 % → 55.8 %**, +9.8 pp CI [+1.3, +18.8]; no regression on economy pairs. `--critic-arch critic_v1` reproduces the old baseline. **Gate met — row closed.** |
 | 3b | **Head-to-head: `critic_v2` vs `critic_v1` in the gauntlet** — the behavioural check the within-state metric cannot give (see the Appendix command) | ~1 h | no | does the ranking gain convert to wins? A 6-game smoke run went 6/6 to `critic_v2`; needs ~200 games before it means anything |
 | 4 | **Quiescence in `LookaheadBot`** (§2 step 3) | 1–2 days | no | board-only tie rate well below 89 %; beats plain `lookahead` head to head; bolster/tactic rates rise without losing WR |
@@ -833,7 +841,7 @@ Two methodological rules this investigation produced, worth keeping:
 | 6 | ~~**Remaining critic hygiene** — drop `opp_onehot` + per-opponent advantage normalisation~~. Shared encoder + stop-gradient is **not** part of this (§4: demoted to an optimisation) | done | no | **shipped 2026-08-09** as `critic_v3` (default) + `--adv-norm per_opponent` (default); see §3.5 and `docs/history.md`. Landed as a *new* arch, not a mutation of v2 — `warchest_critic_20260808-0607.pth` is v2 and is the checkpoint that proved row 3. 181 tests pass; all five prior critic checkpoints still load. **Gate still open:** pooled R² holds ~0.20, which needs a run + `fit` |
 | 7 | **Conditional-bolster overlay** on `SimGreedyBot` — the never-run clean test of the domain claim | hours | no | paired seeds vs the unmodified bot |
 | 8 | **▶ FIRST TRAINING RUN** — contents decided by 2, 3 and 4 | a run | **YES** | gauntlet Elo holds/rises **and** step-5 conditional metrics move off the floor |
-| 9 | `puct` vs `lookahead` vs the **raw policy** (never run) | ~1 h | no | if search over the critic does not beat the policy guiding it, search contributes nothing. Must run *after* row 3 (the trunk fix): every search result on record used a board-blind leaf |
+| 9 | ~~`puct` vs `lookahead` vs the **raw policy** (never run)~~ | done | no | **RUN 2026-08-16/18 — positive, and it re-sequenced the whole plan** (`IDEAS.md` R.0.1, R.8.1). `PuctBot` beats the raw policy that supplies its own priors: **0.725–0.74 at a 1.0 s budget**, but only ~0.49–0.66 at the shipped 0.1 s, which buys just ~14–30 node expansions on a mean-10.5-branching tree. So search works here, the budget was the bug, and the previous "search adds nothing" results were all taken on a board-blind leaf. What search adds, measured: **+27 % enemy coins boxed** and +1.15 bases at end, with `own_at_risk` **unchanged** — better conversion, not better safety |
 | 10 | Verb-gate `logsumexp` residual (§3.7) | hours | prep | A/B against `beta = 0`, which reproduces today's model exactly |
 | 11 | **▶ SECOND TRAINING RUN** / ExIt with a quiescent teacher **and a shaped-return critic** | days | **YES** | a round beats base **and** step-5 metrics move |
 
@@ -844,10 +852,21 @@ the two findings this document was built on (the heuristic as positional referen
 as within-state dead end) both reversed. Quiescence slipped from first to fourth; it is still
 justified, on a narrower argument.
 
-**Row 3 is done and its gate is met (§3.4).** The head of the list is now row 2b — the
-critic-target A/B — which needs one PPO run with `--dump-returns-dir` to fill its dataset. If
-the 2026-08-08 run was launched without that flag, the dataset does not exist yet and the
-cheapest way to get it is to set the flag on the next run rather than to run one for it alone.
+**Row 3 is done and its gate is met (§3.4).** ~~The head of the list is now row 2b — the
+critic-target A/B — which needs one PPO run with `--dump-returns-dir` to fill its dataset.~~
+**Row 2b ran 2026-08-16** on the `data/ppo_returns` shards that flag produced, and came back
+*partly negative*: ~1.3× rather than ~2×, most of it not board-specific (see the row).
+
+**Deferred as a consequence: `IDEAS.md` A6 (two value heads).** Its own gate ran too
+(`src/app/eval_value_calibration.py`) and the cheap fix wins — a frozen-trunk `z`-head buys
+**+0.008 AUC** and is *worse* calibrated than simply rescaling the existing scalar, while two
+Platt floats capture **78 %** of the achievable Brier gain (ECE 0.118 → 0.031); and PUCT's
+Q-spread / typical-U is **1.27**, so the shaped scale is already commensurate with `c_puct`.
+Do the two floats in `save_critic_checkpoint` instead and delete
+`LookaheadCriticBot._calibrate_value_scale`. Blind spot that could reopen it: the gate's head
+sits on a **frozen** trunk. Full record and the AlphaZero/MuZero/KataGo comparison in
+`docs/decision.md` 2026-08-16.
+
 Row 3b (head to head) is independent and costs an hour.
 
 **Do not raise `--playouts` below 16 again for any within-state measurement.** Two headline
@@ -870,7 +889,13 @@ From the user, recorded because the environment has to match:
 
 Parity questions, in order of how much each would change the game:
 
-1. **Does material pressure have any terminal consequence?** The env has only 6-base control
+1. ~~**Does material pressure have any terminal consequence?**~~ **CLOSED 2026-08-18 by the
+   user's ruling** (`IDEAS.md` R.8): 6-base control is indeed the only win condition, but
+   reaching 6 against a competent opponent goes through positional control and removing enemy
+   units — the game **cannot** be won by racing alone. So the env is not the defect; the reward
+   is. It prices a base at 0.05 and a boxed coin at 0.0015, i.e. the goal at **33×** its only
+   means (`IDEAS.md` R.0.3). Do not re-open this question; act on the reward instead. Original
+   text follows. The env has only 6-base control
    plus `max_rounds = 50` truncation. Killed coins go to the box permanently, but a player
    can be ground down without the game registering it — and per the numbers above the real
    game does not end on elimination either, so the honest question is whether the *pressure*
@@ -900,8 +925,11 @@ choice). In `rank` mode the first is the `bd-only` column. A dead trunk announce
 
 `--playouts 16` is the floor for any within-state claim — see §5's closing note.
 
-**Running the shipped critic fix (§2 step 2).** `critic_v2` is the default, so a plain
-`python src/app/ppo.py` already gets GroupNorm, the board-only auxiliary head and the guard.
+**Running the shipped critic fix (§2 step 2).** The default critic arch has moved on since this
+was written — it is **`critic_v5`** as of 2026-08-16 (v2's GroupNorm trunk and board-only
+auxiliary head, minus the opponent one-hot from v3, plus v4's gather readout and A1's unit-type
+embedding; `docs/history.md`). A plain `python src/app/ppo.py` therefore still gets GroupNorm, the
+board-only auxiliary head and the guard — and everything after them.
 Adding the dump makes the same run fill the dataset the target A/B needs:
 
 ```bash
