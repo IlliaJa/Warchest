@@ -31,7 +31,12 @@ opponent-independent complement.
 > **Read [State review (2026-08-16)](#state-review-2026-08-16--the-strength-is-already-in-the-box-nothing-is-taking-it-out)
 > at the bottom of this file first.** It audits the whole list against four measurements and
 > concludes that no item here is worth a step change, while a 0.74-vs-current agent already
-> exists (the current checkpoint + 1 s of PUCT). It re-sequences §N.4.
+> exists (the current checkpoint + 1 s of PUCT). It re-sequences §N.4. Then read **R.8** (what
+> search actually adds, and the A1+A3 verdict), **R.9** (pre-launch list for a PPO run) and
+> **R.10** (a symbol-level read of ExIt: R.8's budget fix is validated on two independent axes,
+> and what is left is that the teacher reads the opponent's hand plus four missing AlphaZero
+> mechanisms — R.10.1 and R.10.2 are retractions of R.10's own first draft). R.10.8 is the
+> current order.
 
 Current state: the live plan is **not** in this file — it is
 [next_iteration.md](next_iteration.md) §5, which supersedes both the sequencing in
@@ -1851,8 +1856,418 @@ outright. Build it against `preflight`, whose four gates are the acceptance test
 | 5 | copy the newest critic into `data/lookahead_critic/lookahead_critic_v6.pth` | ~0 | the remaining search opponent otherwise runs a 2026-08-08 critic |
 | 6 | raise the verb-entropy floor (`verb_entropy_coeff_final` 0.01 → ~0.015) | trivial | judgement call. `verb_ent` ends at 0.276 of a 2.40 max; a reward change meant to induce new behaviour needs exploration to find it, and the floor was tuned for the old reward. Bundling it does cost attribution — skip it if that matters more |
 | 7 | `--dump-returns-dir` off unless another target A/B is planned | ~0 | 252 shards / 4.34 M samples last time, and the reader was OOM-prone (`decision.md` 2026-08-16) |
-| 8 | R.3b (Gumbel) — **during** the run, not before | mod | R.9.5 |
+| 8 | R.3b (Gumbel) — **during** the run, not before | mod | R.9.5. **R.10 sharpens this:** Gumbel root sampling + sequential halving is the principled form of exactly the two things R.10.3 and R.10.6 do cheaply — it decouples "was this move considered" from "did the U term let us visit it" (R.10's M1: only 3.3 of 8 children are reachable), and its completed-Q target is not the over-peaked visit count R.10.1 indicts. Do R.10.3 first because it is one line; reach for Gumbel when that sweep runs out of room |
 
 Standing caveat, unchanged: items 3, 4 and 6 all land on the same side of a reward boundary as
 R.0.3, so `score`, `score_parts`, returns and `critic_mae` are **not** comparable across it.
 Win rate and the gauntlet are. That is what item 2 exists to protect.
+
+---
+
+## R.10 ExIt, read symbolically (2026-08-18) — the budget fix holds up; the target's *inputs* are what is left
+
+A symbol-level pass over the whole pipeline (`services/expert_iteration.py`,
+`app/expert_iteration.py`, `services/selfplay_collector.py`, `bots/puct_bot.py`) plus four new
+measurements. It was written to test R.8/R.9's assumption that ExIt's problem is teacher strength
+and that raising the budget fixes it.
+
+**The one-sentence version.** R.8.3's `--time-budget 1.0` is validated by two independent
+instruments — the search now diverges from its own prior on **13.1 %** of moves (was 1.3 % at
+0.02 s) and the target's entropy lands roughly balanced against the policy's — so there *is*
+something to distil; what remains broken is upstream and downstream of the tree rather than in it:
+the teacher **sees the opponent's hand** (15.4 % of its moves depend on it, as large as the whole
+improvement signal), the prior it searches inside is a near point mass (82 % on one move, ~3 of 8
+children reachable), and the distillation step has **no replay window, no promotion gate, no trust
+region and no early stopping**.
+
+**Read R.10.1 and R.10.2 as retractions.** This section's first draft argued that the target is
+over-peaked and that raising the budget makes things worse. M4 was run to test that and inverted it.
+The retraction is kept in full because the *reason* it was wrong — a signed comparison of two
+entropies drawn from a single 103-sample game — is the same methodological trap this project has
+now written down three times.
+
+### R.10.0 Four measurements
+
+**M1 — the prior the search has to work inside is nearly a point mass.** 2643 decision states,
+`ckpt_20260817-2102`. "Children PUCT can reach" counts root children whose *first-visit*
+exploration bonus `c_puct · P(a) · √N_total / 1` exceeds 0.05 at `c_puct = 1.5` and 97 expansions
+(the 1.0 s budget) — i.e. moves the U term can actually lift into a visit at all. The 0.05 is a
+stipulated Q-scale, not a derived one, but it is grounded: `eval_value_calibration.py puct` measured
+Q's p5–p95 span at **1.74** (`decision.md` 2026-08-16), so 0.05 is ~3 % of the range the values
+actually occupy — a small but real difference in evaluation. The 97 is the *contended* expansion count
+from R.0.1 (12 workers); M4 measures **262** on an idle box at the same budget, which raises `√N` by
+1.6× and so lowers the reachability threshold from `P > 0.0034` to `P > 0.0021`. The reachable-children
+column would therefore be somewhat higher on an idle box — the table below is the pessimistic end, and
+the qualitative point (a handful of children, not a dozen) holds either way:
+
+| prior temperature τ | mean top-1 prior | entropy (nats) | of max (ln 13.7 = 2.62) | children PUCT can reach |
+|---|---|---|---|---|
+| **1.0 (shipped)** | **0.817** | **0.495** | **19 %** | **3.3** |
+| 1.5 | 0.737 | 0.737 | 28 % | 4.4 |
+| 2.0 | 0.668 | 0.956 | 37 % | 5.2 |
+| 3.0 | 0.557 | 1.316 | 50 % | 6.3 |
+
+**The teacher effectively considers ~3 moves, and already puts 82 % on one of them.** That is the
+quantitative content of the recorded 0.94–0.95 agreement, and it is a property of the *prior*, not
+of the tree.
+
+**M2 — `max_branching = 8` is not the constraint, and widening it provably cannot help.** Same
+states:
+
+| cap | states truncated | legal moves kept | prior mass kept (mean / p10 / min) |
+|---|---|---|---|
+| 8 | 66.2 % | 69.2 % | **99.74 % / 99.58 % / 81.10 %** |
+| 12 | 46.0 % | 83.4 % | 99.94 % / 99.97 % / 91.91 % |
+| 16 | 31.7 % | 91.7 % | 99.99 % / 100.00 % / 96.25 % |
+
+Even in the **widest decile** (≥ 24 legal moves, where the cap keeps only 29.4 % of them) it
+retains **99.39 %** of the prior's mass. So the discarded moves carry ~0.26 % of the prior between
+them — and a move with prior ~0.001 gets a U bonus of `1.5 · 0.001 · √97 ≈ 0.015`, far below any
+real Q gap, so it would never be visited even if it *were* in the tree. R.0.2's aside
+("widening it is **not** the fix") is hereby confirmed, but for a much stronger reason than was
+given there: the cap is downstream of the collapsed prior, and so is everything else.
+
+**M3 — the search *does* diverge from its prior at 1.0 s, and the cheating penalty grows with the
+budget too.** `eval_move_agreement.py --games 10 --time-budget 1.0 --value-mode shaped
+--sample-every 2`, run for this section: 428 probed positions across 10 self-play games driven by the
+cheating teacher, with a blind search run on the same position at every probe. Against the only prior
+record — a 2-game smoke at **0.02 s** (`search_under_uncertainty.md` §8.3):
+
+| | 0.02 s smoke (n≈small) | **1.0 s (n = 428)** |
+|---|---|---|
+| search agrees with its own policy argmax | **98.7 %** | **86.9 %** (blind variant: 84.3 %) |
+| cheat vs blind, top-1 agreement | 92 % | **84.6 %** |
+| cheat vs blind, mean TV of visit distributions | 0.084 | **0.123** |
+
+Two readings, pulling opposite ways, and both matter:
+
+- **R.8.3's budget fix is validated on the axis it was aimed at.** The search now picks a different
+  move from its own prior on **13.1 %** of decisions, against 1.3 % at 0.02 s — a ~10× increase in
+  the quantity ExIt actually distils. §8.3's warning ("if this holds at the full budget, ExIt is
+  distilling the policy into itself") **does not hold at 1.0 s.** There is real signal to teach.
+- **But the privileged-information component grew with it, and is now as large as the signal.**
+  Cheat and blind pick different moves on **15.4 %** of positions (TV 0.123) — *more* than the
+  13.1 % on which the search improves on its prior at all. The divergence is flat across game phase
+  (85.3 % early / 83.9 % late) and does not concentrate in wide positions (84.3 % at ≥ 8 legal), so
+  it is not a handful of complex spots. See R.10.4: this is no longer a nicety.
+
+**M4 — how the target's entropy moves with the budget, on identical states.** The claim this
+section was originally built on (see the correction in R.10.1) needed a controlled sweep rather than
+one preflight game, so: 45 probe states, `dirichlet_alpha = 0`, the same states scored at four
+budgets, against the policy's own entropy on those states (0.456 nats).
+
+| budget | expansions | visit_entropy | **Δ = visit − policy** |
+|---|---|---|---|
+| 0.1 s | 29.1 | 0.678 | **+0.222** |
+| 0.5 s | 133.7 | 0.555 | +0.098 |
+| **1.0 s** | **262.1** | **0.487** | **+0.031** |
+| 2.0 s | 512.4 | 0.497 | +0.041 |
+
+Two facts: the target **does** tighten as the budget rises (0.678 → 0.487) and then **plateaus** by
+1.0–2.0 s; and **Δ is positive at every budget**, i.e. the visit distribution is *softer* than the
+policy, not sharper. Note also the expansion counts on an idle box — 262 at 1.0 s, against the ~97
+measured under 12-way worker contention in R.0.1. Both are real; which one applies depends on how
+many workers are running.
+
+### R.10.1 Correction — the target is *not* over-peaked; the budget fix lands it near the healthy point
+
+**This subsection originally argued the opposite, and the retraction is the finding.** It read the
+R.8.3 `preflight` line `policy_entropy = 0.626, visit_entropy = 0.450` (Δ = −0.176) as evidence that
+the target is more peaked than the policy, concluded that a distillation round is therefore an
+entropy-*reduction* operator, and predicted that raising the budget would make it worse. M4 was run
+to check that prediction on identical states across four budgets and **it inverts**: Δ is **+0.222**
+at 0.1 s and **+0.031** at 1.0 s — positive throughout, and *converging toward* zero as the budget
+rises rather than away from it.
+
+Why the preflight number was not evidence: it came from **one self-play game, 103 samples**, and both
+of its halves sit on the opposite side of M4's values (policy 0.626 vs 0.456; visit 0.450 vs 0.678).
+A one-game average of a per-state entropy cannot support a signed comparison of two numbers 0.18
+apart. This is the trap this project has written down twice already — `next_iteration.md`'s
+"reliability is not validity" and "in a paired measurement, precision is binding, not sample count" —
+and it caught this section within a day of R.8 citing those very rules.
+
+**What survives, and it is the useful half.** The structural reading of `distill` stands: 4 epochs of
+plain cross-entropy to the visit distribution with **no trust region, no KL to the previous policy,
+no entropy term and no early stopping** (`val_frac` is computed and *reported*, never used to stop).
+On a 300-game round that is ~25 k samples / 256 = 88 minibatches × 4 ≈ **350 unconstrained Adam steps
+at 3e-4**, against PPO's clipped, KL-gated ~171 per batch. Put that beside M3: the improvement signal
+lives in **13.1 %** of samples. So the correct statement is not "sharpening dominates" but **"350
+unconstrained steps are taken toward a target whose informative content is one sample in eight, with
+nothing bounding how far the policy may move."** That argues for a trust region and for R.10.6's
+weighting, and it holds regardless of Δ's sign.
+
+**And the budget fix comes out better than R.8.3 claimed.** It buys teacher divergence (M3: prior
+agreement 98.7 % → 86.9 %) *and* walks Δ from +0.222 to +0.031 — from clearly-flattening to roughly
+balanced — with the plateau at 2.0 s (+0.041) saying 1.0 s is already at the useful end of that
+curve. Two independent gates improve together; the claim that they pull opposite ways is withdrawn.
+
+### R.10.2 The entropy guard: right side, no tolerance, and only one side ever observed
+
+With M4 in hand the guards can be assessed properly, and the picture is different from R.10.1's
+first draft in both directions.
+
+`_run_distill` warns when `visit_entropy > policy_entropy`; `preflight` gate 4 (R.8.3) uses the same
+polarity and scores that condition `FAIL`. **That orientation is correct for the regime M4 measures**
+— Δ is positive at every budget, so "the target is flatter than the policy" is the side we are
+actually on, and it is the side with the one recorded failure. So the "both guards watch the wrong
+edge" claim from this section's first draft is withdrawn along with R.10.1's.
+
+What is wrong with them is narrower and still worth fixing: **a bare inequality has no tolerance,
+and Δ's natural resting point at a sane budget is a small positive number.** At 1.0 s, Δ = +0.031 —
+both guards fire, and M4 gives no reason to think that value is unhealthy. As written they are
+false-alarm generators at exactly the setting R.8.3 recommends.
+
+The useful calibration falls out of putting the two data points on one axis:
+
+| Δ = visit − policy | evidence |
+|---|---|
+| **+0.22 … +0.27** | the regime that *failed*. The recorded `--dirichlet-frac 0.25` arm measured visit 0.87 against policy ~0.6 (Δ ≈ +0.27) and flattened the policy every round; M4's **0.1 s** row sits at **+0.222** with noise switched off entirely |
+| **≈ +0.03** | 1.0 s, M4. Untested in a real round, and the closest thing to balanced this project has measured |
+| **< 0** | **never observed.** R.10.1's first draft inferred it from a 103-sample preflight line; M4 contradicts it |
+
+Two consequences worth carrying:
+
+- **Warn above ~+0.15, not above 0.** That keeps the alarm on the one regime with evidence behind
+  it and stops it firing on the recommended configuration. Print signed Δ rather than two numbers
+  the reader must subtract.
+- **The historical `frac 0.25` failure may have been as much about the budget as about the noise.**
+  Δ ≈ +0.27 then, and M4 reaches Δ = +0.222 at 0.1 s with `dirichlet_alpha = 0`. The two are the
+  same regime, and the budget alone accounts for most of it. That is independent corroboration of
+  R.8.3's fix, and it further weakens the case for treating `--dirichlet-frac` as the lever
+  (R.3d).
+
+### R.10.3 The one lever aimed at M1: soften the prior inside the search — and what it costs
+
+Everything above is one quantity — the entropy of the prior the search runs on. The cheapest place
+to change it is not the network and not the noise, it is a **policy softmax temperature applied
+inside the search**: raise `P(a)` to `1/τ` and renormalise in `PuctBot._policy_priors` (or in
+`_expand` after the top-`max_branching` cut, so the cut still uses the raw ranking).
+
+This is not an invention. **Leela Chess Zero ships exactly this knob** (`--policy-softmax-temp`)
+and runs it above 1.0 in its shipped configurations, for exactly the reason M1 measures: a trained
+net's raw policy is too peaked for MCTS to explore. (Check the current LC0 default before quoting a
+number — the point that matters here is the sign, not the value.) It is one line, it has no effect on the network, and by M1's table
+τ = 2.0 takes the reachable-children count 3.3 → 5.2 and the prior's entropy 19 % → 37 % of max.
+
+**But M4 changes what this costs, and the first draft of this item got that wrong too.** Softening the
+prior raises the *search's* entropy without touching the network's, so it pushes **Δ up** — and Δ is
+already +0.031 at 1.0 s, with the failing regime starting somewhere around +0.15…+0.22 (R.10.2). So
+temperature is **not** a free win that raises reach and Δ together; it buys reach and spends the Δ
+budget, and the two effects have to be weighed against each other rather than assumed to align.
+
+What is not obvious a priori is the *size* of that cost: more reachable candidates means the visits
+spread wider, but it also means Q has more to discriminate between, which concentrates them again.
+The net effect on Δ is an empirical question and cheap to answer, which is the whole point of running
+it as a sweep rather than shipping a value.
+
+Two properties that survive unchanged and still make it the first thing to try:
+
+1. It attacks the one quantity M1 measures directly — the search examines ~3 moves and its prior
+   already puts 82 % on one of them — and nothing else on this list touches that.
+2. It **sidelines the `--dirichlet-frac` question** (R.3d) rather than answering it. Noise tries to
+   lift tail moves past the U threshold by adding mass, which is sparse at `frac = 0.03` (a move at
+   `P = 0.001` reaches at best `0.03 · Dir(0.3)`, usually ~0) and overshoots into the failing Δ
+   regime at `frac = 0.25`. Temperature reshapes the mass already there, so it has no such cliff —
+   and R.10.2's second consequence suggests most of what `frac 0.25` was blamed for was the budget
+   anyway.
+
+Sweep τ ∈ {1.0, 1.5, 2.0, 3.0} and read **three** numbers per arm, not one: signed Δ (must stay well
+under ~+0.15), teacher strength vs the raw policy (must hold ≥ 0.65), and search/own-prior divergence
+from `eval_move_agreement.py` (13.1 % at τ = 1 — this is the number τ is being bought to raise). If Δ
+blows past +0.15 before divergence improves meaningfully, τ is the wrong lever here and R.10.6 is the
+fallback.
+
+### R.10.4 The teacher cheats, and nothing in ExIt turns that off
+
+`PuctBot.__init__` has `see_opponent_hand=True` as its **default**, `_build_bot` in
+`app/expert_iteration.py` does not pass the argument, and `LookaheadBot._prepare_root` only
+re-splits the opponent's hidden coins when it is `False`. So every ExIt sample is a target produced
+by a search that **knew the opponent's actual hand**, distilled into a policy that structurally
+cannot observe it.
+
+`search_under_uncertainty.md` §8.1 measured that cheating is worth ~0 in *strength*, and §6.4-3
+already made the point that strength is the wrong test: two searches can be equally strong and still
+choose differently, and then the cheating one's targets encode a choice the student cannot derive
+from its own observation. Equal win rates and unlearnable targets are perfectly compatible. The
+measurement is now in, at the real budget (M3), and it is not marginal: cheat and blind disagree on
+**15.4 %** of positions with a visit-distribution TV of **0.123**, against the **13.1 %** of
+positions where the search improves on its prior at all. **The hidden-information component of the
+target is at least as large as the entire improvement signal** — and unlike the signal, no amount of
+training can reduce it, because the student's observation does not contain the variable it depends
+on. It is irreducible label noise sitting exactly on top of the thing being learned.
+
+Fix: pass `see_opponent_hand=False` for data-gen, and raise `n_determinizations` to 3–4 at the same
+time — with a blind root, `n_determinizations=1` (the default) is single-determinization search,
+which is the strategy-fusion failure `search_under_uncertainty.md` §2 is entirely about. The cost is
+linear in determinizations and generation is offline. **The gate this item was waiting on has now
+passed** — at TV 0.123 the cheating is worth removing, and the 3–4× data-gen cost of blind
+determinization voting is the price. Expect blind search to be no weaker (§8.1 measured the strength
+difference at ~0), so the only thing being bought is that the target becomes a function of what the
+student can actually see.
+
+### R.10.5 Four AlphaZero-family mechanisms the pipeline does not have
+
+Each is standard, cheap, and maps onto a recorded symptom.
+
+**(a) No replay window.** `cmd_loop` distils on `round{r}.npz` **only** — one round, ~25 k samples.
+Every AlphaZero-family trainer samples a sliding window over many generations. The recorded symptom
+names its absence precisely: each round the previous round's critic scored held-out MSE 1.2–1.55 on
+the new data then re-fit to 0.03–0.05 within the round — *"it memorises each round's narrow
+self-play distribution and generalises to the next round's barely at all: churn, not learning"*
+(`independent_opponents.md` §1). Cost is RAM, not compute: ~0.5 GB per 300-game round
+(`visit_targets` is `[N, 1875] f32` and dominates), and `SelfPlayDataset.concat` already exists.
+
+**(b) No promotion gate.** `cur_policy = out_policy` unconditionally, so a bad round becomes the
+next round's seed *and* the next round's teacher prior. AlphaGo Zero gated promotion at 55 %. The
+recorded symptom is the ungated signature: *"the base policy beats every one of its 30
+descendants … monotonically weaker for the first several rounds, then plateaued below the start."*
+The post-round gauntlet already computes the number; nothing reads it. A gated loop can stall — an
+ungated one spirals.
+
+**(c) `val_frac` is a report, not a control, and its split leaks.** Two separate problems. The
+held-out CE is never used to stop training (350 unconstrained steps regardless), and the split is
+`np.random.permutation` over *samples* — but ~84 samples come from one game and share its trajectory
+and outcome, so a random split puts near-duplicates on both sides and the held-out number is
+optimistic. `eval_board_value.py` already fixed exactly this ("held out **by round**") and
+`next_iteration.md`'s methodological rules list it. **Split by game, then early-stop on it.**
+
+**(d) The search's own root value is computed, thrown away, and would be a better critic target
+than `z`.** `LookaheadCriticBot.act` puts `last_stats['best_value']` — the visit-weighted root value
+of the chosen move — on every decision, and `SelfPlayDataset` never records it. `z` is the noisiest
+target available: one bit per game, shared by all ~84 of its samples. Row 2b measured that a
+less-noisy target is worth ~1.3× *to everyone*, and MuZero's value target is exactly this
+substitution (n-step bootstrapped return in place of the terminal outcome) once intermediate rewards
+exist. Recording it costs one column and makes `λ·z + (1−λ)·V_search` available as a target —
+relevant the moment `--freeze-critic` is turned back off.
+
+### R.10.6 Weight the loss by how much the teacher disagreed
+
+Follows directly from R.10.1: if ~95 % of samples carry no improvement signal and an actively
+harmful sharpening gradient, stop paying full price for them. Weight each sample by the
+teacher/prior divergence already available at record time — the TV distance between the visit
+distribution and the raw prior, both of which `PuctBot` exposes (`last_stats['visit_counts']` and
+`last_stats['policy_argmax']` come from `_combine_visit_counts` over `_search_visits` and
+`_search_priors`, so the full prior vector is one line away).
+
+This extracts the 5 % without discarding the 95 % outright (dropping them would let the policy
+drift on everything the search agreed with). KataGo's *policy target pruning* is the nearest
+published relative. It is also the natural fallback if R.10.3's temperature sweep cannot get Δ
+positive without costing teacher strength — the two are alternative routes to the same end, and
+either alone is enough.
+
+### R.10.7 Two small things found while reading
+
+- **`seed_base = args.seed or 0`**, so `--seed 0` and no `--seed` are the same run, and workers are
+  seeded once per *collector* (`np.random.seed(seed_base + worker_id)` in `_worker_loop`) with the
+  stream continuing across rounds. Rounds therefore differ, but **re-running `gen` on the same
+  checkpoint reproduces the identical dataset** — good for reproducibility, and a trap for anyone
+  trying to buy more data by re-running generation. Vary `--seed` per round if a replay window
+  (R.10.5a) is used.
+- **`eval_move_agreement.py` earns its keep and should be run at every budget change.** One pass
+  reports all three quantities R.10 turns on: search/own-prior divergence (the ExIt go/no-go),
+  cheat-vs-blind top-1 and TV (item 1's gate), and the visit-vs-prior TV distribution (R.10.6's
+  weighting signal). `search_under_uncertainty.md` §8.4 had the command written down at the wrong
+  budget (0.1 s) since 2026-08-02; at 1.0 s it changed two conclusions in this document. Cost: ~21
+  min single-process for 10 games at `--sample-every 2`.
+
+### R.10.8 Revised order for the ExIt attempt
+
+Supersedes R.8.4's launch list. Item 0 is done; items 1–2 are the ones that changed most between this
+section's first draft and its measurements.
+
+| # | do | why |
+|---|---|---|
+| 0 | ~~run `eval_move_agreement.py` at 1.0 s~~ | **done (M3).** Prior divergence 98.7 % → **86.9 %**: the loop has something to teach at this budget. This was the go/no-go and it passed |
+| 1 | **`see_opponent_hand=False` + `n_determinizations=3` for data-gen** | R.10.4, and M3 promoted it from "nice to have" to the largest single defect: **15.4 %** of the teacher's moves depend on hidden state (TV 0.123), against **13.1 %** of moves carrying the improvement signal. Irreducible label noise as large as the signal, and §8.1 says blind search costs ~0 in strength |
+| 2 | **replay window + promotion gate** | R.10.5a/b — the two mechanisms whose absence matches the recorded 30-round collapse one-for-one, and neither depends on anything above |
+| 3 | split `val` **by game**, early-stop on it | R.10.5c — the split currently leaks (84 correlated samples per game, random permutation), and 350 unconstrained steps run regardless of what it says |
+| 4 | fix the entropy guard: print signed **Δ**, warn above ~**+0.15** | R.10.2 — as written both guards fire at Δ = +0.031, which is the recommended configuration. Currently a false-alarm generator, not a wrong-side guard |
+| 5 | policy softmax temperature in the search, sweep τ ∈ {1, 1.5, 2, 3} | R.10.3 — still the only lever aimed at M1 (3.3 reachable children, 82 % top-1 prior), but M4 shows it **spends** the Δ budget rather than adding to it. Read Δ, teacher strength and prior-divergence per arm |
+| 6 | `loop --rounds 3 --freeze-critic --time-budget 1.0` | R.8.4's command, with 1–4 in place. 1 and 2 are the ones that would change the outcome; 5 is a tuning pass |
+| 7 | record `best_value`; weight the loss by teacher/prior divergence | R.10.5d, R.10.6 — the next round of improvements, and R.10.6 is the fallback if τ has no room |
+
+**The honest summary of R.8 → R.10.** R.8 measured the teacher and concluded ExIt was justified;
+R.10 measured the *channel* and the conclusion mostly held, with one real correction and one real
+find. The correction: the channel is not over-peaked, and the budget increase improves teacher
+divergence and target entropy **together** rather than trading them (R.10.1, R.10.2 — both
+retractions of this section's own first draft). The find: the teacher is conditioning on the
+opponent's hand, and M3 sizes that at the same order as the entire signal being distilled — which no
+amount of budget, temperature or rounds can fix, because it is not noise in the search, it is
+information the student does not have. **Item 1 is the change most likely to decide whether the run
+works.**
+
+### R.10.9 The run itself, and the correction R.10.1 needed after seeing it (2026-08-19)
+
+`loop --rounds 3 --freeze-critic --time-budget 1.0` (item 6, item 2 not yet in place) ran overnight
+2026-08-18/19, ~50 min/round on 8 CPU workers, `data/exit/round{0,1,2}_policy.pth`. Result — the base
+beat every round, by a widening margin:
+
+| round | base vs round | agreement (pre→post distill) | policy_entropy (pre→post distill) |
+|---|---|---|---|
+| 0 | **0.70–0.75** | 0.749 → 0.858 | 0.469 → **0.875** |
+| 1 | 0.78 | 0.827 → 0.862 | 0.882 → 0.959 |
+| 2 | 0.82 | 0.858 → 0.866 | 0.957 → 0.988 |
+
+Same symptom the user reported before any of this section existed — "плays like an absolute
+beginner" — reproduced end to end with the exact numbers behind it: one round of distillation raised
+the policy's own entropy from 0.469 to 0.875 nats, i.e. it made the model's decisions almost twice as
+*undecided*, and the next two rounds kept climbing (never re-sharpening), because `cur_policy =
+out_policy` ran unconditionally regardless of the gauntlet report sitting right above it in the same
+log saying the round had lost.
+
+**This is the flattening failure the `evaluate_distillation` warning was written to catch, and it
+fired every round** (`visit_entropy (0.720) > pre-distill policy_entropy (0.469)` etc.) — logged,
+and then ignored, because a `logger.warning` is not a gate.
+
+**The size of the gap needed a second look at R.10.1.** M4 (a *controlled* sweep re-using the same
+handful of states across four budgets) measured Δ = visit_entropy − policy_entropy at **+0.031** at
+1.0 s — small, "softer but not collapsed," the basis for retracting the original flattening claim.
+The real run's *own* self-play data (23065 samples, the full state distribution a game actually
+visits, not a curated identical-state set) measured Δ = **+0.251** at the same nominal 1.0 s budget —
+eight times larger. Both measurements are correct; they answer different questions. M4 isolated "how
+does more budget change the entropy gap, holding the state fixed" (answer: shrinks it, converges by
+2 s). It says nothing about the *average* gap over a real trajectory, which includes many
+near-forced, lopsided, or already-clearly-won positions where the trained policy is close to a
+one-hot (entropy near 0) but the search still burns its ~97 expansions plus a flat 3 %
+(`--dirichlet-frac`) root-noise floor across every child — a fixed absolute noise cost that reads as
+enormous *relative* entropy exactly where the policy was already confident and correct. R.10.1's
+retraction stands for the budget-vs-budget comparison it measured; it should not have been read as
+"the production channel is fine," and this section did not say that explicitly enough. Corrected here.
+
+**Shipped, both directly targeting what actually broke, not the two items R.10.8 had queued next:**
+
+1. **`--visit-temp` (default 0.5), `src/services/expert_iteration.py:_sharpen_target`.** Raises the
+   recorded visit distribution to `1/visit_temp` and renormalises before it is used as the CE target
+   — in `distill()`'s training loop and in `evaluate_distillation()`'s before/after report, so the
+   logged numbers reflect what training actually sees rather than the raw recording (a monotonic
+   transform never changes the argmax, so `agreement` is unaffected). Verified on the real, already-
+   recorded `data/exit/round0.npz` — no new self-play needed: `visit_temp=1.0` (old default) mean
+   entropy 0.720 nats; `0.7` → 0.451; **`0.5` → 0.304**, chosen for a clear margin under the round's
+   0.469 policy_entropy without going as far as `0.15`'s near-one-hot 0.090. Re-running `distill` on
+   that exact dataset end to end at the new default: `policy_entropy` before/after **0.469 → 0.486**
+   (essentially flat, not 0.469 → 0.875) while `agreement` still rises **0.749 → 0.861** — the real
+   signal survives, the flattening does not.
+2. **Promotion gate, `cmd_loop` (`--promote-threshold`, default 0.5).** Each round's post-round
+   gauntlet result now gates advancement: the win rate of `round{r}_policy` against the checkpoint
+   *that round's self-play was generated from* (not the run's original base — that comparison is what
+   the existing report already showed, and it is not what decides whether to build the next round on
+   top of this one) must clear the threshold or the round is REJECTED — logged, kept on disk for
+   inspection, but the next round retries self-play from the same, still-current checkpoint instead of
+   compounding a regression. This is R.10.8 item 2's promotion half (the replay-window half is still
+   open); with it in place this exact run would have stopped after round 0 rather than running two
+   more rounds on top of a checkpoint that had already measurably lost.
+
+Both are covered by `tests/test_expert_iteration.py` (the pure sharpening function: no-op at
+`visit_temp=1.0`, lowers entropy below 1.0, preserves zeros/argmax, raises entropy above 1.0 — the
+promotion gate's branching is exercised by inspection, not unit-tested, since it is a thin
+`win_rate[...]  >=  threshold` read off gauntlet output already covered by `gauntlet_parallel`'s own
+tests).
+
+**Still open, unchanged from R.10.8:** item 1 (blind teacher, `see_opponent_hand=False` +
+`n_determinizations=3` for data-gen — 15.4 % of the teacher's moves depend on hidden state, as large
+as the whole improvement signal) and item 3 (the `val` split leaks 84 correlated samples per game
+under a random permutation, and is never used to early-stop). Neither was touched by this fix; both
+still apply on top of it. **Re-run `preflight` (now `--visit-temp`-aware, gate 4 reports the
+sharpened entropy) before the next `loop` invocation** — the two fixes above address why the last run
+made the model worse, not whether this run's teacher is strong enough to make it better, which is
+still items 0/3/4 in R.10.8's table.

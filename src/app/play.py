@@ -11,7 +11,7 @@ from src.services.gauntlet import PolicyAgent
 from src.services.policy.checkpoint import load_critic_checkpoint, load_policy_checkpoint
 from src.services.policy.policy import Critic, Policy
 
-DEFAULT_CRITIC_PATH = 'data/lookahead_critic/lookahead_critic_v2.pth'
+DEFAULT_CRITIC_PATH = 'data/lookahead_critic/lookahead_critic_v6.pth'
 
 
 def _find_latest_model() -> str:

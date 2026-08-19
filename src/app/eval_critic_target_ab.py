@@ -5,7 +5,7 @@
 clean: the shaped-return critic was `hidden_dim=192` and trained on a full PPO run, the `z`
 arm from `eval_board_value.py fit` was `hidden_dim=96` on 120k samples — different capacity,
 different data budget. Row 2b removes both confounds: the SAME `ValueArm` architecture, the
-SAME `hidden_dim`, the SAME sample count and seed, trained once on `data/exit/round*.npz`
+SAME `hidden_dim`, the SAME sample count and seed, trained once on `data/exit/**/round*.npz`
 (z-key = game outcome) and once on a `ppo.py --dump-returns-dir` shard set (z-key = shaped
 GAE return — same field name, per `PPOTrainer._maybe_dump_returns`, so `load_exit_dataset`
 and `train_arm` need no changes to consume either). Both fits are then scored against the
@@ -68,7 +68,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--policy', default=None,
                     help='policy checkpoint providing the obs encoder (default: latest)')
-    ap.add_argument('--z-data', default='data/exit/round*.npz',
+    ap.add_argument('--z-data', default='data/exit/**/round*.npz',
                     help='ExIt shards — z-key holds the game outcome')
     ap.add_argument('--shaped-data', required=True,
                     help="shards from 'ppo.py --dump-returns-dir' — z-key holds the shaped "

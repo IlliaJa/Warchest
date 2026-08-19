@@ -17,7 +17,9 @@ Four modes, cheapest first. Run them in this order; each can settle the question
                 within-state ranking problem, so this is the quantity that matters.
 
   fit           Supervised value regression on the ExIt datasets already on disk
-                (data/exit/round*.npz — ~30 rounds x ~16k (state -> z) samples). Three
+                (data/exit/**/round*.npz — ~30 rounds x ~16k (state -> z) samples;
+                `**` covers both the legacy flat files and the per-run subdirectories
+                expert_iteration.py writes now). Three
                 arms with an identical head:
                   globals  — board block removed (the control)
                   board    — full Critic: own HexConv trunk + split_pool
@@ -350,7 +352,9 @@ HOW TO READ — the "SAME verb, boards differ" line is the one to read.
 # Mode: fit — supervised value regression on the ExIt datasets
 # --------------------------------------------------------------------------- #
 def load_exit_dataset(pattern, max_samples, val_rounds, seed):
-    files = sorted(glob.glob(pattern))
+    # recursive: ExIt runs write into per-run `data/exit/{stamp}/` subdirectories
+    # (older runs left their round*.npz flat in data/exit/, which `**` also matches).
+    files = sorted(glob.glob(pattern, recursive=True))
     if not files:
         raise SystemExit(f'no dataset files matched {pattern!r}')
 
@@ -1097,7 +1101,7 @@ def main():
     d.set_defaults(func=mode_distinguish)
 
     f = sub.add_parser('fit', parents=[common], help='supervised value regression')
-    f.add_argument('--data', default='data/exit/round*.npz')
+    f.add_argument('--data', default='data/exit/**/round*.npz')
     f.add_argument('--max-samples', type=int, default=120000)
     f.add_argument('--val-rounds', type=int, default=5)
     f.add_argument('--epochs', type=int, default=3)

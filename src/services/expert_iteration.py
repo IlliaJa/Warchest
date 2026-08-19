@@ -327,15 +327,38 @@ def _pool_onehot():
     return v
 
 
+def _sharpen_target(visit_targets, visit_temp):
+    """Raise a normalised visit distribution to `1/visit_temp` and renormalise.
+
+    `visit_temp < 1` sharpens (peaks), `> 1` flattens; `1.0` is a no-op returned as-is.
+    Zero entries (illegal actions) stay zero under any positive power, so legality is
+    preserved. Exists because at this project's search budget the raw visit counts are
+    *less* decisive than the policy already distilling toward them — measured on
+    `data/exit/round0.npz` (2026-08-18): mean visit entropy 0.720 nats vs a pre-distill
+    policy entropy of 0.469, and one round of unsharpened distillation dragged the
+    policy's own entropy up to 0.875 (a confident policy turned into a near-uniform
+    one — the ExIt loop making the model measurably worse, `docs/IDEAS.md` R.10.8 item
+    2 turned R.10.9). `visit_temp=0.5` (the CLI default) brought the same dataset's
+    mean entropy down to 0.304, a clear margin under 0.469, without going as far as
+    the near-one-hot 0.090 nats `visit_temp=0.15` produces.
+    """
+    if visit_temp == 1.0:
+        return visit_targets
+    sharpened = visit_targets.clamp_min(0) ** (1.0 / visit_temp)
+    return sharpened / sharpened.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+
 def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=3e-4,
             lr_critic=3e-4, grad_clip=1.0, device='cpu', val_frac=0.1, log_every=1,
-            train_critic=True):
+            train_critic=True, visit_temp=0.5):
     """Distil `policy` (CE→visits) and, unless `train_critic=False`, `critic` (MSE→z).
 
     Two independent Adam passes (like PPO's separate actor/critic optimisers). The
-    policy CE is `-(visit_target * joint_log_probs).sum(1).mean()` over the full action
-    space — illegal ids sit at -1e9 in the log-probs but are zeroed by the target.
-    Returns per-epoch train stats plus a final held-out `(ce, mse, agreement)` from a
+    policy CE is `-(sharpened_target * joint_log_probs).sum(1).mean()` over the full
+    action space — illegal ids sit at -1e9 in the log-probs but are zeroed by the
+    target. `visit_target` is raised to `1/visit_temp` and renormalised before use
+    (`_sharpen_target`; `visit_temp=1.0` is the raw recorded distribution). Returns
+    per-epoch train stats plus a final held-out `(ce, mse, agreement)` from a
     `val_frac` tail split, so a caller can confirm both losses fell and the policy's
     argmax move now agrees more with the search's.
 
@@ -363,9 +386,10 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
         ce_sum = mse_sum = 0.0
         n_mb = 0
         for batch in dataset.iter_minibatches(minibatch_size, device, indices=train_idx):
-            # Policy: cross-entropy to the visit distribution.
+            # Policy: cross-entropy to the (sharpened) visit distribution.
             joint = policy.joint_log_probs_batch(batch)  # [B, A], illegal at -1e9
-            ce = -(batch['visit_targets'] * joint).sum(dim=1).mean()
+            tgt = _sharpen_target(batch['visit_targets'], visit_temp)
+            ce = -(tgt * joint).sum(dim=1).mean()
             p_opt.zero_grad()
             ce.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
@@ -390,23 +414,27 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
         if log_every and (epoch + 1) % log_every == 0:
             logger.info('distill: epoch %d/%d — ce=%.4f mse=%.4f', epoch + 1, epochs, stats['ce'], stats['mse'])
 
-    val = evaluate_distillation(dataset, policy, critic, device=device, indices=val_idx) if n_val else {}
+    val = evaluate_distillation(dataset, policy, critic, device=device, indices=val_idx,
+                                visit_temp=visit_temp) if n_val else {}
     return {'history': history, 'val': val, 'n_train': len(train_idx), 'n_val': n_val}
 
 
-def evaluate_distillation(dataset, policy, critic, *, device='cpu', indices=None, minibatch_size=512):
+def evaluate_distillation(dataset, policy, critic, *, device='cpu', indices=None,
+                          minibatch_size=512, visit_temp=1.0):
     """Held-out `(ce, mse, agreement, policy_entropy, visit_entropy)`:
-    - `ce`/`mse`: CE to visits, critic MSE to z (the actual training objectives).
+    - `ce`/`mse`: CE to visits (sharpened by `visit_temp`, see `_sharpen_target`),
+      critic MSE to z (the actual training objectives).
     - `agreement`: fraction where the policy's argmax legal action matches the
-      search's argmax visit.
+      search's argmax visit. Unaffected by `visit_temp` (a monotonic transform of a
+      distribution never changes its argmax).
     - `policy_entropy` / `visit_entropy`: mean entropy (nats) of the policy's own
-      distribution vs. the visit-count target it's being distilled toward. If
-      `visit_entropy` sits *above* `policy_entropy`, the search target is less
-      decisive than the policy already is — distilling toward it will flatten (not
-      sharpen) the policy, the opposite of the intended AlphaZero effect (usually a
-      sign the search ran too few simulations/move for its branching). Logged before
-      and after every distill call precisely so this is visible each round rather
-      than a silent regression.
+      distribution vs. the (sharpened) visit-count target it's being distilled
+      toward. If `visit_entropy` sits *above* `policy_entropy`, the search target is
+      less decisive than the policy already is — distilling toward it will flatten
+      (not sharpen) the policy, the opposite of the intended AlphaZero effect
+      (usually a sign the search ran too few simulations/move for its branching, or
+      that `visit_temp` needs to be lower). Logged before and after every distill
+      call precisely so this is visible each round rather than a silent regression.
     """
     policy.to(device).eval()
     critic.to(device).eval()
@@ -415,7 +443,7 @@ def evaluate_distillation(dataset, policy, critic, *, device='cpu', indices=None
     with torch.inference_mode():
         for batch in dataset.iter_minibatches(minibatch_size, device, shuffle=False, indices=indices):
             joint = policy.joint_log_probs_batch(batch)
-            tgt = batch['visit_targets']
+            tgt = _sharpen_target(batch['visit_targets'], visit_temp)
             ce_sum += float((-(tgt * joint).sum(dim=1)).sum().item())
             val = critic.value_batch(batch).reshape(-1)
             mse_sum += float(((val - batch['z']) ** 2).sum().item())

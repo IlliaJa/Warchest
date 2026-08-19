@@ -420,7 +420,7 @@ def main():
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument('--critic', required=True, help='critic checkpoint to test')
-    common.add_argument('--data', default='data/exit/round*.npz',
+    common.add_argument('--data', default='data/exit/**/round*.npz',
                         help='shards whose z-key is the GAME OUTCOME (not shaped returns)')
     common.add_argument('--max-samples', type=int, default=60000)
     common.add_argument('--val-rounds', type=int, default=5)

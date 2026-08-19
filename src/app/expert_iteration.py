@@ -8,13 +8,19 @@ worker pool (mirrors `rollout_collector.py`'s design for PPO rollout collection)
 from the project root:
 
     # one generation of self-play games -> a dataset (parallel by default)
-    python src/app/expert_iteration.py gen --games 200 --out data/exit/round0.npz
+    python src/app/expert_iteration.py gen --games 200
 
-    # distil a dataset into new nets (writes to data/exit/)
-    python src/app/expert_iteration.py distill --dataset data/exit/round0.npz
+    # distil a dataset into new nets
+    python src/app/expert_iteration.py distill --dataset data/exit/<run>/gen.npz
 
     # the full loop: gen -> distil -> re-seed puct -> gauntlet-check -> repeat
     python src/app/expert_iteration.py loop --rounds 5 --games 200
+
+Every invocation writes its artifacts into a fresh `data/exit/{launch timestamp}/`
+(`--run-dir` overrides it) together with a `meta.json` recording the invocation, so a
+new run can never overwrite an earlier run's datasets or checkpoints — it used to write
+`round{r}.npz` / `round{r}_policy.pth` flat into `data/exit/`, which silently destroyed
+the previous loop's nets. The run id matches `logs/exit_{run_id}.log`.
 
 ExIt artifacts live under `data/exit/` on purpose: the distilled critic predicts the
 game outcome z (scale [-1,1]), NOT the shaped PPO return, so it must never become the
@@ -29,10 +35,21 @@ After every round `loop` runs a small round-robin gauntlet (base policy vs. ever
 round's distilled policy so far, raw — no search, so it's cheap) via the existing
 `services/gauntlet.py` + `services/gauntlet_parallel.py` machinery, and logs the same
 win-rate/Bradley-Terry report `app/gauntlet.py` prints — this is the actual answer to
-"did this round make the policy stronger", not just whether CE/MSE went down.
+"did this round make the policy stronger", not just whether CE/MSE went down. That
+report also drives a promotion gate (`--promote-threshold`, default win rate 0.5
+against the checkpoint the round's self-play was generated from): a round that loses
+is REJECTED and the next round retries from the same checkpoint instead of building
+on a regression. Before this gate existed, a 3-round run accepted every round
+unconditionally and got monotonically weaker while its own gauntlet report showed
+it (base beat every round, 0.70/0.78/0.82 — docs/IDEAS.md R.10.9), which is also why
+the CE-target visit distribution is sharpened (`--visit-temp`, see
+`_sharpen_target`) rather than used raw: at this project's search budget it is
+measurably less decisive than the policy already distilling toward it, and
+unsharpened distillation was the mechanism behind that same regression.
 """
 import argparse
 import glob
+import json
 import logging
 import os
 import re
@@ -61,6 +78,36 @@ CRITIC_GLOB = 'data/lookahead_critic/lookahead_critic_v*.pth'
 EXIT_DIR = 'data/exit'
 
 logger = logging.getLogger('warchest')
+
+
+def resolve_run_dir(args, run_id):
+    """Per-run output directory: `data/exit/{run_id}/` unless --run-dir says otherwise.
+
+    Every artifact a run writes (datasets, distilled policy/critic checkpoints, the
+    run's `meta.json`) goes in here. Runs used to write `data/exit/round{r}.npz` +
+    `round{r}_policy.pth` flat, so a second `loop` silently overwrote the first one's
+    checkpoints — including a `PuctBot` seed someone still wanted. The run id is the
+    same launch timestamp as `logs/exit_{run_id}.log`, so a directory and its log
+    always pair up by name. The directory itself is only created once something is
+    written into it, so `preflight` (which writes nothing) leaves no empty dir behind.
+    """
+    return getattr(args, 'run_dir', None) or os.path.join(EXIT_DIR, run_id)
+
+
+def write_run_meta(args, run_dir, run_id, log_path):
+    """Drop the invocation into `{run_dir}/meta.json` so a stale run dir is identifiable."""
+    os.makedirs(run_dir, exist_ok=True)
+    meta = {
+        'run_id': run_id,
+        'cmd': args.cmd,
+        'argv': sys.argv[1:],
+        'log': log_path,
+        'args': {k: v for k, v in sorted(vars(args).items()) if k != 'func'},
+    }
+    path = os.path.join(run_dir, 'meta.json')
+    with open(path, 'w') as f:
+        json.dump(meta, f, indent=2, default=str)
+    return path
 
 
 def setup_run_logger(run_id):
@@ -200,10 +247,11 @@ def _run_distill(dataset, policy_path, critic_path, args, *, out_policy, out_cri
         raise SystemExit('policy/critic obs_version mismatch (see gen).')
 
     freeze = getattr(args, 'freeze_critic', False)
-    logger.info('distill: %d samples, %d epochs, minibatch=%d, lr=%.1e, critic=%s',
-                len(dataset), args.epochs, args.minibatch, args.lr,
+    logger.info('distill: %d samples, %d epochs, minibatch=%d, lr=%.1e, visit_temp=%.2f, critic=%s',
+                len(dataset), args.epochs, args.minibatch, args.lr, args.visit_temp,
                 'FROZEN (policy-only distillation)' if freeze else 'trained on z')
-    before = evaluate_distillation(dataset, policy, critic, device=args.device)
+    before = evaluate_distillation(dataset, policy, critic, device=args.device,
+                                   visit_temp=args.visit_temp)
     if before.get('agreement', 0.0) >= 0.9:
         logger.warning(
             'distill: pre-distill policy/search agreement is %.3f (>= 0.90) — the search is '
@@ -213,7 +261,7 @@ def _run_distill(dataset, policy_path, critic_path, args, *, out_policy, out_cri
             'spending the compute.', before['agreement'])
     res = distill(dataset, policy, critic, epochs=args.epochs, minibatch_size=args.minibatch,
                   lr_policy=args.lr, lr_critic=args.lr, device=args.device,
-                  val_frac=args.val_frac, train_critic=not freeze)
+                  val_frac=args.val_frac, train_critic=not freeze, visit_temp=args.visit_temp)
     after = res['val']
     logger.info('distill: held-out n_val=%d', res['n_val'])
     logger.info('distill: before %s', _fmt(before))
@@ -388,16 +436,17 @@ def cmd_preflight(args):
     gs = summarize_game_stats(game_stats)
     policy, _ = _load_policy(policy_path, 'cpu')
     critic, _ = _load_critic(critic_path, 'cpu')
-    ev = evaluate_distillation(ds, policy, critic, device='cpu')
+    ev = evaluate_distillation(ds, policy, critic, device='cpu', visit_temp=args.visit_temp)
     logger.info('self-play: %d samples, agreement %.3f, mean_visit_entropy %.3f nats',
                 gs['n_samples'], gs['mean_agreement'], gs['mean_visit_entropy'])
-    logger.info('pre-distill %s', _fmt(ev))
+    logger.info('pre-distill (visit_temp=%.2f) %s', args.visit_temp, _fmt(ev))
     if ev['visit_entropy'] > ev['policy_entropy']:
         logger.warning(
-            'FLATTENING TARGET: visit_entropy %.3f > policy_entropy %.3f — distilling this '
-            'target makes the policy less decisive, the opposite of the intended effect. '
-            'Lower --dirichlet-frac or raise --time-budget.',
-            ev['visit_entropy'], ev['policy_entropy'])
+            'FLATTENING TARGET: visit_entropy %.3f > policy_entropy %.3f (at visit_temp=%.2f) '
+            '— distilling this target makes the policy less decisive, the opposite of the '
+            'intended effect. Lower --visit-temp further, lower --dirichlet-frac, or raise '
+            '--time-budget.',
+            ev['visit_entropy'], ev['policy_entropy'], args.visit_temp)
         verdicts.append(('target sharpness', 'FAIL',
                          f"visit {ev['visit_entropy']:.3f} > policy {ev['policy_entropy']:.3f}"))
     else:
@@ -481,7 +530,7 @@ def cmd_gen(args):
     critic_path = args.critic or _latest_critic_path()
     if policy_path is None or critic_path is None:
         raise SystemExit('gen needs a policy and a critic checkpoint (none found).')
-    out = args.out or os.path.join(EXIT_DIR, 'gen.npz')
+    out = args.out or os.path.join(args.run_dir, 'gen.npz')
     _run_gen(policy_path, critic_path, args, value_mode=args.value_mode, out_path=out)
 
 
@@ -491,9 +540,8 @@ def cmd_distill(args):
     if policy_path is None or critic_path is None:
         raise SystemExit('distill needs base policy and critic checkpoints (none found).')
     ds = SelfPlayDataset.load(args.dataset)
-    ts = time.strftime('%Y%m%d-%H%M%S')
-    out_policy = args.out_policy or os.path.join(EXIT_DIR, f'policy_{ts}.pth')
-    out_critic = args.out_critic or os.path.join(EXIT_DIR, f'critic_{ts}.pth')
+    out_policy = args.out_policy or os.path.join(args.run_dir, 'policy.pth')
+    out_critic = args.out_critic or os.path.join(args.run_dir, 'critic.pth')
     _run_distill(ds, policy_path, critic_path, args, out_policy=out_policy, out_critic=out_critic)
 
 
@@ -502,7 +550,6 @@ def cmd_loop(args):
     base_critic = args.critic or _latest_critic_path()
     if base_policy is None or base_critic is None:
         raise SystemExit('loop needs base policy and critic checkpoints (none found).')
-    os.makedirs(EXIT_DIR, exist_ok=True)
 
     # One persistent worker pool for the whole loop (mirrors ppo.py's
     # `_lazy_init_collector`: spawned once, reused every round — each round's workers
@@ -514,24 +561,41 @@ def cmd_loop(args):
     # distilled policy so far, so each round's report shows the whole trend, not just
     # this round vs. base.
     field_specs = [{'kind': 'policy', 'path': base_policy}]
+    # Index into field_specs of the checkpoint each round's self-play is generated
+    # from. Only advances past a promoted round — see the gate below.
+    cur_idx = 0
+    if args.skip_gauntlet:
+        logger.warning(
+            '--skip-gauntlet disables the promotion gate: every round will be accepted '
+            'unconditionally regardless of whether it actually beat the checkpoint it '
+            'was generated from (this is exactly the bug that let a 3-round run get '
+            'monotonically weaker while its own reports showed it — docs/IDEAS.md R.10.9).')
 
     cur_policy, cur_critic, cur_mode = base_policy, base_critic, 'shaped'
     try:
         for r in range(args.rounds):
             round_t0 = time.perf_counter()
-            logger.info('=== ExIt round %d/%d (mode=%s) ===', r + 1, args.rounds, cur_mode)
-            ds_path = os.path.join(EXIT_DIR, f'round{r}.npz')
+            logger.info('=== ExIt round %d/%d (mode=%s, base=%s) ===',
+                        r + 1, args.rounds, cur_mode, os.path.basename(cur_policy))
+            ds_path = os.path.join(args.run_dir, f'round{r}.npz')
             ds = _run_gen(cur_policy, cur_critic, args, value_mode=cur_mode, out_path=ds_path,
                          collector=collector, desc=f'round {r + 1}/{args.rounds} self-play')
-            out_policy = os.path.join(EXIT_DIR, f'round{r}_policy.pth')
-            out_critic = os.path.join(EXIT_DIR, f'round{r}_critic.pth')
+            out_policy = os.path.join(args.run_dir, f'round{r}_policy.pth')
+            out_critic = os.path.join(args.run_dir, f'round{r}_critic.pth')
             before, after, critic_in_force = _run_distill(
                 ds, cur_policy, cur_critic, args,
                 out_policy=out_policy, out_critic=out_critic)
 
             field_specs.append({'kind': 'policy', 'path': out_policy})
+            new_idx = len(field_specs) - 1
+            promoted = True
             if not args.skip_gauntlet:
-                _run_post_round_gauntlet(field_specs, args)
+                out = _run_post_round_gauntlet(field_specs, args)
+                wr_vs_cur = float(out['win_rate'][new_idx, cur_idx])
+                promoted = wr_vs_cur >= args.promote_threshold
+                logger.info('round %d/%d vs its own base: %.3f (promote threshold %.2f) -> %s',
+                            r + 1, args.rounds, wr_vs_cur, args.promote_threshold,
+                            'PROMOTED' if promoted else 'REJECTED')
 
             logger.info(
                 'round %d/%d done in %.1fs — agreement %.3f -> %.3f, critic mse %.4f -> %.4f',
@@ -539,17 +603,28 @@ def cmd_loop(args):
                 before.get('agreement', 0.0), after.get('agreement', 0.0),
                 before.get('mse', 0.0), after.get('mse', 0.0),
             )
+            if not promoted:
+                logger.warning(
+                    'round %d/%d REJECTED: round%d_policy did not beat %s (win rate %.3f < '
+                    '%.2f). Keeping %s as the base for the next round instead of building on '
+                    'a regression — this is the gate that would have stopped the '
+                    '2026-08-18 run after round 0 (it lost to base 0.25-0.30).',
+                    r + 1, args.rounds, r, os.path.basename(cur_policy), wr_vs_cur,
+                    args.promote_threshold, os.path.basename(cur_policy))
+                continue
+
             # With --freeze-critic the critic never changes scale, so the search stays in
             # the 'shaped' mode that produced the only ExIt round that helped. Otherwise the
             # critic is now z-scale from this round on and must be paired with outcome mode.
             cur_policy = out_policy
             cur_critic = critic_in_force
             cur_mode = cur_mode if args.freeze_critic else 'outcome'
+            cur_idx = new_idx
     finally:
         if collector is not None:
             collector.shutdown()
-    logger.info('ExIt loop finished. Latest nets: policy=%s critic=%s (value_mode=%s).',
-                cur_policy, cur_critic, cur_mode)
+    logger.info('ExIt loop finished in %s. Best promoted nets: policy=%s critic=%s (value_mode=%s).',
+                args.run_dir, cur_policy, cur_critic, cur_mode)
 
 
 # --------------------------------------------------------------------------- #
@@ -559,6 +634,11 @@ def _add_common(p):
     p.add_argument('--policy', default=None, help='Base policy .pth (default: newest data/warchest_ppo_*.pth).')
     p.add_argument('--critic', default=None, help='Base critic .pth (default: newest lookahead_critic_v*.pth).')
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--run-dir', default=None,
+                   help='Directory for this run\'s artifacts (datasets, distilled nets, '
+                        'meta.json). Default: data/exit/{launch timestamp}/ — one fresh '
+                        'directory per invocation, so a new run can never overwrite an '
+                        'earlier one\'s checkpoints. Pass an existing path to add to it.')
     p.add_argument('--n-workers', type=int, default=min(os.cpu_count() or 4, 8),
                    help='Parallel self-play worker processes (mirrors ppo.py\'s rollout '
                         'workers). 1 = sequential in-process. Also the worker count for '
@@ -606,6 +686,23 @@ def _add_common(p):
     p.add_argument('--minibatch', type=int, default=256)
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--val-frac', type=float, default=0.1)
+    p.add_argument('--visit-temp', type=float, default=0.5,
+                   help="Sharpening exponent applied to the recorded visit distribution "
+                        "before it is used as the CE target (`t = t**(1/visit_temp)`, "
+                        "renormalised; 1.0 = off, the raw AlphaZero convention). Exists "
+                        "because at this project's search budget the raw visit counts are "
+                        "measurably LESS decisive than the policy already distilling toward "
+                        "them: on `data/exit/round0.npz` (2026-08-18, --time-budget 1.0) mean "
+                        "visit entropy was 0.720 nats against a pre-distill policy entropy of "
+                        "0.469, and one round of unsharpened distillation dragged the policy's "
+                        "own entropy up to 0.875 — the loop making the model measurably worse "
+                        "(base beat every one of 3 rounds by a widening margin, 0.70/0.78/0.82; "
+                        "docs/IDEAS.md R.10.9). 0.5 measured 0.304 nats on that same dataset, a "
+                        "clear margin under 0.469; canonical high-sim-count AlphaZero doesn't "
+                        "need this knob because its search naturally concentrates visits via "
+                        "PUCT's positive feedback loop before ~800 sims are spent, which ~97 "
+                        "expansions at max_branching=8 does not have time to do. Re-check via "
+                        "`preflight`'s gate 4 whenever --time-budget or --max-branching change.")
     p.add_argument('--freeze-critic', action='store_true',
                    help="Distil the POLICY only; leave the critic bit-identical and keep the "
                         "search in value_mode='shaped' for every round. This is the "
@@ -640,9 +737,26 @@ def main():
     _add_common(lp)
     lp.add_argument('--rounds', type=int, default=3)
     lp.add_argument('--gauntlet-k-games', type=int, default=20,
-                    help='Games per pair in the post-round gauntlet check. Default 20.')
+                    help='Games per pair in the post-round gauntlet check, which now also '
+                         'decides promotion (see --promote-threshold). se(WR) ~ 11pp at the '
+                         'default 20 — raise this if rounds are being rejected/accepted on '
+                         'what looks like noise; a rejection only costs a wasted round (the '
+                         'next one retries from the same, still-best, checkpoint), so this '
+                         'is deliberately conservative rather than tuned for throughput.')
+    lp.add_argument('--promote-threshold', type=float, default=0.5,
+                    help="Minimum win rate a round's distilled policy must score against the "
+                         "checkpoint its self-play was generated from (not the run's original "
+                         "base) to be accepted; otherwise the round is REJECTED and the next "
+                         "round retries self-play from the same, unpromoted checkpoint instead "
+                         "of building on a regression. Without this gate, `cur_policy = "
+                         "out_policy` happened unconditionally and produced a 3-round run "
+                         "where the base beat every round by a widening margin (0.70 / 0.78 / "
+                         "0.82 — docs/IDEAS.md R.10.9) while the loop kept building the next "
+                         "round on top of the previous one's regression regardless.")
     lp.add_argument('--skip-gauntlet', action='store_true',
-                    help='Skip the post-round gauntlet check (faster iteration).')
+                    help='Skip the post-round gauntlet check. Also disables the promotion '
+                         'gate above (there is no win-rate to gate on) — every round is then '
+                         'accepted unconditionally, which is the pre-fix behaviour.')
     lp.set_defaults(func=cmd_loop)
 
     pf = sub.add_parser('preflight',
@@ -665,7 +779,14 @@ def main():
     args = parser.parse_args()
     run_id = time.strftime('%Y%m%d-%H%M%S')
     log_path = setup_run_logger(run_id)
-    logger.info('expert iteration: cmd=%s, logging to %s', args.cmd, log_path)
+    args.run_dir = resolve_run_dir(args, run_id)
+    if args.cmd == 'preflight':
+        # Preflight writes no artifacts; do not leave an empty run directory behind.
+        logger.info('expert iteration: cmd=%s, logging to %s', args.cmd, log_path)
+    else:
+        meta_path = write_run_meta(args, args.run_dir, run_id, log_path)
+        logger.info('expert iteration: cmd=%s, run_dir=%s, logging to %s (invocation in %s)',
+                    args.cmd, args.run_dir, log_path, meta_path)
     args.func(args)
 
 

@@ -222,7 +222,7 @@ state-clustered bootstrap and both point at the critic's *training* rather than 
    the gap or the `hidden_dim`/data confounds do.
 
    **Prerequisite, and it is not free:** no shaped-return target exists on disk.
-   `data/exit/*.npz` stores only `z` (`boards, globals, masks, visit_targets, opp_onehots,
+   `data/exit/**/*.npz` stores only `z` (`boards, globals, masks, visit_targets, opp_onehots,
    privileged, z`), and `RolloutBuffer.returns` is computed in memory during PPO and never
    dumped. So this needs a collection step first — add a `(board, global, opp, priv,
    shaped_return)` dump to `ppo.py`'s rollout, then re-fit. Budget half a day for the dump
