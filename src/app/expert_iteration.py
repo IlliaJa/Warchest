@@ -46,6 +46,15 @@ the CE-target visit distribution is sharpened (`--visit-temp`, see
 `_sharpen_target`) rather than used raw: at this project's search budget it is
 measurably less decisive than the policy already distilling toward it, and
 unsharpened distillation was the mechanism behind that same regression.
+
+Both fixes above stop a round from *overwriting* the last one, but a round-0-only
+regression can still recur even with a correctly-sharpened target and a working gate,
+because `distill()` used to see only the round it was just handed — one network's
+~25k-sample self-play slice, refit for several epochs, with nothing from any earlier
+round to anchor it (docs/IDEAS.md R.10.5a). `--replay-rounds` (default 3, see
+`services.expert_iteration.ReplayWindow`) closes that: each round now trains on the
+concatenation of the last few rounds' datasets, a sliding window over generations the
+way every AlphaZero-family trainer keeps one, rather than one round's narrow slice.
 """
 import argparse
 import glob
@@ -63,6 +72,7 @@ import torch
 
 from src.services.expert_iteration import (
     generate_selfplay, summarize_game_stats, distill, evaluate_distillation, SelfPlayDataset,
+    ReplayWindow,
 )
 from src.services.selfplay_collector import ParallelSelfPlayCollector
 from src.services.bots.puct_bot import PuctBot
@@ -571,6 +581,13 @@ def cmd_loop(args):
             'was generated from (this is exactly the bug that let a 3-round run get '
             'monotonically weaker while its own reports showed it — docs/IDEAS.md R.10.9).')
 
+    # Sliding window over the last --replay-rounds rounds' self-play data (docs/IDEAS.md
+    # R.10.5a, R.10.8 item 2): each round still writes its own round{r}.npz, but distill()
+    # now trains on the concatenation of the last few rounds rather than this round alone,
+    # so one round's narrow, single-network self-play slice can't fully overwrite what
+    # earlier rounds taught. --replay-rounds 1 reproduces the old one-round-only behaviour.
+    replay = ReplayWindow(args.replay_rounds)
+
     cur_policy, cur_critic, cur_mode = base_policy, base_critic, 'shaped'
     try:
         for r in range(args.rounds):
@@ -580,10 +597,15 @@ def cmd_loop(args):
             ds_path = os.path.join(args.run_dir, f'round{r}.npz')
             ds = _run_gen(cur_policy, cur_critic, args, value_mode=cur_mode, out_path=ds_path,
                          collector=collector, desc=f'round {r + 1}/{args.rounds} self-play')
+            replay.push(ds)
+            train_ds = replay.concat()
+            logger.info('round %d/%d: training on %d samples buffered over %d round(s) '
+                        '(this round contributed %d)', r + 1, args.rounds, len(train_ds),
+                        len(replay), len(ds))
             out_policy = os.path.join(args.run_dir, f'round{r}_policy.pth')
             out_critic = os.path.join(args.run_dir, f'round{r}_critic.pth')
             before, after, critic_in_force = _run_distill(
-                ds, cur_policy, cur_critic, args,
+                train_ds, cur_policy, cur_critic, args,
                 out_policy=out_policy, out_critic=out_critic)
 
             field_specs.append({'kind': 'policy', 'path': out_policy})
@@ -757,6 +779,17 @@ def main():
                     help='Skip the post-round gauntlet check. Also disables the promotion '
                          'gate above (there is no win-rate to gate on) — every round is then '
                          'accepted unconditionally, which is the pre-fix behaviour.')
+    lp.add_argument('--replay-rounds', type=int, default=3,
+                    help="Train each round on the concatenation of the last N rounds' self-play "
+                         "data (a sliding window, oldest dropped first) instead of this round's "
+                         "~25k-sample slice alone. 1 reproduces the old one-round-only behaviour. "
+                         "Ships docs/IDEAS.md R.10.8 item 2's replay-window half (the promotion-gate "
+                         "half shipped 2026-08-19): distilling on one round only means each fine-tune "
+                         "sees a single network's narrow self-play distribution and nothing else, "
+                         "which the record ties to the same churn signature as an untrained critic "
+                         "(independent_opponents.md §1: held-out MSE re-fit within a round but did "
+                         "not generalise to the next one). Cost is RAM only (~0.5 GB/300-game round, "
+                         "`SelfPlayDataset.concat`), so the default keeps 3 rounds in the window.")
     lp.set_defaults(func=cmd_loop)
 
     pf = sub.add_parser('preflight',

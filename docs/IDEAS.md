@@ -2271,3 +2271,56 @@ still apply on top of it. **Re-run `preflight` (now `--visit-temp`-aware, gate 4
 sharpened entropy) before the next `loop` invocation** — the two fixes above address why the last run
 made the model worse, not whether this run's teacher is strong enough to make it better, which is
 still items 0/3/4 in R.10.8's table.
+
+### R.10.10 Replay window shipped (2026-08-19), and a recorded fallback if it still isn't enough
+
+Both `loop --freeze-critic --time-budget 1.0` and `--time-budget 2.0` re-runs (2026-08-19, on
+desktop-legion, `data/exit/20260819-111340` and `.../20260819-131927`) confirmed the two R.10.9 fixes
+work exactly as designed — `policy_entropy` stays flat round to round instead of blowing up, and every
+round that lost to its own base was correctly REJECTED, so nothing compounded — **and still netted
+zero improvement**: every independently-generated round, always starting fresh from the untouched
+base, still lost to it (0.40/0.33/0.23 at 1.0 s; 0.467/0.433 at 2.0 s before the run was stopped for
+this diagnosis). Sharpening and the gate fixed the mechanism that made rounds *actively worse*; they
+were never going to fix a mechanism that keeps rounds merely *not better*.
+
+A clean split of one round's own recorded data (`data/exit/round0.npz`, agree vs. disagree with the
+policy's own argmax) pinned that second mechanism down directly, independent of R.10.4's hidden-
+information story: `disagree_only` distillation loses to base **0.28–0.29**, `agree_only` loses more
+mildly at **0.40–0.41**, and `agree_only` beats `disagree_only` head-to-head **0.70** — confirmed at
+both k=40 and k=80. Epoch count (1 vs 4) and learning rate (1e-4 vs 3e-4) were also swept across both
+loop runs and made no reliable difference — every combination lost to base by a similar margin, ruling
+out "distillation hyperparameters" as the lever. If the hidden-opponent-hand story (R.10.4) were the
+dominant mechanism it would corrupt agree and disagree samples alike, not cleanly separate them this
+way — this result is closer kin to R.10.5a's overfitting story: `distill()` was fitting `epochs=4` at
+`lr=3e-4` to one round's ~25k-sample, single-network self-play slice with nothing from any earlier
+round to anchor it, which is exactly the missing replay window R.10.8 item 2 already named as cheap
+and already-scoped (`SelfPlayDataset.concat` existed before this fix; only the sliding-window
+bookkeeping was missing).
+
+**Shipped:** `ReplayWindow` (`src/services/expert_iteration.py`) and `--replay-rounds` (default 3,
+`src/app/expert_iteration.py cmd_loop`). Each round still self-plays and saves its own
+`round{r}.npz`, but `distill()` now trains on the concatenation of the last `--replay-rounds` rounds'
+datasets rather than the current round alone — `--replay-rounds 1` reproduces the exact pre-fix
+behaviour. A round's data stays in the window even if that round is later REJECTED by the promotion
+gate: a rejected round's retry self-plays from the same checkpoint, so the data is still drawn from
+the retry's own distribution rather than being stale. Covered by
+`tests/test_expert_iteration.py`'s `ReplayWindow` tests (single-round no-op, concatenation within the
+window, dropping the oldest round past the window size). Not yet re-run on desktop-legion — the two
+loop runs above predate this fix.
+
+**Recorded fallback if the replay window alone doesn't turn the loop net-positive — do not build this
+yet, only measure it if the window fails:** retire CE-imitation of the search's move choice entirely
+and use `PuctBot` as an on-policy PPO sparring opponent instead of a behavior-cloning teacher. The
+premise behind ExIt — that the search is a genuinely stronger player than the raw policy — is not in
+question: a clean matched-seed, matched-machine A/B this session (`preflight --time-budget 1.0`,
+dirichlet settings identical to gate 3) measured PUCT at **0.76–0.79** against the raw policy,
+consistent across two independent runs and refuting an earlier, weaker 0.567 remote read (n=60,
+single seed — concluded to be sampling noise, not a real weak-teacher effect). What may not survive
+the transfer is specifically *one-shot CE-to-visit-distribution imitation* of that strength: PUCT's
+edge comes from multi-ply lookahead, and cloning the argmax move it happened to land on in one game is
+a lossy, indirect way to transfer a lookahead advantage, especially on the ~26 % of positions where its
+choice disagrees with the policy's own (the sub-batch measured most harmful above). PPO's existing
+opponent-pool machinery (`src/services/opponent_pool.py`) already supports adding a fixed opponent
+into self-play; adding `PuctBot` there lets the policy improve via its own on-policy PPO gradient
+against a stronger opponent — with PPO's clip acting as the trust region the replay window only
+approximates by diluting the update — rather than via imitation of its move choices at all. Untried.

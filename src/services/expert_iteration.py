@@ -168,6 +168,38 @@ class SelfPlayDataset:
             }
 
 
+class ReplayWindow:
+    """A sliding window of the last `max_rounds` self-play `SelfPlayDataset`s.
+
+    `cmd_loop` (app/expert_iteration.py) used to call `distill()` on the round it had
+    just generated only — one round, ~25k samples for a 300-game round — so every
+    round's fine-tune saw a single network's narrow self-play slice and nothing else
+    (docs/IDEAS.md R.10.5a, R.10.8 item 2). Every AlphaZero-family trainer instead
+    samples from a window over several generations; this is that window. `push` keeps
+    the most recent `max_rounds` datasets (oldest dropped first) regardless of whether
+    the round that produced them was later promoted — a rejected round retries
+    self-play from the same checkpoint, so its data is still drawn from the same
+    distribution as the retry and stays useful pool for it.
+    """
+
+    def __init__(self, max_rounds):
+        self.max_rounds = max(1, max_rounds)
+        self._datasets = []
+
+    def push(self, dataset):
+        self._datasets.append(dataset)
+        if len(self._datasets) > self.max_rounds:
+            self._datasets.pop(0)
+
+    def concat(self):
+        if len(self._datasets) == 1:
+            return self._datasets[0]
+        return SelfPlayDataset.concat(self._datasets)
+
+    def __len__(self):
+        return len(self._datasets)
+
+
 def _ego_visit_target(visit_counts, mover):
     """Absolute-frame `{action_id: prob}` → dense ego-frame [A] target vector.
 
