@@ -257,9 +257,10 @@ def _run_distill(dataset, policy_path, critic_path, args, *, out_policy, out_cri
         raise SystemExit('policy/critic obs_version mismatch (see gen).')
 
     freeze = getattr(args, 'freeze_critic', False)
-    logger.info('distill: %d samples, %d epochs, minibatch=%d, lr=%.1e, visit_temp=%.2f, critic=%s',
+    logger.info('distill: %d samples, %d epochs, minibatch=%d, lr=%.1e, visit_temp=%.2f, '
+                'kl_coeff=%.2f, critic=%s',
                 len(dataset), args.epochs, args.minibatch, args.lr, args.visit_temp,
-                'FROZEN (policy-only distillation)' if freeze else 'trained on z')
+                args.kl_coeff, 'FROZEN (policy-only distillation)' if freeze else 'trained on z')
     before = evaluate_distillation(dataset, policy, critic, device=args.device,
                                    visit_temp=args.visit_temp)
     if before.get('agreement', 0.0) >= 0.9:
@@ -271,7 +272,8 @@ def _run_distill(dataset, policy_path, critic_path, args, *, out_policy, out_cri
             'spending the compute.', before['agreement'])
     res = distill(dataset, policy, critic, epochs=args.epochs, minibatch_size=args.minibatch,
                   lr_policy=args.lr, lr_critic=args.lr, device=args.device,
-                  val_frac=args.val_frac, train_critic=not freeze, visit_temp=args.visit_temp)
+                  val_frac=args.val_frac, train_critic=not freeze, visit_temp=args.visit_temp,
+                  kl_coeff=args.kl_coeff)
     after = res['val']
     logger.info('distill: held-out n_val=%d', res['n_val'])
     logger.info('distill: before %s', _fmt(before))
@@ -725,6 +727,15 @@ def _add_common(p):
                         "PUCT's positive feedback loop before ~800 sims are spent, which ~97 "
                         "expansions at max_branching=8 does not have time to do. Re-check via "
                         "`preflight`'s gate 4 whenever --time-budget or --max-branching change.")
+    p.add_argument('--kl-coeff', type=float, default=0.0,
+                   help="Trust-region penalty added to the policy loss: "
+                        "kl_coeff * KL(policy_at_round_start || policy). 0.0 (default) is the "
+                        "old, unregularised CE-only distillation. Complements --replay-rounds: "
+                        "the replay window controls which data a round trains on, this controls "
+                        "how far plain CE (which has no trust region, unlike PPO's clip) is "
+                        "allowed to move the policy on it in `epochs` passes at `lr` "
+                        "(docs/IDEAS.md R.10.10). Untuned — calibrate with a quick `distill` + "
+                        "gauntlet check on an existing dataset before trusting a value here.")
     p.add_argument('--freeze-critic', action='store_true',
                    help="Distil the POLICY only; leave the critic bit-identical and keep the "
                         "search in value_mode='shaped' for every round. This is the "

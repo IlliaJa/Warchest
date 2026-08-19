@@ -15,7 +15,7 @@ it.
 import numpy as np
 import torch
 
-from src.services.expert_iteration import ReplayWindow, SelfPlayDataset, _sharpen_target
+from src.services.expert_iteration import ReplayWindow, SelfPlayDataset, _kl_to_reference, _sharpen_target
 
 
 def _fake_dataset(n):
@@ -97,3 +97,25 @@ def test_replay_window_drops_the_oldest_round_past_its_size():
 def test_replay_window_clamps_max_rounds_to_at_least_one():
     w = ReplayWindow(max_rounds=0)
     assert w.max_rounds == 1
+
+
+def test_kl_to_reference_is_zero_when_identical():
+    joint = torch.tensor([[0.5, 0.3, 0.2]]).log()
+    kl = _kl_to_reference(joint, joint)
+    assert abs(float(kl)) < 1e-6
+
+
+def test_kl_to_reference_is_positive_for_different_distributions():
+    ref = torch.tensor([[0.5, 0.3, 0.2]]).log()
+    new = torch.tensor([[0.2, 0.3, 0.5]]).log()
+    kl = _kl_to_reference(ref, new)
+    assert float(kl) > 0
+
+
+def test_kl_to_reference_ignores_illegal_actions():
+    ref = torch.tensor([[0.6, 0.4, 1e-30]]).log()
+    ref[0, 2] = -1e9
+    new_diff = ref.clone()
+    new_diff[0, 2] = -50.0  # wildly different from ref's -1e9 there; exp(-1e9) == 0, so it shouldn't matter
+    kl = _kl_to_reference(ref, new_diff)
+    assert abs(float(kl)) < 1e-6

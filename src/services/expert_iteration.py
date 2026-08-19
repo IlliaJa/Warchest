@@ -32,6 +32,7 @@ self-inverse) so they line up index-for-index with the masked policy logits. Pol
 critic must share one `obs_version` (they always do when saved from one PPO run); this
 is asserted by the caller.
 """
+import copy
 import logging
 
 import numpy as np
@@ -380,9 +381,18 @@ def _sharpen_target(visit_targets, visit_temp):
     return sharpened / sharpened.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
 
+def _kl_to_reference(ref_joint, joint):
+    """KL(ref || new) from two joint log-prob tensors `[B, A]` (illegal ids at -1e9,
+    `exp(-1e9) == 0` so they drop out of the sum on their own — no mask needed).
+    Mean over the batch, matching how `ce` is already averaged in `distill`.
+    """
+    ref_probs = ref_joint.exp()
+    return (ref_probs * (ref_joint - joint)).sum(dim=1).mean()
+
+
 def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=3e-4,
             lr_critic=3e-4, grad_clip=1.0, device='cpu', val_frac=0.1, log_every=1,
-            train_critic=True, visit_temp=0.5):
+            train_critic=True, visit_temp=0.5, kl_coeff=0.0):
     """Distil `policy` (CE→visits) and, unless `train_critic=False`, `critic` (MSE→z).
 
     Two independent Adam passes (like PPO's separate actor/critic optimisers). The
@@ -401,6 +411,15 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
     critic; every round that ran on the self-distilled `z`-critic got weaker, and row 2b
     independently measured `z` as the worse of the two targets. With the critic frozen the
     leaf value cannot drift round to round, so the loop has exactly one moving part.
+
+    `kl_coeff > 0` adds `kl_coeff * KL(policy_at_round_start || policy)` to the policy
+    loss (`docs/IDEAS.md` R.10.10's replay window addresses *which* data a round trains
+    on; this addresses *how far* one round is allowed to move the policy on it — plain
+    CE has no trust region at all, unlike PPO's clip, so `epochs=4` at `lr=3e-4` can push
+    arbitrarily far from a policy that was already fine everywhere the round's narrow
+    self-play didn't visit). The reference is a frozen snapshot of `policy` taken before
+    training starts, so the penalty is against where the round began, not a moving
+    target. `0.0` (default) is the old, unregularised behaviour.
     """
     n = len(dataset)
     n_val = max(1, int(n * val_frac)) if val_frac else 0
@@ -413,19 +432,35 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
     p_opt = torch.optim.Adam(policy.parameters(), lr=lr_policy)
     c_opt = torch.optim.Adam(critic.parameters(), lr=lr_critic) if train_critic else None
 
+    ref_policy = None
+    if kl_coeff > 0:
+        ref_policy = copy.deepcopy(policy).to(device).eval()
+        for p in ref_policy.parameters():
+            p.requires_grad_(False)
+
     history = []
     for epoch in range(epochs):
-        ce_sum = mse_sum = 0.0
+        ce_sum = mse_sum = kl_sum = 0.0
         n_mb = 0
         for batch in dataset.iter_minibatches(minibatch_size, device, indices=train_idx):
-            # Policy: cross-entropy to the (sharpened) visit distribution.
+            # Policy: cross-entropy to the (sharpened) visit distribution, plus an
+            # optional KL trust-region term against the round's starting policy.
             joint = policy.joint_log_probs_batch(batch)  # [B, A], illegal at -1e9
             tgt = _sharpen_target(batch['visit_targets'], visit_temp)
             ce = -(tgt * joint).sum(dim=1).mean()
+            loss = ce
+            kl = None
+            if ref_policy is not None:
+                with torch.no_grad():
+                    ref_joint = ref_policy.joint_log_probs_batch(batch)
+                kl = _kl_to_reference(ref_joint, joint)
+                loss = ce + kl_coeff * kl
             p_opt.zero_grad()
-            ce.backward()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
             p_opt.step()
+            if kl is not None:
+                kl_sum += float(kl.item())
 
             # Critic: MSE to the game outcome z (raw output, no return-normaliser).
             # Skipped entirely when frozen — including the forward, so a frozen run costs
@@ -441,10 +476,12 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
 
             ce_sum += float(ce.item())
             n_mb += 1
-        stats = {'epoch': epoch, 'ce': ce_sum / max(1, n_mb), 'mse': mse_sum / max(1, n_mb)}
+        stats = {'epoch': epoch, 'ce': ce_sum / max(1, n_mb), 'mse': mse_sum / max(1, n_mb),
+                 'kl': kl_sum / max(1, n_mb)}
         history.append(stats)
         if log_every and (epoch + 1) % log_every == 0:
-            logger.info('distill: epoch %d/%d — ce=%.4f mse=%.4f', epoch + 1, epochs, stats['ce'], stats['mse'])
+            logger.info('distill: epoch %d/%d — ce=%.4f mse=%.4f kl=%.4f',
+                        epoch + 1, epochs, stats['ce'], stats['mse'], stats['kl'])
 
     val = evaluate_distillation(dataset, policy, critic, device=device, indices=val_idx,
                                 visit_temp=visit_temp) if n_val else {}
