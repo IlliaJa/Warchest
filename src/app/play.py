@@ -4,6 +4,7 @@ import os
 
 import torch
 
+from src.services.bots.puct_bot import PuctBot
 from src.services.environment.interactive_renderer import PlayRenderer
 from src.services.environment.obs_encoders import get_encoder
 from src.services.environment.warchest_env import WarChestEnv
@@ -34,6 +35,15 @@ if __name__ == '__main__':
                              "'pool' is the closest proxy for a human opponent).")
     parser.add_argument('--save-dir', type=str, default='data/games',
                         help='Directory finished games are saved to (see game_record.py).')
+    parser.add_argument('--puct', action='store_true',
+                        help='Play against PuctBot (search over --model-path/--critic-path) '
+                             'instead of the raw policy.')
+    parser.add_argument('--puct-time-budget', type=float, default=1.0,
+                        help='PuctBot per-move search budget in seconds (--puct only).')
+    parser.add_argument('--puct-max-branching', type=int, default=8,
+                        help='PuctBot branching cap per node (--puct only).')
+    parser.add_argument('--puct-c', type=float, default=1.5,
+                        help='PuctBot PUCT exploration constant (--puct only).')
     args = parser.parse_args()
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -49,7 +59,20 @@ if __name__ == '__main__':
                     arch=ckpt['arch']).to(device)
     policy.load_state_dict(ckpt['state_dict'])
     policy.eval()
-    opponent = PolicyAgent(os.path.basename(model_path), policy, policy_encoder)
+
+    if args.puct:
+        if not args.critic_path:
+            raise SystemExit('--puct needs a critic (--critic-path); it is the leaf value the search uses.')
+        opponent = PuctBot(
+            policy_path=model_path, critic_path=args.critic_path,
+            c_puct=args.puct_c, max_branching=args.puct_max_branching,
+            time_budget=args.puct_time_budget, device=device,
+            name=f'puct({os.path.basename(model_path)})',
+        )
+        print(f'Opponent: PuctBot, time_budget={args.puct_time_budget}s, '
+              f'max_branching={args.puct_max_branching}, c_puct={args.puct_c}')
+    else:
+        opponent = PolicyAgent(os.path.basename(model_path), policy, policy_encoder)
 
     critic, critic_encoder = None, None
     value_scale, value_shift = 1.0, 0.0
