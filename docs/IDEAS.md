@@ -2324,3 +2324,51 @@ opponent-pool machinery (`src/services/opponent_pool.py`) already supports addin
 into self-play; adding `PuctBot` there lets the policy improve via its own on-policy PPO gradient
 against a stronger opponent — with PPO's clip acting as the trust region the replay window only
 approximates by diluting the update — rather than via imitation of its move choices at all. Untried.
+
+### R.10.11 A KL trust region, calibrated offline, plus the round-8 run this rests on (2026-08-19)
+
+The user launched the replay-window loop themselves; round 1/3 lost to base **0.40**, same as every
+prior round-0 measurement. Expected, and not a verdict on the replay window: round 1 has no earlier
+round to buffer against, so `--replay-rounds` cannot do anything differently there — it only changes
+what round 2+ trains on. It is, however, a clean second confirmation that plain CE distillation has no
+defense of its own: `epochs=4` at `lr=3e-4` has no equivalent of PPO's clip, so nothing stops one round
+from moving arbitrarily far off a policy that was already fine everywhere that round's ~23k-sample
+self-play didn't visit.
+
+**Shipped:** `kl_coeff * KL(policy_at_round_start || policy)` added to the policy loss in `distill()`
+(`_kl_to_reference`, `src/services/expert_iteration.py`), wired as `--kl-coeff` (default `0.0`, old
+behaviour). The reference is a frozen snapshot of the policy taken before the round's training starts.
+This is not an alternative to the replay window — it answers a different question (*how far* one
+round is allowed to move on its data, vs. *which* data it trains on) and the two compose.
+
+**Calibrated offline, no new self-play needed** (mirrors how `--visit-temp` was calibrated on the same
+kind of already-recorded dataset): re-ran `distill --freeze-critic --visit-temp 0.5` on the interrupted
+run's real `round0.npz` (22964 samples, the same one that measured 0.40) at `--kl-coeff` ∈ {0, 0.3, 1,
+2, 3, 5, 8, 15}, then gauntleted every resulting checkpoint against base.
+
+| kl_coeff | WR vs base (k=60) | WR vs base (k=150) |
+|---|---|---|
+| 0.0 (old default) | 0.40 | — |
+| 0.3 – 3.0 | 0.40 – 0.55, noisy, no clear trend | — |
+| 8.0 | 0.45 | **0.47** |
+| 15.0 | 0.57 | **0.48** |
+
+The k=60 sweep alone is not trustworthy in isolation — a 6-agent round-robin at k=60/pair has real
+intransitivity (fraction 0.10–0.20 across the two sweep runs), and kl=3.0 alone moved from 0.55 to 0.40
+between two different seeds/fields, a swing bigger than one pair's own noise. The k=150, base-only
+3-agent re-check on the two most promising values (8.0, 15.0) is the number to trust, and it says: KL
+regularisation at this strength does not yet make the round better than base, but it stops the round
+from being reliably *worse* — 0.47/0.48 is a wash, not the 0.40 loss every unregularised round measured
+in this document's history so far. That is itself the first non-negative single-round result recorded
+in R.10.9/R.10.10/here.
+
+**Launched, not yet measured:** `loop --rounds 8 --freeze-critic --time-budget 1.0 --replay-rounds 3
+--kl-coeff 10.0` (the middle of the flat 8–15 plateau), `data/exit/20260819-204911`. Eight rounds
+rather than three so the replay window gets several chances to accumulate rather than just one, given
+round 1 cannot exercise it at all. This is a compound test of both fixes together, not an isolated
+ablation of either — if it comes back positive, a follow-up should split the credit (replay window
+alone vs. KL alone vs. both) before either is called the fix; if it comes back flat or negative, the
+recorded fallback above (R.10.10 — retire CE-imitation, PUCT as a PPO sparring opponent) is next.
+`_kl_to_reference` is covered by `tests/test_expert_iteration.py` (zero when identical, positive for
+different distributions, illegal actions excluded); the loop's round-to-round bookkeeping is exercised
+by this run, not unit-tested, same as the promotion gate.
