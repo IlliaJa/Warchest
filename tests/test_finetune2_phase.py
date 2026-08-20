@@ -196,3 +196,65 @@ def test_a_win_rate_under_the_threshold_never_promotes():
     for _ in range(4):
         assert t._apply_opponent_phase(0.9, batch_num=100) == 'finetune'
     assert all(w == {'tag': 'finetune'} for w in t._pool.applied)
+
+
+# --------------------------------------------------------------------------- #
+# Warm start (--init-policy / --init-critic, docs/IDEAS.md #19)
+# --------------------------------------------------------------------------- #
+def test_return_normalizer_restore_puts_the_critic_back_on_its_own_scale():
+    from src.app.ppo import ReturnNormalizer
+
+    norm = ReturnNormalizer()
+    norm.restore(0.35, 0.62)
+    assert norm.mean == 0.35 and norm.std == 0.62
+    # denormalize(normalize(x)) == x, i.e. a warm-started critic's output lands where it was
+    # trained to land instead of being read through a fresh (0, 1).
+    assert abs(norm.denormalize(norm.normalize(1.25)) - 1.25) < 1e-9
+
+
+def test_restore_is_blended_into_not_overwritten_by_the_first_batch():
+    import torch
+
+    from src.app.ppo import ReturnNormalizer
+
+    norm = ReturnNormalizer(alpha=0.1)
+    norm.restore(1.0, 1.0)
+    norm.update(torch.tensor([0.0, 0.0, 0.0, 0.0]))
+    # A fresh normaliser would jump straight to the batch's (0, ~0); a restored one moves
+    # 10 % of the way, which is what "initialised" has to mean for the restore to be worth
+    # anything at all.
+    assert 0.85 < norm.mean < 0.95
+
+
+def test_restore_floors_a_degenerate_std():
+    from src.app.ppo import ReturnNormalizer
+
+    norm = ReturnNormalizer()
+    norm.restore(0.0, 0.0)
+    assert norm.std > 0  # never divides by zero on a checkpoint with a collapsed scale
+
+
+def test_adopt_checkpoint_shape_overrides_the_cli_and_says_so(caplog):
+    from src.app.ppo import _adopt_checkpoint_shape
+    from src.services.environment.obs_encoders import LATEST_VERSION
+
+    hp = {'policy_arch': 'policy_v1', 'hidden_dim': 64}
+    meta = {'arch': 'policy_factored_v2', 'hidden_dim': 128, 'obs_version': LATEST_VERSION}
+    with caplog.at_level('INFO'):
+        _adopt_checkpoint_shape(hp, meta, 'policy_arch', 'hidden_dim', 'ckpt.pth')
+    assert hp == {'policy_arch': 'policy_factored_v2', 'hidden_dim': 128}
+    assert 'warm start' in caplog.text
+
+
+def test_adopt_checkpoint_shape_refuses_an_obs_version_mismatch():
+    from src.app.ppo import _adopt_checkpoint_shape
+    from src.services.environment.obs_encoders import LATEST_VERSION
+
+    meta = {'arch': 'policy_v1', 'hidden_dim': 64, 'obs_version': LATEST_VERSION - 1}
+    try:
+        _adopt_checkpoint_shape({'policy_arch': 'policy_v1', 'hidden_dim': 64}, meta,
+                                'policy_arch', 'hidden_dim', 'old.pth')
+    except SystemExit as exc:
+        assert 'OBS_VERSION' in str(exc)
+    else:
+        raise AssertionError('expected a SystemExit naming the obs version')

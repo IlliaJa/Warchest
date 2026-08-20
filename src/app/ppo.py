@@ -18,9 +18,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 from src.services.policy.policy import Policy, Critic
 from src.services.policy.checkpoint import (
     save_policy_checkpoint, save_critic_checkpoint, load_policy_checkpoint,
+    load_critic_checkpoint,
     CRITIC_ARCHS, CURRENT_CRITIC_ARCH, POLICY_ARCHS, CURRENT_ARCH,
 )
-from src.services.environment.obs_encoders import get_encoder
+from src.services.environment.obs_encoders import get_encoder, LATEST_VERSION
 from src.services.environment.warchest_env import WarChestEnv
 from src.services.environment.rollout_core import (
     play_episode, SHAPING_C, C_MAT, OPP_TYPE_IDX, OPP_GROUP_IDX,
@@ -109,6 +110,39 @@ class ReturnNormalizer:
     @property
     def std(self):
         return self._std
+
+    def restore(self, mean, std):
+        """Adopt a saved (mean, std) — the warm-start path (`--init-critic`).
+
+        Load-bearing, not bookkeeping: the critic predicts *normalised* returns, so a
+        warm-started critic read through a fresh normaliser (0, 1) is off by the whole
+        affine transform it was trained under. Every V in the buffer, and therefore every
+        GAE target, would be wrong until the EMA drifted back — i.e. exactly the batches
+        where the warm start is supposed to be paying off. Marked initialised so the first
+        `update` blends into it rather than overwriting it.
+        """
+        self._mean = float(mean)
+        self._std = max(float(std), 1e-6)
+        self._initialised = True
+
+
+def _adopt_checkpoint_shape(hp, meta, arch_key, hidden_key, path):
+    """Point `hp`'s arch/width at what a warm-start checkpoint actually contains.
+
+    The nets have to match the weights, and `hp` is also what the rollout workers build
+    their pool opponents from, so a silent mismatch surfaces as a worker crash rather than
+    an error here. Overriding the CLI is the safe direction: a warm start onto a different
+    architecture is not a warm start.
+    """
+    if meta['obs_version'] != LATEST_VERSION:
+        raise SystemExit(
+            f'{path} was trained on obs v{meta["obs_version"]} but this run encodes v'
+            f'{LATEST_VERSION}; the weights expect a different input layout. Warm-starting '
+            f'across an OBS_VERSION bump is not supported.')
+    for key, value in ((arch_key, meta['arch']), (hidden_key, meta['hidden_dim'])):
+        if hp[key] != value:
+            logger.info('warm start: %s %r -> %r (from %s)', key, hp[key], value, path)
+            hp[key] = value
 
 
 class ReferenceOpponent:
@@ -1361,6 +1395,40 @@ if __name__ == '__main__':
         '--no-reference-eval', action='store_true',
         help='Skip the frozen-checkpoint eval opponent (saves eval_episodes games per eval).')
     parser.add_argument(
+        '--no-wandb', action='store_true',
+        help='Skip Weights & Biases. Needed to run at all on a box with no `wandb login`, '
+             'and the right choice for a smoke run — the logger still writes the full '
+             'per-batch line to logs/.')
+    parser.add_argument(
+        '--n-batches', type=int, default=1500,
+        help='Training batches. Lower it deliberately for a gated run: this project has '
+             'repeatedly read a long run wrong (docs/IDEAS.md R.8.2 — the in-run eval '
+             'reported 0.35 for a checkpoint that measured 0.55 over 200 gauntlet games), so '
+             'a few hundred batches plus a k>=200 gauntlet against the starting checkpoint is '
+             'a cheaper decision than a full run plus a guess.')
+    parser.add_argument(
+        '--n-workers', type=int, default=None,
+        help='Parallel rollout workers (default: the hyperparameter value). Leave 1-2 cores '
+             'free: an oversubscribed box silently weakens every search opponent, since their '
+             'strength is expansions per move and expansions are CPU (docs/IDEAS.md R.10.13).')
+    parser.add_argument(
+        '--init-policy', default=None,
+        help='Warm-start the policy from this checkpoint instead of random init. The '
+             'checkpoint\'s own `arch` and `hidden_dim` are adopted (a warm start across '
+             'architectures is meaningless, and the pool ships snapshots that must match), '
+             'so --policy-arch is overridden when they differ. Pair it with --init-critic: '
+             'a warm policy on a random critic spends its first batches being taught by '
+             'noise. This is docs/IDEAS.md #19 (warm-start vs from-scratch), which has never '
+             'been run.')
+    parser.add_argument(
+        '--init-critic', default=None,
+        help='Warm-start the critic from this checkpoint. Its saved return_mean/return_std '
+             'are restored into the ReturnNormalizer — without them the critic, which '
+             'predicts normalised returns, is read on the wrong scale until the EMA drifts '
+             'back, which corrupts V and every GAE target over exactly the early batches the '
+             'warm start exists for. A checkpoint from before that pair was saved is '
+             'refused rather than loaded blind.')
+    parser.add_argument(
         '--p-puct-live-finetune2', type=float, default=0.5,
         help='Share of finetune2-phase episodes played against a PuctBot whose priors are '
              'the newest snapshot of the policy being trained (its leaf value stays the '
@@ -1424,7 +1492,7 @@ if __name__ == '__main__':
              '(docs/next_iteration.md §5 row 2a).')
     cli_args = parser.parse_args()
 
-    use_wandb = True
+    use_wandb = not cli_args.no_wandb
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     run_id = time.strftime('%Y%m%d-%H%M%S')
@@ -1451,7 +1519,7 @@ if __name__ == '__main__':
     )
 
     hp = {
-        'n_batches': 1500,
+        'n_batches': cli_args.n_batches,
         'collect_episodes': 64,
         'max_t': 1000,
         'gamma': 0.99,
@@ -1480,7 +1548,7 @@ if __name__ == '__main__':
         'minibatch_size': 64,
         # Parallel rollout collection (docs/parallel_rollouts.md). 1 = in-process; 6 leaves
         # cores for the GPU update + IPC + OS on this 12-core box. Capped at collect_episodes.
-        'n_workers': 6,
+        'n_workers': cli_args.n_workers if cli_args.n_workers else 6,
         # Overlap next-batch collection with the GPU update (docs/parallel_rollouts.md P11b).
         # Hides rollout wall behind the update; adds 1-step off-policy staleness + a second
         # in-flight buffer in RAM. A/B learning quality, and disable if RAM-bound.
@@ -1627,6 +1695,10 @@ if __name__ == '__main__':
         # Frozen checkpoint the eval phase plays against (None => that match is skipped).
         # Already resolved above, on purpose — see the comment there.
         'reference_policy_path': reference_policy_path,
+        # Warm start (docs/IDEAS.md #19): None on both = the from-scratch behaviour every
+        # run in this project's history used.
+        'init_policy_path': cli_args.init_policy,
+        'init_critic_path': cli_args.init_critic,
     }
     logger.info(f'hyperparameters={hp}')
 
@@ -1653,12 +1725,51 @@ if __name__ == '__main__':
         )
         logger.info(f'wandb_run={run.url}')
 
+    # Warm start (--init-policy / --init-critic, docs/IDEAS.md #19). The checkpoints'
+    # own arch/hidden_dim win over the CLI: the nets have to match the weights, and
+    # `policy_constructor` is what the rollout workers use to build pool opponents from
+    # broadcast snapshots, so a mismatch here fails in the workers rather than here.
+    init_policy_meta = init_critic_meta = None
+    if hp['init_policy_path']:
+        init_policy_meta = load_policy_checkpoint(hp['init_policy_path'], map_location=device)
+        _adopt_checkpoint_shape(hp, init_policy_meta, 'policy_arch', 'hidden_dim',
+                                hp['init_policy_path'])
+    if hp['init_critic_path']:
+        init_critic_meta = load_critic_checkpoint(hp['init_critic_path'], map_location=device)
+        _adopt_checkpoint_shape(hp, init_critic_meta, 'critic_arch', 'critic_hidden_dim',
+                                hp['init_critic_path'])
+        if init_critic_meta.get('return_mean') is None:
+            raise SystemExit(
+                f'{hp["init_critic_path"]} has no saved return_mean/return_std, so its '
+                f'output cannot be placed on a reward scale (it predicts NORMALISED '
+                f'returns). Warm-starting from it would corrupt V and every GAE target '
+                f'until the EMA drifted back. Use a critic saved after that pair was added, '
+                f'or start from scratch.')
+    if (init_policy_meta is None) != (init_critic_meta is None):
+        logger.warning(
+            'warm start is one-sided (%s only): a warm policy on a random critic spends its '
+            'first batches being taught by noise, and a warm critic behind a random policy '
+            'is evaluating states it will never see again. Prefer passing both.',
+            'policy' if init_policy_meta else 'critic')
+
     def policy_constructor():
         return Policy(device=device, hidden_dim=hp['hidden_dim'], arch=hp['policy_arch'])
 
     warchest_policy = policy_constructor().to(device)
     warchest_critic = Critic(device=device, hidden_dim=hp['critic_hidden_dim'],
                              arch=hp['critic_arch']).to(device)
+    if init_policy_meta is not None:
+        warchest_policy.load_state_dict(init_policy_meta['state_dict'])
+        logger.info('warm start: policy <- %s (arch %s, obs v%d, hidden %d)',
+                    hp['init_policy_path'], init_policy_meta['arch'],
+                    init_policy_meta['obs_version'], init_policy_meta['hidden_dim'])
+    if init_critic_meta is not None:
+        warchest_critic.load_state_dict(init_critic_meta['state_dict'])
+        logger.info('warm start: critic <- %s (arch %s, obs v%d, hidden %d, '
+                    'return_mean=%.4f return_std=%.4f)',
+                    hp['init_critic_path'], init_critic_meta['arch'],
+                    init_critic_meta['obs_version'], init_critic_meta['hidden_dim'],
+                    init_critic_meta['return_mean'], init_critic_meta['return_std'])
     actor_optimizer = optim.Adam(warchest_policy.parameters(), lr=hp['lr_actor'])
     critic_optimizer = optim.Adam(warchest_critic.parameters(), lr=hp['lr_critic'])
 
@@ -1672,6 +1783,17 @@ if __name__ == '__main__':
         hp,
         device,
     )
+    if init_critic_meta is not None:
+        # Must happen before the first batch: see `ReturnNormalizer.restore`. The critic
+        # predicts normalised returns, so its saved (mean, std) is part of its weights as
+        # far as any consumer is concerned.
+        trainer._ret_normalizer.restore(init_critic_meta['return_mean'],
+                                        init_critic_meta['return_std'])
+
+    if init_critic_meta is not None:
+        # Must happen before the first batch: see ReturnNormalizer.restore.
+        trainer._ret_normalizer.restore(init_critic_meta['return_mean'],
+                                       init_critic_meta['return_std'])
 
     exception_for_raising = None
     save_model = True
