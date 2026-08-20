@@ -2692,3 +2692,53 @@ raises the divergence *rate* — M3 measured 13.1 % at ~220 expansions against o
 118. That reframes the budget question R.10.13 answered with "not worth +0.03 of teacher
 strength": the right quantity to buy with wall-clock is not teacher strength, it is how many
 samples per round carry a correction.
+
+#### R.10.15a Correction — the 0.565 did not survive, and neither did the volume argument
+
+Same day, higher precision. The 0.565 above came from one 5-agent field at k=200 (se ≈ 3.5 pp)
+that printed an intransitive-triple fraction of 0.300. Re-measured in a field containing only
+base and the arms in question, at **k=300** (se ≈ 2.9 pp):
+
+| arm | WR vs base |
+|---|---|
+| `disagree_weight 20`, one round (844–867 disagreeing samples) | **0.503** |
+| `disagree_weight 20`, two rounds concatenated (~1700) | **0.487** |
+
+The two reads of the same arm (0.565 ± 0.035 and 0.503 ± 0.029) differ by 1.4 σ, so the honest
+estimate is ~0.51: **the weighting is worth +0.01…0.02, not +0.065.** The live loop's own gate
+agrees — it promoted its first weighted round at **0.520** at k=100 (se ≈ 5 pp), which is the
+same statement at lower precision.
+
+And the volume argument R.10.15 closed on is contradicted by its own test: two independent
+200-game rounds from the same base, concatenated (exactly what `--replay-rounds` gives a round
+whose predecessor was rejected), measured **0.487** — doubling the disagreement count bought
+nothing. That weakens the "buy divergence with wall-clock" prescription considerably. The
+remaining version of it that is *not* refuted is buying a higher divergence **rate** rather
+than more samples at the same rate (a deeper search finds corrections a shallower one cannot
+see at all, which is a different quantity from seeing more of the same ones) — but that is now
+a hypothesis with a failed sibling, not the obvious next step it looked like an hour ago.
+
+**So the arithmetic in R.10.15 does not hold.** At ~0.51 per round nothing compounds to 0.70:
+five rounds of +0.01 is noise, not +225 Elo. What survives from R.10.15 is the *diagnosis* —
+agreement 0.944, the signal is 5.6 % of samples, and the R.10.10 split inverts once the labels
+are clean — and the fact that the loop no longer makes the policy worse. What does not survive
+is that any weighting of that 5.6 % turns it into strength.
+
+**Which promotes R.10.10's recorded fallback from "if the window fails" to "the next thing to
+run".** Three independent attempts have now landed on ~0.50: unweighted CE (0.480–0.500),
+disagreement-weighted CE (0.503–0.520), and double-volume CE (0.487) — with a teacher measured
+at 0.733 on the same machine and with both label defects removed. The common factor in all
+three is one-shot cross-entropy imitation of *which move the search picked*, which throws away
+the one thing the search actually computed: how much better that move was. The two ways out,
+in the order their cost argues for:
+
+1. **`PuctBot` as a PPO sparring opponent** (R.10.10's fallback). The policy improves through
+   its own on-policy gradient against a stronger opponent, with PPO's clip as the trust region
+   — no imitation of marginal labels at all. Cost is the problem, not the idea: 1.0 s/move is
+   ~4 s of opponent time per episode against ~36 ms for a pool snapshot (R.9.2), so this wants
+   a small `p_puct`, a cheaper teacher (B4's distilled net), or both.
+2. **Distil the search's *value*, not its move** — R.10.5d records `best_value`, which is
+   already computed and thrown away on every decision, and A6/R.3c are the target-shape half
+   of the same idea. A Q-based target (or Gumbel's completed-Q, R.3b) carries *how much* better
+   the search's move was, which is exactly the information a hard label discards, and it is the
+   only untried lever that does not need a new opponent in the rollout hot path.
