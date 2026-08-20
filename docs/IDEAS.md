@@ -2559,3 +2559,77 @@ their first measurement in this project. Defaults follow the measurement:
 project's history whose teacher was measured, on its own machine, at **0.700 ± 0.059** before
 a single game was generated. The success condition is unchanged from R.10.12: one round that
 clears **0.55 at k=100**, after which the loop is what runs rather than what is debugged.
+
+### R.10.14 The search was evaluating positions on a board plane belonging to no position (2026-08-20)
+
+Found while chasing a discrepancy in R.10.13's launch, not by looking for it: the loop's
+first round reported gen-time policy/search **agreement 0.928** while
+`evaluate_distillation` reported **0.756** on the same samples with the same policy. Two
+numbers that are supposed to be the same quantity, 0.17 apart.
+
+**The bug.** `exploration_map_dict` — per-player, per-cell visit counts — lives on
+`WarChestEnv`, not in `GameState`. It is created in `set_init_state` and incremented on
+every move (`warchest_env.py`, seven call sites). So `set_state(cloned_state)` cannot
+restore it, `_clone_state` does not carry it, and `_apply` keeps incrementing the **sim**
+env's own copy for every line a search simulates, for the whole life of the bot. Board plane
+**5** is exactly that map (`obs_encoders/v11.py:291`). Every position a search bot evaluated
+through `_sim_env` therefore reached the nets with an accumulating visit count belonging to
+no position at all.
+
+**It was not cosmetic.** 145 real states, `ckpt_20260817-2102`:
+
+| plane 5 fed to the policy | top-1 move changes | mean TV |
+|---|---|---|
+| the sim env's, i.e. what the search actually used | **8.3 %** | 0.123 |
+| all zeros | 13.8 % | 0.118 |
+
+For scale, the *entire* improvement a 1.0 s search provides over its own prior is a **13.1 %**
+top-1 change (R.10 M3), and the cheat-vs-blind hidden-hand component is **15.4 %** (R.10.4).
+This was a third perturbation of the same order — and the only one of the three that is a
+plain defect: the teacher's prior was not the student's policy, and its leaf values were not
+the critic's. It also explains the 0.928/0.756 gap exactly: the gen-time metric compares two
+quantities that both come from the corrupted-observation world, while the eval-time one
+compares the target against the policy as it really is.
+
+**The fix and what it bought.** `LookaheadBot._sync_exploration_map` — `_prepare_root`
+snapshots the live env's map, and every net encode installs a fresh copy of that snapshot, so
+simulated moves cannot accumulate into it. Fixed in the shared base, so all three affected
+call sites are covered at once (`PuctBot._policy_priors`,
+`PolicyCriticBot._prune_candidates`, `LookaheadCriticBot`'s critic batch).
+Re-running R.10.13's four arms on the same box with the same seeds:
+
+| teacher | before the fix | after | Δ |
+|---|---|---|---|
+| `cheat d1 k0` | 0.567 ± 0.064 | **0.717 ± 0.058** | +0.150 |
+| `blind d1 k0` | 0.617 ± 0.063 | 0.650 ± 0.062 | +0.033 |
+| `blind d3 k0` | 0.600 ± 0.063 | 0.700 ± 0.059 | +0.100 |
+| **`blind d1 k2`** | 0.700 ± 0.059 | **0.733 ± 0.057** | +0.033 |
+
+Four arms, all up, mean **+0.079**. Individually each Δ is inside one arm's own interval;
+collectively they are not, and the mechanism was measured independently above. So the fix is
+worth roughly +0.05…+0.08 of teacher strength, and `blind d1 k2` remains the best
+configuration at **0.733**.
+
+Three things worth carrying:
+
+* **`PolicyThetaBot` never had the bug** — it encodes the live env directly
+  (`policy_theta_bot.py:213`) rather than round-tripping through `_sim_env`. It is also the
+  one policy-guided bot this project measured as *strong* (0.53–0.78 against
+  `lookahead_critic` at 21× less compute, `docs/bots.md`). That is no longer a curiosity: its
+  competitors were reading a corrupted plane and it was not.
+* **Every search number on record predates this fix**, including R.0.1's 0.66/0.74 scaling
+  read, R.8.1's `eval_search_delta` behaviour split, all of `lookahead_critic`'s gauntlet
+  standing, and the PPO runs that used search bots as pool opponents. None of them is
+  *wrong* about the agent as it was, but none of them measured the search this repo can
+  actually run.
+* **The residual is bounded, not zero.** The snapshot is the root's map; the true map would
+  gain one increment per ply of the line under evaluation. Removing even that means moving
+  the map into `GameState` and paying two array copies per node in `_clone_state` (~10 %
+  of its 10 µs). Worth doing only if a measurement asks for it.
+
+**Method note, since this is the second time in two days.** The find came from a *consistency
+check between two implementations of one metric*, not from a strength measurement. Gen-time
+agreement and eval-time agreement should have been identical and were 0.17 apart; that gap
+was the whole signal. This project has a lot of quantities computed twice in different places
+(`_obs_logits` vs `joint_log_probs_batch`, gauntlet WR vs in-run eval, evaluator constants vs
+reward constants). Diffing them is cheap and has now paid twice.
