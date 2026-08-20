@@ -41,7 +41,11 @@ opponent-independent complement.
 > PIMC, apprentice-driven states, forced root playouts with target pruning, by-game early
 > stopping, a wider replay window, and a post-round verdict that can resolve the effect it
 > gates on. It also corrects R.10.10's dismissal of the cheating-teacher hypothesis, which
-> flips R.10.6 from queued to contra-indicated.
+> flips R.10.6 from queued to contra-indicated. **R.10.13 then found why the loop looked
+> flat**: the 0.74–0.79 teacher was measured on the laptop, and on desktop-legion — where
+> every recorded loop run happened — the same search buys 118 expansions instead of 220 and
+> measures **0.567**. Teacher strength is machine-specific; forced playouts take it to 0.700
+> there, and PIMC voting is a bad trade at this budget.
 
 Current state: the live plan is **not** in this file — it is
 [next_iteration.md](next_iteration.md) §5, which supersedes both the sequencing in
@@ -2485,3 +2489,73 @@ against its predecessor is ~+35 Elo, and five or six of them stack to ~0.72–0.
 run's original base, with the teacher re-strengthening on each improved prior. So the target
 for this work is not 0.70 in one round — it is **one round that clears 0.55 at k ≥ 100**,
 after which the loop is the thing that runs, not the thing that is being debugged.
+
+### R.10.13 The teacher behind every "flat round" on desktop-legion was 0.57, not 0.79 (2026-08-20)
+
+R.10.12's bundle was gated through `preflight` before launching, and **gate 3 failed**:
+0.550 ± 0.064 where the record says 0.787. Chasing that produced the most useful number of
+the day, and it is not about the bundle.
+
+**The decomposition** — one change at a time, `warchest_ppo_20260817-2102` +
+`lookahead_critic_v6`, `--time-budget 1.0`, n=60 per arm on shared seeds, 12 workers, all on
+**desktop-legion**:
+
+| teacher | WR vs the raw policy |
+|---|---|
+| `cheat d1 k0` — *the exact configuration that measured 0.787* | **0.567 ± 0.064** |
+| `blind d1 k0` (+ blind root) | 0.617 ± 0.063 |
+| `blind d3 k0` (+ PIMC voting) | 0.600 ± 0.063 |
+| **`blind d1 k2` (+ forced playouts)** | **0.700 ± 0.059** |
+| `blind d3 k2` (the whole bundle, from `preflight`) | 0.550 ± 0.064 |
+
+**The 0.787 is machine-specific, and the mechanism is measured.** `preflight` gate 2 reports
+**118 expansions/move** at 1.0 s on desktop-legion. On the laptop, the same four
+configurations measure **205–226** expansions/move single-process (`cheat d1 k0` 219.5,
+`blind d1 k0` 204.7, `blind d3 k0` 225.4, `blind d3 k2` 225.8) — so the search changes cost
+no expansions at all, and desktop-legion is simply ~1.9× slower per expansion. Every
+teacher configuration measures 0.55–0.62 there at 1.0 s, *including* the one that measures
+0.76–0.79 on the laptop.
+
+R.10.10 recorded exactly this number and dismissed it: *"refuting an earlier, weaker 0.567
+remote read (n=60, single seed — concluded to be sampling noise, not a real weak-teacher
+effect)"*. It reproduces to three digits, on a fresh seed block, with a mechanism. It was
+not noise.
+
+**Consequence, and it reframes R.10.9 through R.10.11.** Every ExIt loop run in this
+document's history ran on desktop-legion — R.10.9's 3-round run, R.10.10's two, R.10.11's
+8-round run. All of them distilled a teacher worth **~0.57** against its own student, i.e.
+an edge of 0.07 ± 0.06, while the sections reasoned about a 0.74–0.79 teacher measured
+elsewhere. *A teacher that barely beats its student has almost nothing to transfer*, which
+explains "parity" more simply than any channel mechanism those sections proposed. The
+channel fixes (sharpening, promotion gate, replay window, KL) were each measured against a
+premise that was broken on the machine they ran on — they may still be right, and R.10.11's
+verdict that they moved the loop from *reliably worse* to *parity* stands, but nothing in
+that history was ever a test of a strong teacher.
+
+Two standing rules fall out, both cheap and both violated until now:
+
+1. **Gate 3 is machine-specific.** Run `preflight` on the box that will generate the data,
+   at the budget it will use, and never quote a teacher-strength number without the machine
+   attached. A wall-clock search budget is not portable.
+2. **`nodes_visited` is the portable quantity, not seconds.** 1.0 s means ~220 expansions on
+   one box and ~118 on another; `--time-budget` should eventually be replaced by, or paired
+   with, an expansion target (`max_simulations` already exists on `PuctBot`).
+
+**What this says about the bundle, which is the part that was actually being tested.** Blind
+costs nothing (0.567 → 0.617, consistent with `search_under_uncertainty.md` §8.1 and now
+confirmed for `PuctBot` at a real budget), so R.10.4's label-noise fix is **free**. PIMC
+voting also costs nothing on its own (0.600) but is *not* free in combination: at 118
+expansions a 0.1-weight hedge gets ~12, forced playouts then spend all 12 on quotas, and its
+vote and its pruned target are both noise — which is the whole of the bundle's 0.700 → 0.550.
+Forced playouts are the one change that moves strength, and they move it **up by 0.13**,
+their first measurement in this project. Defaults follow the measurement:
+`--n-determinizations` back to **1** (revisit above ~400 expansions/move) and
+`--forced-playouts-k` to **2.0**.
+
+**Launched on the strength of it:** `loop --rounds 8 --games 200 --time-budget 1.0
+--blind-teacher --n-determinizations 1 --forced-playouts-k 2 --apprentice-frac 0.5
+--visit-temp 1.0 --kl-coeff 10 --freeze-critic --replay-rounds 6 --epochs 8 --patience 2
+--gauntlet-k-games 100`, `data/exit/20260820-144857`. This is the first ExIt run in the
+project's history whose teacher was measured, on its own machine, at **0.700 ± 0.059** before
+a single game was generated. The success condition is unchanged from R.10.12: one round that
+clears **0.55 at k=100**, after which the loop is what runs rather than what is debugged.

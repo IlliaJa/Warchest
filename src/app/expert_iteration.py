@@ -785,15 +785,19 @@ def _add_common(p):
     p.add_argument('--cheating-teacher', dest='blind_teacher', action='store_false',
                    help='Let the data-gen teacher read the opponent real hand (the pre-'
                         '2026-08-20 behaviour). For reproducing old runs.')
-    p.add_argument('--n-determinizations', type=int, default=3,
+    p.add_argument('--n-determinizations', type=int, default=1,
                    help='PIMC votes per teacher move. With a blind root each search samples '
                         'its own re-split of the opponent hidden coins, so n=1 is single-'
                         'determinization search — the strategy-fusion failure mode '
                         'docs/search_under_uncertainty.md §2 is about. The budget is SPLIT '
                         '(0.8 primary + 0.2 spread over the hedges, LookaheadCriticBot.act), '
-                        'so this costs no extra wall-clock; it trades some primary depth for a '
-                        'second opinion. 1 with --cheating-teacher reproduces the old teacher.')
-    p.add_argument('--forced-playouts-k', type=float, default=0.0,
+                        'so voting costs no extra wall-clock; it trades primary depth for a '
+                        'second opinion. MEASURED A BAD TRADE at this budget and left at 1 '
+                        '(docs/IDEAS.md R.10.13): a hedge gets ~12 expansions, which forced '
+                        'playouts then consume entirely on quotas, so its vote is noise — '
+                        'blind+k=2 measures 0.700 at n=1 against 0.550 at n=3. Revisit above '
+                        '~400 expansions/move, where a 0.1-weight hedge is a real search.')
+    p.add_argument('--forced-playouts-k', type=float, default=2.0,
                    help="KataGo forced playouts at the search root: every child is guaranteed "
                         "ceil(sqrt(k * P(a) * N)) visits, and the same allocation is subtracted "
                         "back out of the recorded target (policy target pruning). 0 = off. "
@@ -802,10 +806,16 @@ def _add_common(p):
                         "first-visit U bonus big enough for PUCT to reach at all, so the visit "
                         "counts largely re-encode the prior and the search cannot promote a "
                         "move the prior ranked low (docs/IDEAS.md R.10 M1). k=2 is KataGo's "
-                        "value; it reserves ~60 of 300 expansions at 8 children. Re-read "
-                        "preflight gates 2-4 when changing it — it makes the target sharper "
-                        "(pruning) AND spends budget on breadth, so both the entropy pair and "
-                        "teacher strength can move.")
+                        "value and is the default here because it MEASURED as the only one of "
+                        "R.10.12's three search changes that moves teacher strength, and it "
+                        "moves it up: blind d1 k2 = 0.700 +/- 0.059 against blind d1 k0 = "
+                        "0.617 and the old cheating teacher's 0.567, n=60 on shared seeds "
+                        "(R.10.13). 0 = off. It reserves ~30 of ~118 expansions at 8 children "
+                        "on that box. Re-read preflight gates 2-4 when changing it — it makes "
+                        "the target sharper (pruning) AND spends budget on breadth, so both "
+                        "the entropy pair and teacher strength can move; with it on, "
+                        "--visit-temp 1.0 is usually right (gate 4 measured visit 0.285 vs "
+                        "policy 0.516 unsharpened).")
     p.add_argument('--apprentice-frac', type=float, default=0.0,
                    help="Fraction of recorded plies PLAYED by the raw policy (sampled from its "
                         "own priors) instead of by the search. The search still runs and still "
