@@ -613,13 +613,26 @@ def cmd_loop(args):
             field_specs.append({'kind': 'policy', 'path': out_policy})
             new_idx = len(field_specs) - 1
             promoted = True
+            wr_vs_cur = wr_vs_base = None
             if not args.skip_gauntlet:
                 out = _run_post_round_gauntlet(field_specs, args)
                 wr_vs_cur = float(out['win_rate'][new_idx, cur_idx])
-                promoted = wr_vs_cur >= args.promote_threshold
-                logger.info('round %d/%d vs its own base: %.3f (promote threshold %.2f) -> %s',
-                            r + 1, args.rounds, wr_vs_cur, args.promote_threshold,
-                            'PROMOTED' if promoted else 'REJECTED')
+                # Also gate against the run's *original* base (field_specs[0]). The
+                # vs-predecessor check alone answers "did this round improve on last
+                # round's checkpoint", which a chain of marginal wins can satisfy without
+                # ever improving on where the run started: the 2026-08-19 8-round run
+                # promoted four times at 0.533/0.533/0.500/0.500 against successive
+                # predecessors, and its own final field then read the result as *losing*
+                # to the original base 0.40 (IDEAS.md R.10.11). Skipped while cur_idx is
+                # still 0 — that is the same comparison.
+                if cur_idx != 0:
+                    wr_vs_base = float(out['win_rate'][new_idx, 0])
+                promoted = (wr_vs_cur >= args.promote_threshold
+                            and (wr_vs_base is None or wr_vs_base >= args.promote_threshold))
+                logger.info('round %d/%d vs its own base: %.3f%s (promote threshold %.2f) -> %s',
+                            r + 1, args.rounds, wr_vs_cur,
+                            '' if wr_vs_base is None else f', vs run base: {wr_vs_base:.3f}',
+                            args.promote_threshold, 'PROMOTED' if promoted else 'REJECTED')
 
             logger.info(
                 'round %d/%d done in %.1fs — agreement %.3f -> %.3f, critic mse %.4f -> %.4f',
@@ -628,13 +641,15 @@ def cmd_loop(args):
                 before.get('mse', 0.0), after.get('mse', 0.0),
             )
             if not promoted:
+                failed = 'its predecessor' if wr_vs_cur < args.promote_threshold else 'the run base'
                 logger.warning(
-                    'round %d/%d REJECTED: round%d_policy did not beat %s (win rate %.3f < '
-                    '%.2f). Keeping %s as the base for the next round instead of building on '
-                    'a regression — this is the gate that would have stopped the '
-                    '2026-08-18 run after round 0 (it lost to base 0.25-0.30).',
-                    r + 1, args.rounds, r, os.path.basename(cur_policy), wr_vs_cur,
-                    args.promote_threshold, os.path.basename(cur_policy))
+                    'round %d/%d REJECTED: round%d_policy did not clear %.2f against %s '
+                    '(vs predecessor %s %.3f, vs run base %s). Keeping %s as the base for the '
+                    'next round instead of building on a regression.',
+                    r + 1, args.rounds, r, args.promote_threshold, failed,
+                    os.path.basename(cur_policy), wr_vs_cur,
+                    'n/a' if wr_vs_base is None else f'{wr_vs_base:.3f}',
+                    os.path.basename(cur_policy))
                 continue
 
             # With --freeze-critic the critic never changes scale, so the search stays in

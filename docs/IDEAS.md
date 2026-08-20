@@ -2372,3 +2372,43 @@ recorded fallback above (R.10.10 — retire CE-imitation, PUCT as a PPO sparring
 `_kl_to_reference` is covered by `tests/test_expert_iteration.py` (zero when identical, positive for
 different distributions, illegal actions excluded); the loop's round-to-round bookkeeping is exercised
 by this run, not unit-tested, same as the promotion gate.
+
+**Result (2026-08-20).** Completed, ~4.6 h. Promotion chain: round 2 (0.533 vs the original base) →
+round 6 (0.533 vs round1_policy) → round 7 (0.500 vs round5_policy) → round 8 / `round7_policy`
+(0.500 vs round6_policy, the final checkpoint). Rounds 1, 3, 4, 5 were REJECTED (0.467/0.467/0.333/
+0.333) and correctly did not compound — the promotion gate worked exactly as designed throughout.
+
+That chain is every promotion decision the loop made *itself*, each against only its own immediate
+predecessor at `--gauntlet-k-games 30` (se ≈ 9 pp) — never against the run's original base, so four
+marginal, boundary-hugging wins (two of them exactly 0.500) can drift without a real anchor, and the
+loop's own final 9-agent field snapshot shows exactly that failure mode: `round7_policy` reads as
+**losing** to the original base 0.40 there, buried in a field the tool itself flags as measurably
+intransitive (fraction 0.100–0.200 across every round-8 field this run printed).
+
+A dedicated, clean re-check — 5-agent field only (base + round1/round2/round6/round7), `k=150`/pair,
+se ≈ 4 pp — gives the number to trust instead: `round7_policy` **0.55** vs base, round1 **0.49**,
+round2 **0.51**, round6 **0.47**. Bradley-Terry: round2 1010.1, round1 1001.8, round7 1001.8, base
+998.2, round6 988.0. Intransitive-triple fraction is still 0.200 even in this smaller field — the
+field's real signal-to-noise at this sample size is close to 1.
+
+**Honest verdict:** replay window + KL trust region turned the loop from *reliably worse* — every
+prior recorded run before this fix pair lost every round, 0.70–0.82 in R.10.9's run — into *roughly at
+parity*. That is real progress (the destructive-divergence mechanism this pair targeted is gone), but
+it is not yet a demonstrated improvement: `round7_policy`'s 0.55 is the field's best point estimate,
+not a result distinguishable from noise at this sample size, and the chain's own internal wins
+(0.533/0.533/0.500/0.500) are exactly the kind of boundary result a self-referential gate cannot tell
+apart from a random walk.
+
+**One more cheap fix this run exposes:** gate promotion against the run's *original* base in addition
+to the round's immediate predecessor — the current gate answers "did this round improve on last
+round's checkpoint," which a four-step noisy chain can satisfy without ever answering "is this better
+than where we started," and this run's own 0.40-vs-0.55 discrepancy is a direct demonstration of that
+gap. Cheap: the field already carries every checkpoint including the original base; the gate need only
+also check `win_rate[new_idx, 0] >= threshold`.
+
+If a decisive improvement (not just parity) is still wanted, R.10.10's recorded fallback — retire
+CE-imitation of the search's move choice, use `PuctBot` as a PPO sparring opponent instead — is the
+next thing to try; two iterations (sharpening+gate, then replay-window+KL) have each moved the outcome
+one step from *actively harmful* toward *parity* without yet reaching *better*, which is consistent
+with the fallback's premise that one-shot CE imitation of a multi-ply search verdict has a ceiling
+these fixes cannot lift past, rather than with either fix having simply been mistuned.
