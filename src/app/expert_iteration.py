@@ -298,7 +298,7 @@ def _run_distill(dataset, policy_path, critic_path, args, *, out_policy, out_cri
                   lr_policy=args.lr, lr_critic=args.lr, device=args.device,
                   val_frac=args.val_frac, train_critic=not freeze, visit_temp=args.visit_temp,
                   kl_coeff=args.kl_coeff, early_stop=not args.no_early_stop,
-                  patience=args.patience)
+                  patience=args.patience, disagree_weight=args.disagree_weight)
     after = res['val']
     logger.info('distill: held-out n_val=%d samples from %d games; ran %d/%d epochs, kept '
                 'epoch %s', res['n_val'], res['n_val_games'], res['epochs_run'], args.epochs,
@@ -845,6 +845,18 @@ def _add_common(p):
     p.add_argument('--patience', type=int, default=2,
                    help='Epochs without held-out improvement before distillation stops early. '
                         'The best-scoring epoch weights are restored either way.')
+    p.add_argument('--disagree-weight', type=float, default=1.0,
+                   help="Multiply the CE of samples where the round's starting policy already "
+                        "disagrees with the search's move. 1.0 = off (every sample equal). "
+                        "The measurement behind it (2026-08-20, a post-R.10.14 round of 15502 "
+                        "samples at agreement 0.944): distilling ALL of it scores 0.500 vs "
+                        "base at k=200, distilling only the 867 disagreeing samples scores "
+                        "0.530 — the 94%% the search merely confirmed dilute the 5.6%% that "
+                        "carry a correction. This is the reverse of the R.10.10 split, which "
+                        "predates the blind teacher and the exploration-plane fix; both "
+                        "corrupted exactly the disagreeing subset, so that result measured "
+                        "the corruption. Held-out CE stays unweighted, since it is the "
+                        "early-stopping criterion.")
     p.add_argument('--visit-temp', type=float, default=0.5,
                    help="Sharpening exponent applied to the recorded visit distribution "
                         "before it is used as the CE target (`t = t**(1/visit_temp)`, "

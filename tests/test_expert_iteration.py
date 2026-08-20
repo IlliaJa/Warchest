@@ -350,3 +350,70 @@ def test_distill_without_early_stopping_runs_every_epoch():
     assert res['epochs_run'] == 3
     assert res['best_epoch'] is None
     assert 'val_ce' not in res['history'][0]
+
+
+# --------------------------------------------------------------------------- #
+# Disagreement weighting (the 5.6 % of samples that carry a correction)
+# --------------------------------------------------------------------------- #
+def test_minibatches_carry_the_sample_index_so_weights_can_be_attached():
+    ds = _labelled_dataset(4)
+    seen = []
+    for batch in ds.iter_minibatches(2, 'cpu', shuffle=True):
+        seen.extend(batch['index'].tolist())
+    assert sorted(seen) == [0, 1, 2, 3]
+
+
+def test_disagreement_mask_flags_exactly_the_samples_the_policy_gets_wrong():
+    from src.services.expert_iteration import _disagreement_mask
+
+    torch.manual_seed(0)
+    ds = _stub_training_data(n_games=3, per_game=4)
+    policy = _StubPolicy(4, 3)
+    idx = np.arange(len(ds.z))
+    flags = _disagreement_mask(ds, policy, idx, 'cpu')
+
+    expected = []
+    with torch.inference_mode():
+        for i in idx:
+            batch = {'board': torch.from_numpy(ds.boards[i:i + 1]),
+                     'global': torch.from_numpy(ds.globals[i:i + 1]),
+                     'mask': torch.from_numpy(ds.masks[i:i + 1])}
+            am = int(policy.joint_log_probs_batch(batch).argmax(dim=1).item())
+            expected.append(am != int(ds.visit_targets[i].argmax()))
+    assert flags.tolist() == expected
+
+
+def test_disagree_weight_one_is_bit_identical_to_no_weighting():
+    def run(weight):
+        torch.manual_seed(0)
+        np.random.seed(0)
+        ds = _stub_training_data()
+        pol = _StubPolicy(4, 3)
+        from src.services.expert_iteration import distill
+        distill(ds, pol, _StubCritic(3), epochs=2, minibatch_size=16, lr_policy=0.1,
+                val_frac=0.25, log_every=0, train_critic=False, visit_temp=1.0,
+                disagree_weight=weight)
+        return torch.cat([p.flatten() for p in pol.parameters()])
+
+    torch.testing.assert_close(run(1.0), run(1.0))
+    assert not torch.allclose(run(1.0), run(6.0))
+
+
+def test_disagree_weight_moves_the_policy_further_on_the_samples_it_up_weights():
+    from src.services.expert_iteration import _disagreement_mask, distill
+
+    def run(weight):
+        torch.manual_seed(0)
+        np.random.seed(0)
+        ds = _stub_training_data()
+        pol = _StubPolicy(4, 3)
+        idx = np.arange(len(ds.z))
+        before = _disagreement_mask(ds, pol, idx, 'cpu')
+        distill(ds, pol, _StubCritic(3), epochs=6, minibatch_size=16, lr_policy=0.1,
+                val_frac=0.25, log_every=0, train_critic=False, visit_temp=1.0,
+                early_stop=False, disagree_weight=weight)
+        after = _disagreement_mask(ds, pol, idx, 'cpu')
+        # How many of the originally-disagreeing samples the policy now matches.
+        return int((before & ~after).sum())
+
+    assert run(8.0) > run(1.0)

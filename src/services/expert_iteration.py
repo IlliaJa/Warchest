@@ -189,7 +189,9 @@ class SelfPlayDataset:
         """Yield training minibatch dicts (torch tensors on `device`).
 
         Keys: board, global, mask (policy) · visit_targets (policy CE target) ·
-        opp_onehot, privileged (critic) · z (critic MSE target).
+        opp_onehot, privileged (critic) · z (critic MSE target) · index (the sample's
+        position in the dataset, so a caller can attach per-sample weights to a batch it
+        did not choose the order of — see `distill`'s `disagree_weight`).
         """
         n = len(self.z) if indices is None else len(indices)
         order = np.asarray(indices) if indices is not None else np.arange(n)
@@ -206,6 +208,7 @@ class SelfPlayDataset:
                 'opp_onehot': torch.from_numpy(self.opp_onehots[idx]).to(device),
                 'privileged': torch.from_numpy(self.privileged[idx]).to(device),
                 'z': torch.from_numpy(self.z[idx]).to(device),
+                'index': torch.from_numpy(np.ascontiguousarray(idx)).to(device),
             }
 
 
@@ -481,9 +484,30 @@ def _split_by_game(game_ids, val_frac):
     return np.nonzero(~is_val)[0], np.nonzero(is_val)[0]
 
 
+def _disagreement_mask(dataset, policy, indices, device, minibatch_size=512):
+    """Per-sample `True` where the policy's argmax differs from the target's.
+
+    Computed once, with the policy as it stands at the start of the round, so the weighting
+    below is a property of the data and not of a moving model.
+    """
+    flags = np.zeros(len(indices), dtype=bool)
+    policy.to(device).eval()
+    pos = 0
+    with torch.inference_mode():
+        for batch in dataset.iter_minibatches(minibatch_size, device, shuffle=False,
+                                              indices=indices):
+            joint = policy.joint_log_probs_batch(batch)
+            same = joint.argmax(dim=1) == batch['visit_targets'].argmax(dim=1)
+            n = same.shape[0]
+            flags[pos:pos + n] = (~same).cpu().numpy()
+            pos += n
+    return flags
+
+
 def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=3e-4,
             lr_critic=3e-4, grad_clip=1.0, device='cpu', val_frac=0.1, log_every=1,
-            train_critic=True, visit_temp=0.5, kl_coeff=0.0, early_stop=True, patience=2):
+            train_critic=True, visit_temp=0.5, kl_coeff=0.0, early_stop=True, patience=2,
+            disagree_weight=1.0):
     """Distil `policy` (CE→visits) and, unless `train_critic=False`, `critic` (MSE→z).
 
     Two independent Adam passes (like PPO's separate actor/critic optimisers). The
@@ -520,6 +544,18 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
     self-play didn't visit). The reference is a frozen snapshot of `policy` taken before
     training starts, so the penalty is against where the round began, not a moving
     target. `0.0` (default) is the old, unregularised behaviour.
+
+    `disagree_weight > 1` multiplies the CE of samples where the round's starting policy
+    already disagrees with the target, i.e. the samples where the search found something.
+    Measured on a post-R.10.14 round (2026-08-20, 15502 samples, agreement 0.944): distilling
+    **all** of it scores 0.500 against base at k=200, while distilling **only** the 867
+    disagreeing samples scores **0.530** — the 94 % the search merely confirmed dilute the
+    5.6 % that carry the correction. Note this is the reverse of R.10.10's split measurement
+    (disagree-only 0.28-0.29, agree-only 0.40-0.41), which was taken before the teacher was
+    blinded and before the exploration-plane fix — both of which corrupted precisely the
+    disagreeing subset, so that result was about the corruption, not about the subset.
+    The held-out metric stays **unweighted**: it is the early-stopping criterion, and what it
+    has to answer is "am I overfitting this round's data", which the weighting would distort.
     """
     n = len(dataset)
     game_ids = dataset.game_ids if dataset.game_ids is not None else np.arange(n)
@@ -536,6 +572,16 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
         ref_policy = copy.deepcopy(policy).to(device).eval()
         for p in ref_policy.parameters():
             p.requires_grad_(False)
+
+    # Per-sample CE weights, in `train_idx` order (`iter_minibatches` shuffles the order it
+    # yields, so the weights are carried as a lookup keyed by sample index, not by position).
+    weight_by_index = None
+    if disagree_weight != 1.0:
+        flags = _disagreement_mask(dataset, policy, train_idx, device)
+        weight_by_index = np.ones(n, dtype=np.float32)
+        weight_by_index[train_idx[flags]] = float(disagree_weight)
+        logger.info('distill: weighting %d/%d disagreeing train samples (%.1f%%) by %.1fx',
+                    int(flags.sum()), len(train_idx), 100 * flags.mean(), disagree_weight)
 
     watch = early_stop and n_val > 0
     best = {'ce': math.inf, 'mse': math.inf}
@@ -554,7 +600,15 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
             # optional KL trust-region term against the round's starting policy.
             joint = policy.joint_log_probs_batch(batch)  # [B, A], illegal at -1e9
             tgt = _sharpen_target(batch['visit_targets'], visit_temp)
-            ce = -(tgt * joint).sum(dim=1).mean()
+            per_sample = -(tgt * joint).sum(dim=1)
+            if weight_by_index is None:
+                ce = per_sample.mean()
+            else:
+                w = torch.as_tensor(weight_by_index[batch['index'].cpu().numpy()],
+                                    device=per_sample.device)
+                # Weighted *mean*, not sum: keeps the CE on the same scale as the unweighted
+                # case, so `kl_coeff` keeps meaning what it was calibrated to mean.
+                ce = (per_sample * w).sum() / w.sum()
             loss = ce
             kl = None
             if ref_policy is not None:
