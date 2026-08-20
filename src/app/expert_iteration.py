@@ -183,11 +183,19 @@ def _build_bot(policy_path, critic_path, args, *, value_mode):
         policy_path=policy_path, critic_path=critic_path, value_mode=value_mode,
         c_puct=args.c_puct, max_branching=args.max_branching, time_budget=args.time_budget,
         dirichlet_alpha=args.dirichlet_alpha, dirichlet_frac=args.dirichlet_frac,
+        # Blind + PIMC by default for data-gen: the teacher used to read the opponent's
+        # real hand (PuctBot's own default), so 15.4 % of its moves depended on a variable
+        # the student's observation does not contain — irreducible label noise as large as
+        # the whole improvement signal (docs/IDEAS.md R.10.4, M3).
+        see_opponent_hand=not args.blind_teacher,
+        n_determinizations=args.n_determinizations,
+        forced_playouts_k=args.forced_playouts_k,
         device=args.device, stats_log_every=0,
     )
 
 
-def _run_gen(policy_path, critic_path, args, *, value_mode, out_path, collector=None, desc='self-play'):
+def _run_gen(policy_path, critic_path, args, *, value_mode, out_path, collector=None,
+             desc='self-play', round_seed=None):
     """Self-play `args.games` games and save a dataset. Returns the dataset.
 
     Parallel (`args.n_workers > 1`, the default) uses `ParallelSelfPlayCollector` — a
@@ -196,6 +204,12 @@ def _run_gen(policy_path, critic_path, args, *, value_mode, out_path, collector=
     `ParallelRolloutCollector` across every training batch; a standalone `gen` call
     builds and tears down its own. `args.n_workers <= 1` falls back to the sequential
     in-process path (`generate_selfplay`) — useful for debugging one game at a time.
+
+    `round_seed` overrides `args.seed` for this round's sequential RNG. The parallel
+    workers seed once at spawn and let their streams run on, so their rounds differ by
+    construction, but `generate_selfplay` re-seeds per call — without this, every round
+    of a `loop` at `--n-workers 1` would replay the identical games (docs/IDEAS.md
+    R.10.7).
     """
     pmeta = load_policy_checkpoint(policy_path, map_location=args.device)
     cmeta = load_critic_checkpoint(critic_path, map_location=args.device)
@@ -208,6 +222,10 @@ def _run_gen(policy_path, critic_path, args, *, value_mode, out_path, collector=
     logger.info('gen: %d games requested (n_workers=%d), value_mode=%s, policy=%s critic=%s',
                 args.games, args.n_workers, value_mode,
                 os.path.basename(policy_path), os.path.basename(critic_path))
+    logger.info('gen: teacher = %s hand, n_determinizations=%d, forced_playouts_k=%.1f, '
+                'apprentice_frac=%.2f',
+                'BLIND to the opponent\'s' if args.blind_teacher else 'READING the opponent\'s',
+                args.n_determinizations, args.forced_playouts_k, args.apprentice_frac)
 
     t0 = time.perf_counter()
     if args.n_workers > 1:
@@ -220,7 +238,11 @@ def _run_gen(policy_path, critic_path, args, *, value_mode, out_path, collector=
                 n_games=args.games, c_puct=args.c_puct, max_branching=args.max_branching,
                 time_budget=args.time_budget, dirichlet_alpha=args.dirichlet_alpha,
                 dirichlet_frac=args.dirichlet_frac, temperature=args.temperature,
-                temp_moves=args.temp_moves, max_turns=2000, desc=desc,
+                temp_moves=args.temp_moves, max_turns=2000,
+                see_opponent_hand=not args.blind_teacher,
+                n_determinizations=args.n_determinizations,
+                forced_playouts_k=args.forced_playouts_k,
+                apprentice_frac=args.apprentice_frac, desc=desc,
             )
         finally:
             if own_collector:
@@ -231,17 +253,19 @@ def _run_gen(policy_path, critic_path, args, *, value_mode, out_path, collector=
         encoder = get_encoder(pmeta['obs_version'])
         bot = _build_bot(policy_path, critic_path, args, value_mode=value_mode)
         ds, game_stats = generate_selfplay(bot, args.games, encoder=encoder, temperature=args.temperature,
-                                           temp_moves=args.temp_moves, seed=args.seed, desc=desc)
+                                           temp_moves=args.temp_moves,
+                                           seed=round_seed if round_seed is not None else args.seed,
+                                           apprentice_frac=args.apprentice_frac, desc=desc)
 
     s = summarize_game_stats(game_stats)
     logger.info(
         'gen: %d games, %d samples, wall=%.1fs — turns/game avg=%.1f (min=%d max=%d), '
         'decisive=%.0f%%, mean_legal_actions=%.1f, mean_visit_entropy=%.3f nats, '
-        'policy/search agreement=%.3f',
+        'policy/search agreement=%.3f, apprentice plies=%.0f%%',
         s['n_games'], s['n_samples'], time.perf_counter() - t0,
         s['turns_mean'], s['turns_min'], s['turns_max'],
         100 * s['decisive_frac'], s['mean_legal_actions'], s['mean_visit_entropy'],
-        s['mean_agreement'],
+        s['mean_agreement'], 100 * s['apprentice_frac'],
     )
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     ds.save(out_path)
@@ -273,9 +297,12 @@ def _run_distill(dataset, policy_path, critic_path, args, *, out_policy, out_cri
     res = distill(dataset, policy, critic, epochs=args.epochs, minibatch_size=args.minibatch,
                   lr_policy=args.lr, lr_critic=args.lr, device=args.device,
                   val_frac=args.val_frac, train_critic=not freeze, visit_temp=args.visit_temp,
-                  kl_coeff=args.kl_coeff)
+                  kl_coeff=args.kl_coeff, early_stop=not args.no_early_stop,
+                  patience=args.patience)
     after = res['val']
-    logger.info('distill: held-out n_val=%d', res['n_val'])
+    logger.info('distill: held-out n_val=%d samples from %d games; ran %d/%d epochs, kept '
+                'epoch %s', res['n_val'], res['n_val_games'], res['epochs_run'], args.epochs,
+                res['best_epoch'] if res['best_epoch'] else 'n/a (early stopping off)')
     logger.info('distill: before %s', _fmt(before))
     logger.info('distill: after  %s', _fmt(after))
     if after.get('visit_entropy', 0.0) > before.get('policy_entropy', 0.0):
@@ -377,10 +404,21 @@ def cmd_preflight(args):
     logger.info('critic = %s (arch %s, obs v%d, hidden %d)', critic_path,
                 cmeta['arch'], cmeta['obs_version'], cmeta['hidden_dim'])
     _check_critic_staleness(critic_path)
+    logger.info('teacher = puct @ %.2fs, %s the opponent hand, n_determinizations=%d, '
+                'forced_playouts_k=%.1f | data-gen apprentice_frac=%.2f, visit_temp=%.2f',
+                args.time_budget, 'BLIND to' if args.blind_teacher else 'READING',
+                args.n_determinizations, args.forced_playouts_k, args.apprentice_frac,
+                args.visit_temp)
 
     logger.info('--- gate 2: what --time-budget %.2fs actually buys ---', args.time_budget)
+    # Every gate below runs the *data-gen* teacher configuration (blindness, PIMC
+    # determinizations, forced playouts), not a default PuctBot: a gate measured on a
+    # different bot than the one that will generate the data is not a gate.
     bot = PuctBot(policy_path=policy_path, critic_path=critic_path, c_puct=args.c_puct,
                   max_branching=args.max_branching, time_budget=args.time_budget,
+                  see_opponent_hand=not args.blind_teacher,
+                  n_determinizations=args.n_determinizations,
+                  forced_playouts_k=args.forced_playouts_k,
                   device='cpu', stats_log_every=0)
     env = WarChestEnv(save_game_history=False)
     np.random.seed(args.seed or 0)
@@ -418,6 +456,9 @@ def cmd_preflight(args):
             'policy_path': policy_path, 'critic_path': critic_path,
             'c_puct': args.c_puct, 'max_branching': args.max_branching,
             'time_budget': args.time_budget, 'stats_log_every': 0,
+            'see_opponent_hand': not args.blind_teacher,
+            'n_determinizations': args.n_determinizations,
+            'forced_playouts_k': args.forced_playouts_k,
         }},
     ]
     device = torch.device('cpu')
@@ -444,13 +485,15 @@ def cmd_preflight(args):
     ds, game_stats = generate_selfplay(
         sp_bot, args.preflight_selfplay_games, encoder=encoder,
         temperature=args.temperature, temp_moves=args.temp_moves, seed=args.seed,
-        desc='preflight self-play')
+        apprentice_frac=args.apprentice_frac, desc='preflight self-play')
     gs = summarize_game_stats(game_stats)
     policy, _ = _load_policy(policy_path, 'cpu')
     critic, _ = _load_critic(critic_path, 'cpu')
     ev = evaluate_distillation(ds, policy, critic, device='cpu', visit_temp=args.visit_temp)
-    logger.info('self-play: %d samples, agreement %.3f, mean_visit_entropy %.3f nats',
-                gs['n_samples'], gs['mean_agreement'], gs['mean_visit_entropy'])
+    logger.info('self-play: %d samples, agreement %.3f, mean_visit_entropy %.3f nats, '
+                'apprentice plies %.0f%%',
+                gs['n_samples'], gs['mean_agreement'], gs['mean_visit_entropy'],
+                100 * gs['apprentice_frac'])
     logger.info('pre-distill (visit_temp=%.2f) %s', args.visit_temp, _fmt(ev))
     if ev['visit_entropy'] > ev['policy_entropy']:
         logger.warning(
@@ -490,9 +533,9 @@ def _fmt(d):
 
 
 def _run_post_round_gauntlet(field_specs, args):
-    """Round-robin the accumulated field (base policy + every ExIt round's distilled
-    policy so far) via the existing gauntlet machinery, raw-policy agents only (no
-    search, so this stays cheap even after several rounds). Logs the same win-rate
+    """Round-robin `field_specs` (the run base, the round's own base, and the round's
+    distilled policy — see `cmd_loop`) via the existing gauntlet machinery, raw-policy
+    agents only (no search, so 100+ games per pair is still cheap). Logs the same win-rate
     matrix / Bradley-Terry report `app/gauntlet.py --bots policy` prints, through the
     logger so it lands in this run's log file too.
 
@@ -569,13 +612,14 @@ def cmd_loop(args):
     # instead of respawning processes).
     collector = ParallelSelfPlayCollector(args.n_workers, seed_base=args.seed or 0) \
         if args.n_workers > 1 else None
-    # Accumulated round-robin field for the post-round gauntlet: base + every round's
-    # distilled policy so far, so each round's report shows the whole trend, not just
-    # this round vs. base.
-    field_specs = [{'kind': 'policy', 'path': base_policy}]
-    # Index into field_specs of the checkpoint each round's self-play is generated
-    # from. Only advances past a promoted round — see the gate below.
-    cur_idx = 0
+    # The post-round gauntlet field is deliberately SMALL: the run's original base, the
+    # checkpoint this round was generated from, and the round's own output — at most three
+    # agents, exactly the two comparisons the promotion gate needs. The field used to
+    # accumulate every round, which spent the whole games budget on pairs nothing reads
+    # and produced fields the tool itself flagged as intransitive (0.100-0.200) at
+    # k=20-30, se ~ 9-11 pp. Three agents at k=100+ costs less and resolves ~4 pp
+    # (docs/IDEAS.md R.10.11's closing note, R.9.3).
+    base_spec = {'kind': 'policy', 'path': base_policy}
     if args.skip_gauntlet:
         logger.warning(
             '--skip-gauntlet disables the promotion gate: every round will be accepted '
@@ -598,7 +642,8 @@ def cmd_loop(args):
                         r + 1, args.rounds, cur_mode, os.path.basename(cur_policy))
             ds_path = os.path.join(args.run_dir, f'round{r}.npz')
             ds = _run_gen(cur_policy, cur_critic, args, value_mode=cur_mode, out_path=ds_path,
-                         collector=collector, desc=f'round {r + 1}/{args.rounds} self-play')
+                         collector=collector, desc=f'round {r + 1}/{args.rounds} self-play',
+                         round_seed=None if args.seed is None else args.seed + 1000 * r)
             replay.push(ds)
             train_ds = replay.concat()
             logger.info('round %d/%d: training on %d samples buffered over %d round(s) '
@@ -610,8 +655,14 @@ def cmd_loop(args):
                 train_ds, cur_policy, cur_critic, args,
                 out_policy=out_policy, out_critic=out_critic)
 
+            # base first, then this round's own base (when it isn't the run base), then the
+            # new checkpoint — so index 0 is always the run base and -1 is always the round.
+            field_specs = [base_spec]
+            if cur_policy != base_policy:
+                field_specs.append({'kind': 'policy', 'path': cur_policy})
             field_specs.append({'kind': 'policy', 'path': out_policy})
             new_idx = len(field_specs) - 1
+            cur_idx = new_idx - 1
             promoted = True
             wr_vs_cur = wr_vs_base = None
             if not args.skip_gauntlet:
@@ -658,7 +709,6 @@ def cmd_loop(args):
             cur_policy = out_policy
             cur_critic = critic_in_force
             cur_mode = cur_mode if args.freeze_critic else 'outcome'
-            cur_idx = new_idx
     finally:
         if collector is not None:
             collector.shutdown()
@@ -720,11 +770,71 @@ def _add_common(p):
     p.add_argument('--temperature', type=float, default=1.0, help='Visit-count sampling temperature.')
     p.add_argument('--temp-moves', type=int, default=12, help='Opening plies sampled before going greedy.')
     p.add_argument('--seed', type=int, default=None)
+    p.add_argument('--blind-teacher', action='store_true', default=True,
+                   help="Data-gen teacher does NOT read the opponent's hand (the default "
+                        "since 2026-08-20; --cheating-teacher restores PuctBot's own "
+                        "see_opponent_hand=True default). Nothing in ExIt ever turned it off, "
+                        "so every recorded run distilled a search that conditioned on a "
+                        "variable the student's observation does not contain: cheat and blind "
+                        "searches pick different moves on 15.4%% of positions (TV 0.123) "
+                        "against the 13.1%% on which the search improves on its prior at all "
+                        "— irreducible label noise at least as large as the entire signal, "
+                        "sitting exactly on top of it (docs/IDEAS.md R.10.4, M3). Blind search "
+                        "measured ~0 weaker in strength (search_under_uncertainty.md §8.1), so "
+                        "gate 3 is the check that this holds here too.")
+    p.add_argument('--cheating-teacher', dest='blind_teacher', action='store_false',
+                   help='Let the data-gen teacher read the opponent real hand (the pre-'
+                        '2026-08-20 behaviour). For reproducing old runs.')
+    p.add_argument('--n-determinizations', type=int, default=3,
+                   help='PIMC votes per teacher move. With a blind root each search samples '
+                        'its own re-split of the opponent hidden coins, so n=1 is single-'
+                        'determinization search — the strategy-fusion failure mode '
+                        'docs/search_under_uncertainty.md §2 is about. The budget is SPLIT '
+                        '(0.8 primary + 0.2 spread over the hedges, LookaheadCriticBot.act), '
+                        'so this costs no extra wall-clock; it trades some primary depth for a '
+                        'second opinion. 1 with --cheating-teacher reproduces the old teacher.')
+    p.add_argument('--forced-playouts-k', type=float, default=0.0,
+                   help="KataGo forced playouts at the search root: every child is guaranteed "
+                        "ceil(sqrt(k * P(a) * N)) visits, and the same allocation is subtracted "
+                        "back out of the recorded target (policy target pruning). 0 = off. "
+                        "Aimed at the one quantity nothing else here touches: the prior puts "
+                        "0.817 on its top move and only ~3.3 of the 8 kept children have a "
+                        "first-visit U bonus big enough for PUCT to reach at all, so the visit "
+                        "counts largely re-encode the prior and the search cannot promote a "
+                        "move the prior ranked low (docs/IDEAS.md R.10 M1). k=2 is KataGo's "
+                        "value; it reserves ~60 of 300 expansions at 8 children. Re-read "
+                        "preflight gates 2-4 when changing it — it makes the target sharper "
+                        "(pruning) AND spends budget on breadth, so both the entropy pair and "
+                        "teacher strength can move.")
+    p.add_argument('--apprentice-frac', type=float, default=0.0,
+                   help="Fraction of recorded plies PLAYED by the raw policy (sampled from its "
+                        "own priors) instead of by the search. The search still runs and still "
+                        "supplies the target at every ply, so this changes only which states "
+                        "the dataset covers, at identical cost. 0.0 is AlphaZero's convention "
+                        "(the expert plays); 1.0 is Expert Iteration's original one (Anthony "
+                        "et al. 2017 — apprentice plays, expert labels), which exists because "
+                        "a policy trained only on states the stronger player reaches has no "
+                        "target for the positions its own weaker play walks into (the "
+                        "compounding-error argument against plain behaviour cloning). The "
+                        "symptom it targets: a round's in-sample agreement with the teacher "
+                        "rises 0.744 -> 0.861 while its strength does not move (IDEAS.md "
+                        "R.10.12). 0.5 mixes both distributions.")
     # distill knobs
     p.add_argument('--epochs', type=int, default=4)
     p.add_argument('--minibatch', type=int, default=256)
     p.add_argument('--lr', type=float, default=3e-4)
-    p.add_argument('--val-frac', type=float, default=0.1)
+    p.add_argument('--val-frac', type=float, default=0.1,
+                   help='Held-out share, split by GAME rather than by sample (~84 samples '
+                        'share a game trajectory and its outcome, so a per-sample split puts '
+                        'near-duplicates on both sides — docs/IDEAS.md R.10.5c).')
+    p.add_argument('--no-early-stop', action='store_true',
+                   help='Run all --epochs and keep the last one, i.e. treat the held-out split '
+                        'as a report only. That was the behaviour through 2026-08-19: val_frac '
+                        'was computed, logged and never used to stop, so ~350 unconstrained '
+                        'Adam steps ran regardless of what it said (R.10.5c / R.10.8 item 3).')
+    p.add_argument('--patience', type=int, default=2,
+                   help='Epochs without held-out improvement before distillation stops early. '
+                        'The best-scoring epoch weights are restored either way.')
     p.add_argument('--visit-temp', type=float, default=0.5,
                    help="Sharpening exponent applied to the recorded visit distribution "
                         "before it is used as the CE target (`t = t**(1/visit_temp)`, "
@@ -784,13 +894,15 @@ def main():
     lp = sub.add_parser('loop', help='Full ExIt loop: gen -> distil -> re-seed -> gauntlet-check -> repeat.')
     _add_common(lp)
     lp.add_argument('--rounds', type=int, default=3)
-    lp.add_argument('--gauntlet-k-games', type=int, default=20,
-                    help='Games per pair in the post-round gauntlet check, which now also '
-                         'decides promotion (see --promote-threshold). se(WR) ~ 11pp at the '
-                         'default 20 — raise this if rounds are being rejected/accepted on '
-                         'what looks like noise; a rejection only costs a wasted round (the '
-                         'next one retries from the same, still-best, checkpoint), so this '
-                         'is deliberately conservative rather than tuned for throughput.')
+    lp.add_argument('--gauntlet-k-games', type=int, default=100,
+                    help='Games per pair in the post-round gauntlet check, which also decides '
+                         'promotion (see --promote-threshold). Raised 20 -> 100 on 2026-08-20: '
+                         'se(WR) is ~11 pp at 20 and ~5 pp at 100, and the whole 8-round run of '
+                         '2026-08-19 promoted on 0.533/0.533/0.500/0.500 measured at k=30 '
+                         '(se ~ 9 pp) — every one of those decisions was inside its own noise, '
+                         'and the run\'s own final field then read the result as a loss to base '
+                         '(docs/IDEAS.md R.10.11). The field is only 2-3 raw-policy agents, so '
+                         'k=100 is seconds of compute against a ~50-minute round.')
     lp.add_argument('--promote-threshold', type=float, default=0.5,
                     help="Minimum win rate a round's distilled policy must score against the "
                          "checkpoint its self-play was generated from (not the run's original "
@@ -805,7 +917,7 @@ def main():
                     help='Skip the post-round gauntlet check. Also disables the promotion '
                          'gate above (there is no win-rate to gate on) — every round is then '
                          'accepted unconditionally, which is the pre-fix behaviour.')
-    lp.add_argument('--replay-rounds', type=int, default=3,
+    lp.add_argument('--replay-rounds', type=int, default=6,
                     help="Train each round on the concatenation of the last N rounds' self-play "
                          "data (a sliding window, oldest dropped first) instead of this round's "
                          "~25k-sample slice alone. 1 reproduces the old one-round-only behaviour. "
@@ -815,7 +927,9 @@ def main():
                          "which the record ties to the same churn signature as an untrained critic "
                          "(independent_opponents.md §1: held-out MSE re-fit within a round but did "
                          "not generalise to the next one). Cost is RAM only (~0.5 GB/300-game round, "
-                         "`SelfPlayDataset.concat`), so the default keeps 3 rounds in the window.")
+                         "`SelfPlayDataset.concat`), so the default keeps 6 rounds in the window "
+                         "(raised from 3 on 2026-08-20: one round is ~20k samples for a 1.8M-"
+                         "parameter net, and round 1 cannot exercise the window at all).")
     lp.set_defaults(func=cmd_loop)
 
     pf = sub.add_parser('preflight',

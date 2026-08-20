@@ -34,6 +34,7 @@ is asserted by the caller.
 """
 import copy
 import logging
+import math
 
 import numpy as np
 import torch
@@ -62,15 +63,25 @@ class SelfPlayDataset:
     Arrays (after stack), all ego-frame where applicable:
         boards [N,C,7,7] f32 · globals [N,G] f32 · masks [N,A] bool ·
         visit_targets [N,A] f32 (normalised, zero on illegal) ·
-        opp_onehots [N,3] f32 · privileged [N,P] f32 · z [N] f32
+        opp_onehots [N,3] f32 · privileged [N,P] f32 · z [N] f32 ·
+        game_ids [N] i64 (which game each sample came from)
+
+    `game_ids` exists so a held-out split can be taken by *game* rather than by sample:
+    ~84 samples share one game's trajectory and its outcome, so a random per-sample
+    permutation puts near-duplicates on both sides of the split and the held-out number
+    comes out optimistic (docs/IDEAS.md R.10.5c; `eval_board_value.py` already holds out
+    by round for the same reason). Ids are assigned per game at label time and re-based
+    on `concat`, so they stay unique across workers and across replay-window rounds.
     """
 
     def __init__(self):
         self._boards, self._globals, self._masks = [], [], []
         self._visits, self._opp, self._priv = [], [], []
-        self._movers, self._z = [], []
+        self._movers, self._z, self._game_ids = [], [], []
+        self._n_games = 0
         self.boards = self.globals = self.masks = None
         self.visit_targets = self.opp_onehots = self.privileged = self.z = None
+        self.game_ids = None
 
     def add(self, *, board, global_feats, mask, visit_target, opp_onehot, privileged, mover):
         self._boards.append(board)
@@ -91,8 +102,11 @@ class SelfPlayDataset:
         search uses the same -1 truncation value so target and search agree.
         """
         movers = self._movers[len(self._z):len(self._z) + n]
+        game_id = self._n_games
+        self._n_games += 1
         for mover in movers:
             self._z.append(1.0 if winner == mover else -1.0)
+            self._game_ids.append(game_id)
 
     def stack(self):
         self.boards = np.stack(self._boards).astype(np.float32)
@@ -102,6 +116,7 @@ class SelfPlayDataset:
         self.opp_onehots = np.stack(self._opp).astype(np.float32)
         self.privileged = np.stack(self._priv).astype(np.float32)
         self.z = np.asarray(self._z, dtype=np.float32)
+        self.game_ids = np.asarray(self._game_ids, dtype=np.int64)
         assert len(self.z) == len(self.boards), 'unlabelled samples remain (call label_last per game)'
         # Free the per-sample lists: after stacking they're pure duplication of the
         # arrays above, and a parallel worker ships this whole object back to the main
@@ -116,7 +131,15 @@ class SelfPlayDataset:
 
     @classmethod
     def concat(cls, parts):
-        """Merge already-`stack()`ed datasets (one per parallel worker) into one."""
+        """Merge already-`stack()`ed datasets (one per parallel worker, or one per
+        replay-window round) into one.
+
+        `game_ids` are re-based per part, since each part numbers its own games from 0 —
+        without the offset two workers' game 0 would merge into one apparent game and the
+        by-game held-out split would leak across them. A part saved before `game_ids`
+        existed contributes one id per sample (the old per-sample behaviour) rather than
+        failing the merge.
+        """
         ds = cls()
         ds.boards = np.concatenate([p.boards for p in parts])
         ds.globals = np.concatenate([p.globals for p in parts])
@@ -125,6 +148,14 @@ class SelfPlayDataset:
         ds.opp_onehots = np.concatenate([p.opp_onehots for p in parts])
         ds.privileged = np.concatenate([p.privileged for p in parts])
         ds.z = np.concatenate([p.z for p in parts])
+        ids, offset = [], 0
+        for p in parts:
+            part_ids = p.game_ids
+            if part_ids is None:
+                part_ids = np.arange(len(p.z), dtype=np.int64)
+            ids.append(np.asarray(part_ids, dtype=np.int64) + offset)
+            offset += int(ids[-1].max()) + 1 if len(ids[-1]) else 0
+        ds.game_ids = np.concatenate(ids) if ids else np.zeros(0, dtype=np.int64)
         return ds
 
     def save(self, path):
@@ -133,7 +164,7 @@ class SelfPlayDataset:
         np.savez_compressed(
             path, boards=self.boards, globals=self.globals, masks=self.masks,
             visit_targets=self.visit_targets, opp_onehots=self.opp_onehots,
-            privileged=self.privileged, z=self.z,
+            privileged=self.privileged, z=self.z, game_ids=self.game_ids,
         )
 
     @classmethod
@@ -143,6 +174,15 @@ class SelfPlayDataset:
         ds.boards, ds.globals, ds.masks = d['boards'], d['globals'], d['masks']
         ds.visit_targets, ds.opp_onehots = d['visit_targets'], d['opp_onehots']
         ds.privileged, ds.z = d['privileged'], d['z']
+        if 'game_ids' in d:
+            ds.game_ids = d['game_ids']
+        else:
+            # Pre-2026-08-20 dataset: no game boundaries were recorded. One id per sample
+            # reproduces exactly the old random per-sample split rather than silently
+            # inventing groups that don't exist.
+            logger.warning('%s predates game_ids; held-out split falls back to per-sample '
+                           '(leaky — see SelfPlayDataset docstring).', path)
+            ds.game_ids = np.arange(len(ds.z), dtype=np.int64)
         return ds
 
     def iter_minibatches(self, minibatch_size, device, *, shuffle=True, indices=None):
@@ -232,16 +272,30 @@ def _sample_move(visit_counts, temperature):
     return int(actions[int(np.argmax(probs))])
 
 
-def play_selfplay_game(bot, env, dataset, *, temperature, temp_moves, max_turns):
+def play_selfplay_game(bot, env, dataset, *, temperature, temp_moves, max_turns,
+                       apprentice_frac=0.0):
     """Play one self-play game with `bot` on `env` (already built with a matching
     encoder), appending recorded samples into `dataset` and labelling them with the
     outcome. Shared by `generate_selfplay` (serial) and every worker in
     `services/selfplay_collector.py` (parallel), so both paths run identical game
     logic — only how many games run concurrently differs.
 
+    `apprentice_frac` is the probability that a recorded ply is *played* by the raw
+    policy (sampled from `last_stats['policy_priors']`) instead of by the search. The
+    search still runs at every ply and its visit distribution is still the recorded
+    target, so this changes only *which states end up in the dataset*, at identical
+    cost. `0.0` is AlphaZero's convention (the expert plays); `1.0` is Expert
+    Iteration's original one (Anthony et al. 2017 — the apprentice plays, the expert
+    labels). The latter matters here because a policy trained on states only the
+    stronger player reaches has no target for the positions its own weaker play walks
+    into — the standard compounding-error argument against plain behaviour cloning
+    (Ross & Bagnell), and a candidate explanation for the recorded pattern where a
+    round's in-sample agreement with the teacher rises 0.744 -> 0.861 while its
+    strength does not move at all (docs/IDEAS.md R.10.12).
+
     Returns a per-game stats dict with *sums*, not means (`visit_entropy_sum`,
-    `legal_sum`, `agree_sum`), so a caller aggregating many games — possibly across several
-    workers — only has to add them up and divide once at the end
+    `legal_sum`, `agree_sum`, `apprentice_sum`), so a caller aggregating many games —
+    possibly across several workers — only has to add them up and divide once at the end
     (`summarize_game_stats`).
     """
     env.reset()
@@ -250,6 +304,7 @@ def play_selfplay_game(bot, env, dataset, *, temperature, temp_moves, max_turns)
     visit_entropy_sum = 0.0
     legal_sum = 0
     agree_sum = 0
+    apprentice_sum = 0
     ply = 0
     for ply in range(max_turns):
         mover = env.active_player
@@ -279,12 +334,22 @@ def play_selfplay_game(bot, env, dataset, *, temperature, temp_moves, max_turns)
                 opp_onehot=_pool_onehot(), privileged=env.get_privileged_features(),
                 mover=mover,
             )
-            action = _sample_move(visit_counts, temperature if ply < temp_moves else 0.0)
+            priors = bot.last_stats.get('policy_priors') or {}
+            as_apprentice = bool(priors) and apprentice_frac > 0.0 \
+                and np.random.random() < apprentice_frac
+            if as_apprentice:
+                # Sample from the policy's own distribution, exactly as `PolicyAgent`
+                # does in the gauntlet — this ply's state distribution is the student's.
+                action = _sample_move(priors, 1.0)
+                apprentice_sum += 1
+            else:
+                action = _sample_move(visit_counts, temperature if ply < temp_moves else 0.0)
             _, _, term, trunc, info = env.step(action)
             if not info['action'].is_valid:
                 # puct only returns legal moves, so this is a belt-and-braces guard;
                 # drop the just-added (untaken-move) sample and continue randomly.
                 agree_sum -= move_agree
+                apprentice_sum -= int(as_apprentice)
                 for lst in (dataset._boards, dataset._globals, dataset._masks,
                             dataset._visits, dataset._opp, dataset._priv, dataset._movers):
                     lst.pop()
@@ -300,7 +365,7 @@ def play_selfplay_game(bot, env, dataset, *, temperature, temp_moves, max_turns)
     return {
         'turns': ply + 1, 'winner': winner, 'n_samples': n_samples,
         'visit_entropy_sum': visit_entropy_sum, 'legal_sum': legal_sum,
-        'agree_sum': agree_sum,
+        'agree_sum': agree_sum, 'apprentice_sum': apprentice_sum,
     }
 
 
@@ -315,7 +380,9 @@ def summarize_game_stats(game_stats):
     entropy_sum = sum(s['visit_entropy_sum'] for s in game_stats)
     legal_sum = sum(s['legal_sum'] for s in game_stats)
     agree_sum = sum(s['agree_sum'] for s in game_stats)
+    apprentice_sum = sum(s.get('apprentice_sum', 0) for s in game_stats)
     return {
+        'apprentice_frac': apprentice_sum / n_samples if n_samples else 0.0,
         'n_games': n_games,
         'n_samples': n_samples,
         'turns_mean': float(turns.mean()) if n_games else 0.0,
@@ -329,7 +396,7 @@ def summarize_game_stats(game_stats):
 
 
 def generate_selfplay(bot, n_games, *, encoder, temperature=1.0, temp_moves=12,
-                      max_turns=2000, seed=None, desc='self-play'):
+                      max_turns=2000, seed=None, desc='self-play', apprentice_frac=0.0):
     """Self-play `bot` for `n_games`, sequentially in-process (a live `rich` progress
     bar shows games completed — see `services/selfplay_collector.py` for the
     multi-process equivalent's own live bar).
@@ -349,7 +416,8 @@ def generate_selfplay(bot, n_games, *, encoder, temperature=1.0, temp_moves=12,
     game_stats = []
     for _ in track(range(n_games), description=desc):
         stats = play_selfplay_game(bot, env, dataset, temperature=temperature,
-                                   temp_moves=temp_moves, max_turns=max_turns)
+                                   temp_moves=temp_moves, max_turns=max_turns,
+                                   apprentice_frac=apprentice_frac)
         game_stats.append(stats)
     return dataset.stack(), game_stats
 
@@ -390,9 +458,32 @@ def _kl_to_reference(ref_joint, joint):
     return (ref_probs * (ref_joint - joint)).sum(dim=1).mean()
 
 
+def _split_by_game(game_ids, val_frac):
+    """`(train_idx, val_idx)` holding out whole *games*, not random samples.
+
+    A game contributes ~84 samples that share its trajectory and its single outcome z,
+    so a per-sample permutation puts near-duplicates on both sides and the held-out loss
+    reads better than it is — the same leak `eval_board_value.py` fixed by holding out by
+    round (docs/IDEAS.md R.10.5c). With fewer than two games (unit tests, a one-game
+    smoke) there is nothing to split by, so it falls back to the per-sample behaviour.
+    """
+    n = len(game_ids)
+    if not val_frac:
+        return np.arange(n), np.empty(0, dtype=np.int64)
+    games = np.unique(game_ids)
+    if len(games) < 2:
+        n_val = max(1, int(n * val_frac))
+        perm = np.random.permutation(n)
+        return perm[n_val:], perm[:n_val]
+    n_val_games = min(len(games) - 1, max(1, int(round(len(games) * val_frac))))
+    val_games = np.random.permutation(games)[:n_val_games]
+    is_val = np.isin(game_ids, val_games)
+    return np.nonzero(~is_val)[0], np.nonzero(is_val)[0]
+
+
 def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=3e-4,
             lr_critic=3e-4, grad_clip=1.0, device='cpu', val_frac=0.1, log_every=1,
-            train_critic=True, visit_temp=0.5, kl_coeff=0.0):
+            train_critic=True, visit_temp=0.5, kl_coeff=0.0, early_stop=True, patience=2):
     """Distil `policy` (CE→visits) and, unless `train_critic=False`, `critic` (MSE→z).
 
     Two independent Adam passes (like PPO's separate actor/critic optimisers). The
@@ -400,9 +491,18 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
     action space — illegal ids sit at -1e9 in the log-probs but are zeroed by the
     target. `visit_target` is raised to `1/visit_temp` and renormalised before use
     (`_sharpen_target`; `visit_temp=1.0` is the raw recorded distribution). Returns
-    per-epoch train stats plus a final held-out `(ce, mse, agreement)` from a
-    `val_frac` tail split, so a caller can confirm both losses fell and the policy's
-    argmax move now agrees more with the search's.
+    per-epoch train stats plus a final held-out `(ce, mse, agreement)`, so a caller
+    can confirm both losses fell and the policy's argmax move now agrees more with the
+    search's.
+
+    The held-out split is taken by **game** (`_split_by_game`), and — unless
+    `early_stop=False` — it is now a *control*, not just a report: the held-out CE/MSE
+    is measured after every epoch, the best epoch's weights are kept and restored at
+    the end, and training stops after `patience` epochs without improvement. Before
+    this, `val_frac` was computed, printed and ignored, so all `epochs` ran regardless
+    of what it said (docs/IDEAS.md R.10.5c / R.10.8 item 3) — on a ~25k-sample round
+    that is ~350 unconstrained Adam steps toward a target whose informative content is
+    a minority of samples.
 
     `train_critic=False` leaves the critic bit-identical and distils the policy only.
     That is not a convenience switch — it is the configuration the record argues for
@@ -422,13 +522,12 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
     target. `0.0` (default) is the old, unregularised behaviour.
     """
     n = len(dataset)
-    n_val = max(1, int(n * val_frac)) if val_frac else 0
-    perm = np.random.permutation(n)
-    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    game_ids = dataset.game_ids if dataset.game_ids is not None else np.arange(n)
+    train_idx, val_idx = _split_by_game(game_ids, val_frac)
+    n_val = len(val_idx)
 
-    policy.to(device).train()
+    policy.to(device)
     critic.to(device)
-    critic.train() if train_critic else critic.eval()
     p_opt = torch.optim.Adam(policy.parameters(), lr=lr_policy)
     c_opt = torch.optim.Adam(critic.parameters(), lr=lr_critic) if train_critic else None
 
@@ -438,8 +537,16 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
         for p in ref_policy.parameters():
             p.requires_grad_(False)
 
+    watch = early_stop and n_val > 0
+    best = {'ce': math.inf, 'mse': math.inf}
+    best_epoch = {'policy': -1, 'critic': -1}
+    best_state = {'policy': None, 'critic': None}
+    stale = 0
+
     history = []
     for epoch in range(epochs):
+        policy.train()
+        critic.train() if train_critic else critic.eval()
         ce_sum = mse_sum = kl_sum = 0.0
         n_mb = 0
         for batch in dataset.iter_minibatches(minibatch_size, device, indices=train_idx):
@@ -478,14 +585,53 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
             n_mb += 1
         stats = {'epoch': epoch, 'ce': ce_sum / max(1, n_mb), 'mse': mse_sum / max(1, n_mb),
                  'kl': kl_sum / max(1, n_mb)}
+        if watch:
+            held = evaluate_distillation(dataset, policy, critic, device=device,
+                                         indices=val_idx, visit_temp=visit_temp)
+            stats['val_ce'] = held['ce']
+            stats['val_mse'] = held['mse']
+            improved = False
+            if held['ce'] < best['ce'] - 1e-6:
+                best['ce'] = held['ce']
+                best_state['policy'] = copy.deepcopy(policy.state_dict())
+                best_epoch['policy'] = epoch
+                improved = True
+            if train_critic and held['mse'] < best['mse'] - 1e-6:
+                best['mse'] = held['mse']
+                best_state['critic'] = copy.deepcopy(critic.state_dict())
+                best_epoch['critic'] = epoch
+                improved = True
+            stale = 0 if improved else stale + 1
         history.append(stats)
         if log_every and (epoch + 1) % log_every == 0:
-            logger.info('distill: epoch %d/%d — ce=%.4f mse=%.4f kl=%.4f',
-                        epoch + 1, epochs, stats['ce'], stats['mse'], stats['kl'])
+            logger.info('distill: epoch %d/%d — ce=%.4f mse=%.4f kl=%.4f%s',
+                        epoch + 1, epochs, stats['ce'], stats['mse'], stats['kl'],
+                        '' if not watch else
+                        f" | held-out ce={stats['val_ce']:.4f} mse={stats['val_mse']:.4f}")
+        if watch and stale >= patience:
+            logger.info('distill: held-out loss has not improved for %d epochs — stopping at '
+                        'epoch %d/%d', stale, epoch + 1, epochs)
+            break
+
+    if watch:
+        # Roll back to the best-scoring epoch. Policy and critic are scored on their own
+        # objective and can peak at different epochs; they are separate nets trained by
+        # separate optimisers, so restoring them independently is well defined.
+        if best_state['policy'] is not None and best_epoch['policy'] != history[-1]['epoch']:
+            policy.load_state_dict(best_state['policy'])
+            logger.info('distill: restored the policy from epoch %d (held-out ce %.4f)',
+                        best_epoch['policy'] + 1, best['ce'])
+        if best_state['critic'] is not None and best_epoch['critic'] != history[-1]['epoch']:
+            critic.load_state_dict(best_state['critic'])
+            logger.info('distill: restored the critic from epoch %d (held-out mse %.4f)',
+                        best_epoch['critic'] + 1, best['mse'])
 
     val = evaluate_distillation(dataset, policy, critic, device=device, indices=val_idx,
                                 visit_temp=visit_temp) if n_val else {}
-    return {'history': history, 'val': val, 'n_train': len(train_idx), 'n_val': n_val}
+    return {'history': history, 'val': val, 'n_train': len(train_idx), 'n_val': n_val,
+            'best_epoch': best_epoch['policy'] + 1 if watch else None,
+            'epochs_run': len(history), 'n_val_games': int(len(np.unique(game_ids[val_idx])))
+            if n_val else 0}
 
 
 def evaluate_distillation(dataset, policy, critic, *, device='cpu', indices=None,

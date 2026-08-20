@@ -34,7 +34,8 @@ logger = logging.getLogger('warchest')
 # affects the bot's behavior, not `n_games`/`temperature`/`temp_moves`/`max_turns` (pure
 # per-round play parameters that don't require a new bot instance).
 _BOT_KEYS = ('policy_path', 'critic_path', 'value_mode', 'c_puct', 'max_branching',
-            'time_budget', 'dirichlet_alpha', 'dirichlet_frac')
+            'time_budget', 'dirichlet_alpha', 'dirichlet_frac', 'see_opponent_hand',
+            'n_determinizations', 'forced_playouts_k')
 
 
 def _worker_loop(worker_id, task_q, result_q, counter, completed, seed_base):
@@ -86,6 +87,9 @@ def _worker_loop(worker_id, task_q, result_q, counter, completed, seed_base):
                     value_mode=task['value_mode'], c_puct=task['c_puct'],
                     max_branching=task['max_branching'], time_budget=task['time_budget'],
                     dirichlet_alpha=task['dirichlet_alpha'], dirichlet_frac=task['dirichlet_frac'],
+                    see_opponent_hand=task['see_opponent_hand'],
+                    n_determinizations=task['n_determinizations'],
+                    forced_playouts_k=task['forced_playouts_k'],
                     device='cpu', stats_log_every=0,
                 )
                 # PolicyCriticBot.__init__ already resolved the obs encoder for this
@@ -100,6 +104,7 @@ def _worker_loop(worker_id, task_q, result_q, counter, completed, seed_base):
                 stats = play_selfplay_game(
                     bot, env, dataset, temperature=task['temperature'],
                     temp_moves=task['temp_moves'], max_turns=task['max_turns'],
+                    apprentice_frac=task['apprentice_frac'],
                 )
                 game_stats.append(stats)
                 with completed.get_lock():
@@ -147,7 +152,8 @@ class ParallelSelfPlayCollector:
 
     def submit(self, *, policy_path, critic_path, value_mode, n_games, c_puct, max_branching,
                time_budget, dirichlet_alpha, dirichlet_frac, temperature, temp_moves, max_turns,
-               desc='self-play'):
+               see_opponent_hand=True, n_determinizations=1, forced_playouts_k=0.0,
+               apprentice_frac=0.0, desc='self-play'):
         with self._counter.get_lock():
             self._counter.value = n_games
         with self._completed.get_lock():
@@ -158,7 +164,11 @@ class ParallelSelfPlayCollector:
             'policy_path': policy_path, 'critic_path': critic_path, 'value_mode': value_mode,
             'c_puct': c_puct, 'max_branching': max_branching, 'time_budget': time_budget,
             'dirichlet_alpha': dirichlet_alpha, 'dirichlet_frac': dirichlet_frac,
+            'see_opponent_hand': see_opponent_hand,
+            'n_determinizations': n_determinizations,
+            'forced_playouts_k': forced_playouts_k,
             'temperature': temperature, 'temp_moves': temp_moves, 'max_turns': max_turns,
+            'apprentice_frac': apprentice_frac,
         }
         for wid in range(self._n):
             self._task_qs[wid].put(task)

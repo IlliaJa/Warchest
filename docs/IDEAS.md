@@ -35,8 +35,13 @@ opponent-independent complement.
 > search actually adds, and the A1+A3 verdict), **R.9** (pre-launch list for a PPO run) and
 > **R.10** (a symbol-level read of ExIt: R.8's budget fix is validated on two independent axes,
 > and what is left is that the teacher reads the opponent's hand plus four missing AlphaZero
-> mechanisms — R.10.1 and R.10.2 are retractions of R.10's own first draft). R.10.8 is the
-> current order.
+> mechanisms — R.10.1 and R.10.2 are retractions of R.10's own first draft). **R.10.12
+> (2026-08-20) is the current state**: with the teacher now measured strong (0.787) and the
+> loop still at parity, six changes target the *transfer* path instead — blind teacher +
+> PIMC, apprentice-driven states, forced root playouts with target pruning, by-game early
+> stopping, a wider replay window, and a post-round verdict that can resolve the effect it
+> gates on. It also corrects R.10.10's dismissal of the cheating-teacher hypothesis, which
+> flips R.10.6 from queued to contra-indicated.
 
 Current state: the live plan is **not** in this file — it is
 [next_iteration.md](next_iteration.md) §5, which supersedes both the sequencing in
@@ -2412,3 +2417,71 @@ next thing to try; two iterations (sharpening+gate, then replay-window+KL) have 
 one step from *actively harmful* toward *parity* without yet reaching *better*, which is consistent
 with the fallback's premise that one-shot CE imitation of a multi-ply search verdict has a ceiling
 these fixes cannot lift past, rather than with either fix having simply been mistuned.
+
+### R.10.12 Six changes to the ExIt channel (2026-08-20) — the transfer path, not the teacher
+
+R.10.11 ends at *parity*: the teacher is strong (`preflight` 2026-08-19 measures **0.787 ±
+0.046** at 1.0 s, 359 expansions/move, agreement 0.744, all four gates green) and the loop
+still returns 0.47–0.55 per round. So the open question is no longer "is there anything to
+distil" — it is **why 0.29 of teacher edge arrives as ~0.05**. This section ships six
+changes aimed at the transfer path itself. Three of them are mechanisms nothing in the
+repo had; three make the result readable. None of them touches the search's strength.
+
+**One correction to R.10.10 first, because it changes what the leading hypothesis is.**
+R.10.10 dismissed the cheating-teacher story (R.10.4) on the grounds that hidden
+information "would corrupt agree and disagree samples alike, not cleanly separate them
+this way". That argument does not hold: on an *agree* sample the recorded target's argmax
+**is** the policy's own argmax, so no amount of privileged information can change what
+that label teaches — cheating can only move the label where search and prior disagree.
+The measured pattern (`disagree_only` distillation loses to base **0.28–0.29**, `agree_only`
+loses only **0.40–0.41**, and agree beats disagree head-to-head **0.70**) is therefore
+exactly what R.10.4 predicts, not evidence against it. The clean split is the *strongest*
+evidence in this document that the disagreeing minority carries corrupted labels, and
+R.10.8 item 1 was never tried.
+
+A direct consequence, worth stating because it inverts a queued item: **R.10.6 (weight the
+loss by teacher/prior divergence) is contra-indicated until the teacher is blind.** It
+up-weights precisely the subset measured to be harmful.
+
+#### What shipped
+
+| # | change | flag | why |
+|---|---|---|---|
+| 1 | **Blind teacher + PIMC voting for data-gen** | `--blind-teacher` (now the default), `--cheating-teacher` to revert, `--n-determinizations 3` | `_build_bot` never passed `see_opponent_hand`, so every ExIt sample ever recorded came from a search reading the opponent's real hand (`PuctBot`'s own default). M3: cheat and blind disagree on **15.4 %** of positions (TV 0.123) against the **13.1 %** where the search improves on its prior at all. With a blind root, `n_determinizations=1` is single-determinization search (strategy fusion, `search_under_uncertainty.md` §2) — and the budget is *split*, not multiplied (`LookaheadCriticBot.act`: 0.8 primary + 0.2 across the hedges), so PIMC voting costs no wall-clock, only some primary depth |
+| 2 | **Apprentice-driven state distribution** | `--apprentice-frac` (0 = off) | The recorded ply is *played* by the raw policy (sampled from its own priors, as `PolicyAgent` does in the gauntlet) while the search still runs and still supplies the target. Canonical Expert Iteration (Anthony et al. 2017) samples states from the apprentice for exactly this reason; AlphaZero gets away with expert-played states because its net is retrained from scratch across many generations. Here one round pushes a PPO-converged policy toward targets defined only on states the *stronger* player reaches, so its own weaker play walks into positions the dataset never covered — the compounding-error argument against plain behaviour cloning. The symptom this predicts is on record: agreement rises **0.744 → 0.861** in-sample while strength does not move. **Cost is identical** — the search runs either way; only which move gets played changes |
+| 3 | **Forced root playouts + policy target pruning** | `--forced-playouts-k` (0 = off; 2.0 is KataGo's) | The only lever aimed at M1: the prior puts **0.817** on its top move and only ~**3.3** of 8 kept children have a first-visit U bonus PUCT can reach, so visit counts largely re-encode the prior and *the search cannot promote a move the prior ranked low*. Every root child now gets `ceil(sqrt(k·P(a)·N))` visits, and `_pruned_root_visits` subtracts that same allocation back out of the recorded target so the floor buys **evaluation** without flattening what is distilled. The two halves are one mechanism; using either alone is a mistake in either direction. Note the interaction: pruning **sharpens** the target, so `--visit-temp` should be re-read (probably raised toward 1.0) from `preflight` gate 4 whenever this is on |
+| 4 | **Held-out split by game + early stopping** | `--val-frac` (unchanged), `--no-early-stop`, `--patience 2` | Two separate defects in one place. The split was `np.random.permutation` over *samples*, but ~84 samples share one game's trajectory and outcome, so near-duplicates landed on both sides and the held-out number read optimistically (`eval_board_value.py` already holds out by round for this reason). And `val_frac` was computed, logged and **never used to stop** — all `epochs` ran regardless. Now `game_ids` travel with the dataset (re-based on `concat`, so workers and replay rounds cannot collide; a pre-2026-08-20 `.npz` falls back to the old per-sample split with a warning), the split is by game, the held-out loss is measured every epoch, the best epoch's weights are restored, and training stops after `patience` epochs without improvement |
+| 5 | **More data behind each round** | `--replay-rounds` default 3 → **6**; per-round seeds | One round is ~20k samples for a 1.8M-parameter net, and round 1 cannot exercise the window at all. Also closes R.10.7's trap for the sequential path: `generate_selfplay` re-seeds per call, so at `--n-workers 1` every round of a loop replayed the *identical* games; `cmd_loop` now passes `seed + 1000·r` |
+| 6 | **A verdict that can resolve the effect** | `--gauntlet-k-games` default 20 → **100**; 2–3-agent field | The post-round field used to accumulate every round, spending the games budget on pairs nothing reads and producing fields the tool itself flagged intransitive (0.100–0.200) at k=20–30. The gate needs exactly two numbers — vs the round's own base and vs the run base — so the field is now `[base, cur, new]`. se(WR) goes ~11 pp → ~5 pp, and the whole 8-round run of 2026-08-19 promoted on 0.533/0.533/0.500/0.500 measured at k=30 (se ≈ 9 pp): every one of those decisions was inside its own noise. Three raw-policy agents at k=100 is seconds against a ~50-minute round |
+
+`preflight` now builds the **data-gen** teacher for all four gates (blindness, PIMC,
+forced playouts) and prints the configuration in gate 1 — a gate measured on a different
+bot than the one that will generate the data is not a gate. 355 tests pass, including
+`tests/test_puct_forced_playouts.py` (the quota formula, that pruning zeroes a child which
+only ever got its quota, that the best child is never pruned so the target cannot come out
+empty, that quotas apply at the root only) and the new `tests/test_expert_iteration.py`
+blocks (game-id assignment and re-basing across `concat`, the legacy-`.npz` fallback,
+by-game splits never putting one game on both sides, apprentice plies playing the prior
+while still recording the search's target, and early stopping returning the best epoch
+rather than the last).
+
+**Honest caveat, stated up front:** this is a **bundle**, against this file's own standing
+rule. It is deliberate — the loop has returned "flat" three times, and the cheapest way to
+learn whether the transfer path can be fixed at all is to fix everything cheap about it at
+once. If the bundle comes back positive, the credit split (blind teacher alone / apprentice
+alone / forced playouts alone) is the follow-up, and each is a single flag. If it comes back
+flat, the *class* of fix is exhausted and R.10.10's recorded fallback — retire CE imitation,
+use `PuctBot` as a PPO sparring opponent — is next.
+
+**Still open, unchanged:** R.10.5d (record `best_value`; the search's own root value is
+computed and thrown away, and it is a better critic target than `z`), R.3b (Gumbel — items
+2 and 3 above are its cheap approximations; reach for the real thing when forced playouts
+run out of room), and R.10.6 (now contra-indicated, see above).
+
+**What "70 % vs the raw policy" needs, arithmetically.** One round of imitation is capped by
+the teacher (0.79 today), and 0.70 is 88 % of that gap in a single step — CE imitation has
+never come close to that here. The route is compounding: a round that reliably wins **0.55**
+against its predecessor is ~+35 Elo, and five or six of them stack to ~0.72–0.75 against the
+run's original base, with the teacher re-strengthening on each improved prior. So the target
+for this work is not 0.70 in one round — it is **one round that clears 0.55 at k ≥ 100**,
+after which the loop is the thing that runs, not the thing that is being debugged.

@@ -149,6 +149,10 @@ class PuctBot(PolicyCriticBot):
             (fraction `dirichlet_frac`) for self-play target generation. Off by
             default — pure exploitation for eval/opponent use.
         dirichlet_frac: mixing weight for the root noise when it is enabled.
+        forced_playouts_k: KataGo forced playouts at the root (0 = off). Every root
+            child is guaranteed `ceil(sqrt(k · P(a) · N_root))` visits before PUCT is
+            free to ignore it, and `_pruned_root_visits` removes that allocation from
+            the recorded visit target again. k=2 is KataGo's value.
         value_mode: `'shaped'` (default) — the standard bot: leaf blends critic +
             `_leaf_potential` and the tree accumulates real shaped edge rewards, for a
             critic on the PPO shaped-return scale. `'outcome'` — pure AlphaZero: leaf =
@@ -162,7 +166,7 @@ class PuctBot(PolicyCriticBot):
                  critic_weight=0.7, max_branching=8, time_budget=0.1,
                  max_simulations=None, dirichlet_alpha=0.0, dirichlet_frac=0.25,
                  value_mode='shaped', outcome_heuristic_frac=0.2, see_opponent_hand=True,
-                 max_depth=40, gamma=0.99,
+                 forced_playouts_k=0.0, max_depth=40, gamma=0.99,
                  opp_type='pool', n_determinizations=1, stats_log_every=20,
                  device='cpu', name='puct'):
         # beam_width is inherited but unused by MCTS (no per-node beam); pass 1.
@@ -192,6 +196,18 @@ class PuctBot(PolicyCriticBot):
         # it's roughly commensurate with z ∈ [-1,1]; it's clipped to [-1,1] before the
         # blend to stay on scale. 0.0 recovers the pure-critic AlphaZero leaf.
         self.outcome_heuristic_frac = outcome_heuristic_frac
+        # KataGo forced playouts (0 = off, the plain AlphaZero root). At this project's
+        # budget the root prior is a near point mass — mean top-1 0.817, and only ~3.3 of
+        # the 8 kept children have a first-visit U bonus large enough for PUCT to reach
+        # them at all (docs/IDEAS.md R.10 M1) — so the visit counts mostly re-encode the
+        # prior and the search cannot promote a move the prior ranked low. This guarantees
+        # every root child at least `ceil(sqrt(k · P(a) · N))` visits, i.e. that Q is
+        # actually measured for all of them. `_pruned_root_visits` then subtracts that
+        # forced allocation back out of the recorded target, so the floor buys evaluation
+        # without flattening the distribution that gets distilled (KataGo's forced
+        # playouts + policy target pruning, one mechanism in two halves — using one
+        # without the other is a mistake in either direction).
+        self.forced_playouts_k = forced_playouts_k
         # z is an *undiscounted* game outcome, so the backup must be undiscounted too:
         # with gamma<1 a win d plies deep backs up as gamma**d instead of 1, which the
         # critic's undiscounted z target never sees. AlphaZero uses gamma=1 for exactly
@@ -200,10 +216,14 @@ class PuctBot(PolicyCriticBot):
             self.gamma = 1.0
         # Per-search root visit distributions and raw (pre-noise) policy priors collected
         # during one act() call (reset there): visits -> last_stats['visit_counts'] (the
-        # expert-iteration policy target), priors -> last_stats['policy_argmax'] (for the
-        # self-play policy/search agreement stat).
+        # expert-iteration policy target), priors -> last_stats['policy_argmax'] and
+        # last_stats['policy_priors'] (the self-play agreement stat, and the distribution
+        # apprentice-driven data-gen samples its own move from).
         self._search_visits = []
         self._search_priors = []
+        # The root node of the search currently running, so `_select` can tell the root
+        # apart from every other node (forced playouts apply at the root only).
+        self._root_node = None
 
     def act(self, env) -> int:
         """As `LookaheadCriticBot.act` (iterative determinization voting), plus it
@@ -224,6 +244,11 @@ class PuctBot(PolicyCriticBot):
         # the direct read on whether the search actually diverges from its prior.
         priors = self._combine_visit_counts(self._search_priors)
         self.last_stats['policy_argmax'] = max(priors, key=priors.get) if priors else None
+        # The full raw-prior distribution, not just its argmax: apprentice-driven ExIt
+        # data-gen (`expert_iteration.play_selfplay_game`) samples the move it actually
+        # plays from this, so the states in the dataset are the ones the *student* visits
+        # while the targets stay the search's (docs/IDEAS.md R.10.12).
+        self.last_stats['policy_priors'] = priors
         return action
 
     @staticmethod
@@ -266,6 +291,7 @@ class PuctBot(PolicyCriticBot):
         """
         root_state, root_queues = self._prepare_root(env, root_player)
         root = _Node(root_state, root_queues, root_state.active_player)
+        self._root_node = root
 
         self._n_expansions = 0
         self._max_depth_reached = 0
@@ -293,7 +319,10 @@ class PuctBot(PolicyCriticBot):
         best_edge = root.children[best_action]
         best_val = (best_edge.W / best_edge.N) if best_edge.N > 0 else None
         visit_counts = {a: e.N for a, e in root.children.items()}  # absolute frame
-        self._search_visits.append((sims, visit_counts))
+        # The *target* is the pruned distribution (a no-op unless forced playouts are on);
+        # the move returned above is chosen on the raw tree, since the forced visits are
+        # real evaluations and should inform the choice.
+        self._search_visits.append((sims, self._pruned_root_visits(root)))
         self._search_priors.append((sims, root_priors))
         stats = {
             'depth_reached': self._max_depth_reached,
@@ -346,7 +375,14 @@ class PuctBot(PolicyCriticBot):
         the node's own leaf value as first-play urgency, so an unexplored move is
         assumed roughly as good as the position it comes from — symmetric between
         the two node types, unlike a fixed `Q=0` init which would bias min nodes.
+
+        At the root only, and only when `forced_playouts_k > 0`, a child still short of
+        its forced-playout quota pre-empts the PUCT comparison (`_forced_visits`).
         """
+        if self.forced_playouts_k > 0.0 and node is self._root_node:
+            for action, edge in node.children.items():
+                if edge.N < self._forced_visits(edge.prior, node.N):
+                    return action
         sign = 1.0 if node.mover == root_player else -1.0
         sqrt_total = math.sqrt(max(1, node.N))
         fpu = node.leaf_value
@@ -373,6 +409,44 @@ class PuctBot(PolicyCriticBot):
             return (edge.N, sign * q)
 
         return max(node.children.items(), key=key)[0]
+
+    def _forced_visits(self, prior, total):
+        """KataGo's forced-playout quota for a root child: `ceil(sqrt(k · P(a) · N))`.
+
+        Sub-linear in `N`, so the guarantee costs a shrinking share of a growing budget:
+        at 300 expansions and 8 children it reserves ~60 of them, and at 3000 it would
+        reserve ~190. `prior` is the (post-noise) edge prior, `total` the root's visit
+        count so far.
+        """
+        return math.ceil(math.sqrt(self.forced_playouts_k * prior * max(1, total)))
+
+    def _pruned_root_visits(self, root):
+        """Root visit counts with the forced allocation subtracted — the CE target.
+
+        Forced playouts (`forced_playouts_k`) exist so Q is measured for every root
+        child; left in the target they would flatten it toward the prior, which is the
+        opposite of the intent and the exact failure recorded in docs/IDEAS.md R.10.9.
+        So each non-best child gives back up to its forced quota: what remains is the
+        visits PUCT spent on it *voluntarily*, i.e. actual evidence. A child that never
+        earned a visit beyond its quota drops to 0.
+
+        This is a simplification of KataGo's policy target pruning (which subtracts one
+        visit at a time while the child's PUCT value stays under the best child's, and
+        keeps the best child untouched — as here). The most-visited child is never
+        pruned, so the target can never come out empty.
+        """
+        counts = {a: e.N for a, e in root.children.items()}
+        if self.forced_playouts_k <= 0.0 or not counts:
+            return counts
+        best = max(counts, key=lambda a: counts[a])
+        pruned = {}
+        for action, edge in root.children.items():
+            if action == best:
+                pruned[action] = counts[action]
+                continue
+            surplus = counts[action] - self._forced_visits(edge.prior, root.N)
+            pruned[action] = surplus if surplus > 0 else 0
+        return pruned
 
     # ------------------------------------------------------------------
     # Expansion / child creation
