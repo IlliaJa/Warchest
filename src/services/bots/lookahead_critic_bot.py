@@ -659,6 +659,7 @@ class LookaheadCriticBot(LookaheadBot):
         boards, globals_, privs = [], [], []
         for state in states:
             self._sim_env.set_state(state)
+            self._sync_exploration_map()
             obs = self._sim_env.generate_observation()
             boards.append(obs['board'])
             globals_.append(obs['global'])

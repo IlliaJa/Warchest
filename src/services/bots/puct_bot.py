@@ -498,6 +498,7 @@ class PuctBot(PolicyCriticBot):
         so `exp` gives a distribution already zero on illegal moves.
         """
         self._sim_env.set_state(state)
+        self._sync_exploration_map()
         obs = self._policy_encoder.encode(self._sim_env)
         with torch.inference_mode():
             logp = self._policy._obs_logits(obs)[0].cpu().numpy()

@@ -199,6 +199,9 @@ class LookaheadBot:
         self._sim_env = WarChestEnv(save_game_history=False)
         self._sim_env._draw_one = types.MethodType(_determinized_draw_one, self._sim_env)
         self._sim_env._sim_draw_queues = {1: [], 2: []}
+        # Snapshot of the live env's exploration map, taken per `_prepare_root` — the one
+        # piece of observable state `GameState` does not carry (`_sync_exploration_map`).
+        self._root_exploration = None
         # docs/rewards.md: holding_reward = rate * (my_bases - opp_bases), fired every
         # main-actor ply. Shared derivation with ppo.py, so the two cannot drift.
         self._holding_reward_rate = self._sim_env.default_holding_reward_rate()
@@ -289,7 +292,44 @@ class LookaheadBot:
             root_player: self._shuffled(state.bags[root_player]),
             opp: self._shuffled(state.bags[opp]),
         }
+        # The exploration map lives on the ENV, not on GameState, so `_clone_state` cannot
+        # carry it and `set_state` cannot restore it — see `_sync_exploration_map`.
+        expl = getattr(env, 'exploration_map_dict', None)
+        self._root_exploration = None if expl is None else {1: expl[1].copy(), 2: expl[2].copy()}
         return state, queues
+
+    def _sync_exploration_map(self):
+        """Install the root position's exploration map on the sim env, before a net encode.
+
+        `GameState` does not carry `exploration_map_dict` — it is a separate `WarChestEnv`
+        attribute, created in `set_init_state` and incremented on every move — so
+        `set_state(cloned_state)` leaves the sim env holding *its own* map, and `_apply`
+        keeps incrementing that one for every line the search simulates. Board plane 5 is
+        exactly that map (`obs_encoders/v11.py`), so without this call every position a
+        search bot evaluates carries a stale, monotonically accumulating visit count
+        belonging to no position at all.
+
+        It is not cosmetic. Substituting the sim env's plane 5 for the real one changes the
+        policy's top-1 move on **8.3 %** of states (mean TV 0.123, 145 states) — the same
+        order as the entire improvement signal a 1.0 s search provides over its own prior
+        (13.1 %, docs/IDEAS.md R.10 M3), and comparable to the hidden-hand noise R.10.4 is
+        about. Every search bot that reads a net through `_sim_env` was affected:
+        `PuctBot._policy_priors`, `PolicyCriticBot._prune_candidates`,
+        `LookaheadCriticBot`'s critic batch. (`PolicyThetaBot` encodes the live env
+        directly and never had the problem.)
+
+        A fresh copy is installed per encode so simulated moves cannot accumulate into the
+        snapshot. The residual error is bounded and small — the true map would gain one
+        increment per ply of the line under evaluation, against a root map holding a whole
+        game's worth. Carrying the map inside `GameState` would remove even that, at the
+        cost of two array copies per node in `_clone_state`.
+        """
+        if self._root_exploration is None:
+            return
+        self._sim_env.exploration_map_dict = {
+            1: self._root_exploration[1].copy(),
+            2: self._root_exploration[2].copy(),
+        }
 
     @staticmethod
     def _resplit_hidden(state, opp):
