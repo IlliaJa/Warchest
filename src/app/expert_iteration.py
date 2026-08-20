@@ -281,10 +281,11 @@ def _run_distill(dataset, policy_path, critic_path, args, *, out_policy, out_cri
         raise SystemExit('policy/critic obs_version mismatch (see gen).')
 
     freeze = getattr(args, 'freeze_critic', False)
-    logger.info('distill: %d samples, %d epochs, minibatch=%d, lr=%.1e, visit_temp=%.2f, '
-                'kl_coeff=%.2f, critic=%s',
-                len(dataset), args.epochs, args.minibatch, args.lr, args.visit_temp,
-                args.kl_coeff, 'FROZEN (policy-only distillation)' if freeze else 'trained on z')
+    logger.info('distill: %d samples, %d epochs, minibatch=%d, lr=%.1e, target=%s, '
+                'visit_temp=%.2f, q_scale=%.2f, kl_coeff=%.2f, critic=%s',
+                len(dataset), args.epochs, args.minibatch, args.lr, args.target_mode,
+                args.visit_temp, args.q_scale, args.kl_coeff,
+                'FROZEN (policy-only distillation)' if freeze else 'trained on z')
     before = evaluate_distillation(dataset, policy, critic, device=args.device,
                                    visit_temp=args.visit_temp)
     if before.get('agreement', 0.0) >= 0.9:
@@ -298,7 +299,8 @@ def _run_distill(dataset, policy_path, critic_path, args, *, out_policy, out_cri
                   lr_policy=args.lr, lr_critic=args.lr, device=args.device,
                   val_frac=args.val_frac, train_critic=not freeze, visit_temp=args.visit_temp,
                   kl_coeff=args.kl_coeff, early_stop=not args.no_early_stop,
-                  patience=args.patience, disagree_weight=args.disagree_weight)
+                  patience=args.patience, disagree_weight=args.disagree_weight,
+                  target_mode=args.target_mode, q_scale=args.q_scale)
     after = res['val']
     logger.info('distill: held-out n_val=%d samples from %d games; ran %d/%d epochs, kept '
                 'epoch %s', res['n_val'], res['n_val_games'], res['epochs_run'], args.epochs,
@@ -845,6 +847,23 @@ def _add_common(p):
     p.add_argument('--patience', type=int, default=2,
                    help='Epochs without held-out improvement before distillation stops early. '
                         'The best-scoring epoch weights are restored either way.')
+    p.add_argument('--target-mode', choices=['visits', 'completed_q'], default='visits',
+                   help="What the policy is distilled toward. 'visits' (default) is the "
+                        "AlphaZero convention: the root visit distribution. 'completed_q' is "
+                        "Gumbel AlphaZero's improved policy, softmax(log pi + q_scale * Q) "
+                        "over the root children (docs/IDEAS.md R.3b) — the current policy "
+                        "re-weighted by the margin the search measured, rather than by which "
+                        "move it visited most. The reason to prefer it here: at ~118 "
+                        "expansions over 8 children the visit counts carry the pick and "
+                        "almost nothing about the margin, and three CE-on-visits variants all "
+                        "measured ~0.50 against base with a teacher at 0.733 (R.10.15a). "
+                        "Needs a dataset with recorded child_q (2026-08-20 on) and makes "
+                        "--visit-temp inapplicable.")
+    p.add_argument('--q-scale', type=float, default=2.0,
+                   help='Logit weight on the search Q in --target-mode completed_q. Q spans '
+                        '~1.74 p5-p95 on the shaped scale (eval_value_calibration.py puct), so '
+                        '2.0 makes a full-span difference worth ~3.5 logits. Calibratable '
+                        'offline on one recorded round — no self-play needed to sweep it.')
     p.add_argument('--disagree-weight', type=float, default=1.0,
                    help="Multiply the CE of samples where the round's starting policy already "
                         "disagrees with the search's move. 1.0 = off (every sample equal). "

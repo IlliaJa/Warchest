@@ -417,3 +417,91 @@ def test_disagree_weight_moves_the_policy_further_on_the_samples_it_up_weights()
         return int((before & ~after).sum())
 
     assert run(8.0) > run(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# The completed-Q target (docs/IDEAS.md R.3b) — what the search measured, not what it picked
+# --------------------------------------------------------------------------- #
+def _q_batch(logp, ids, qs):
+    return (torch.tensor([logp], dtype=torch.float32),
+            torch.tensor([ids], dtype=torch.int64),
+            torch.tensor([qs], dtype=torch.float32))
+
+
+def test_completed_q_target_is_a_distribution_over_the_recorded_children_only():
+    from src.services.expert_iteration import _completed_q_target
+
+    joint, ids, qs = _q_batch([-1.0, -2.0, -3.0, -1e9], [0, 1, -1, -1], [0.0, 0.0, 0.0, 0.0])
+    tgt = _completed_q_target(joint, ids, qs, q_scale=2.0)
+    assert tgt[0, 2].item() == 0.0 and tgt[0, 3].item() == 0.0
+    torch.testing.assert_close(tgt.sum(dim=1), torch.tensor([1.0]))
+
+
+def test_with_equal_q_the_target_is_the_policy_renormalised_over_those_children():
+    from src.services.expert_iteration import _completed_q_target
+
+    joint, ids, qs = _q_batch([-1.0, -2.0, -1e9, -1e9], [0, 1, -1, -1], [0.5, 0.5, 0.0, 0.0])
+    tgt = _completed_q_target(joint, ids, qs, q_scale=2.0)
+    p = torch.tensor([-1.0, -2.0]).exp()
+    torch.testing.assert_close(tgt[0, :2], p / p.sum())
+
+
+def test_q_moves_mass_toward_the_better_move_in_proportion_to_the_margin():
+    from src.services.expert_iteration import _completed_q_target
+
+    # The policy prefers action 0 by one logit; the search says action 1 is 1.0 better.
+    joint, ids, qs = _q_batch([-1.0, -2.0, -1e9, -1e9], [0, 1, -1, -1], [0.0, 1.0, 0.0, 0.0])
+    small = _completed_q_target(joint, ids, qs, q_scale=0.5)
+    large = _completed_q_target(joint, ids, qs, q_scale=4.0)
+    assert small[0, 1] > small[0, 0] * 0.5  # already pulling toward the better move
+    assert large[0, 1] > small[0, 1]  # a bigger scale pulls harder
+    assert large[0, 1] > 0.9  # and at a large scale the margin dominates the prior
+
+
+def test_q_scale_zero_ignores_the_search_entirely():
+    from src.services.expert_iteration import _completed_q_target
+
+    joint, ids, qs = _q_batch([-1.0, -2.0, -1e9, -1e9], [0, 1, -1, -1], [-5.0, 5.0, 0.0, 0.0])
+    tgt = _completed_q_target(joint, ids, qs, q_scale=0.0)
+    p = torch.tensor([-1.0, -2.0]).exp()
+    torch.testing.assert_close(tgt[0, :2], p / p.sum())
+
+
+def test_distill_refuses_completed_q_on_a_dataset_without_recorded_q():
+    from src.services.expert_iteration import distill
+
+    ds = _stub_training_data()
+    ds.child_q = None
+    try:
+        distill(ds, _StubPolicy(4, 3), _StubCritic(3), epochs=1, val_frac=0.25, log_every=0,
+                target_mode='completed_q')
+    except ValueError as exc:
+        assert 'child_q' in str(exc)
+    else:
+        raise AssertionError('expected a ValueError naming child_q')
+
+
+def test_dataset_records_and_round_trips_child_q(tmp_path):
+    ds = SelfPlayDataset()
+    ds.add(board=np.zeros((1,), dtype=np.float32), global_feats=np.zeros((1,), dtype=np.float32),
+           mask=np.ones((1,), dtype=bool), visit_target=np.ones((1,), dtype=np.float32),
+           opp_onehot=np.zeros((1,), dtype=np.float32), privileged=np.zeros((1,), dtype=np.float32),
+           mover=1, child_ids=[7, 9], child_q=[0.25, -0.5])
+    ds.label_last(1, winner=1)
+    ds.stack()
+    assert ds.child_ids[0, :2].tolist() == [7, 9]
+    assert ds.child_ids[0, 2] == -1  # padding
+    np.testing.assert_allclose(ds.child_q[0, :2], [0.25, -0.5])
+
+    path = str(tmp_path / 'q.npz')
+    ds.save(path)
+    back = SelfPlayDataset.load(path)
+    np.testing.assert_array_equal(back.child_ids, ds.child_ids)
+    np.testing.assert_allclose(back.child_q, ds.child_q)
+
+
+def test_concat_keeps_child_q_and_drops_it_when_a_part_lacks_it():
+    with_q = _labelled_dataset(2)
+    assert SelfPlayDataset.concat([with_q, _labelled_dataset(1)]).child_ids is not None
+    legacy = _fake_dataset(3)  # arrays assigned directly, child_ids left None
+    assert SelfPlayDataset.concat([with_q, legacy]).child_ids is None

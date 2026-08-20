@@ -51,6 +51,11 @@ logger = logging.getLogger('warchest')
 _POOL_SLOT = OPP_TYPE_IDX['pool']
 _OPP_DIM = len(OPP_TYPE_IDX)
 
+# Root children recorded per sample for the completed-Q target. `max_branching` is 8 by
+# default and 16 is the widest anyone has run it; the store is padded, so the cost of the
+# headroom is 16 ints + 16 floats per sample against a 1875-wide dense target.
+MAX_RECORDED_CHILDREN = 16
+
 
 class SelfPlayDataset:
     """(obs, visit-distribution, critic inputs, outcome z) samples from puct self-play.
@@ -78,12 +83,15 @@ class SelfPlayDataset:
         self._boards, self._globals, self._masks = [], [], []
         self._visits, self._opp, self._priv = [], [], []
         self._movers, self._z, self._game_ids = [], [], []
+        self._child_ids, self._child_q = [], []
         self._n_games = 0
         self.boards = self.globals = self.masks = None
         self.visit_targets = self.opp_onehots = self.privileged = self.z = None
         self.game_ids = None
+        self.child_ids = self.child_q = None
 
-    def add(self, *, board, global_feats, mask, visit_target, opp_onehot, privileged, mover):
+    def add(self, *, board, global_feats, mask, visit_target, opp_onehot, privileged, mover,
+            child_ids=None, child_q=None):
         self._boards.append(board)
         self._globals.append(global_feats)
         self._masks.append(mask)
@@ -91,6 +99,16 @@ class SelfPlayDataset:
         self._opp.append(opp_onehot)
         self._priv.append(privileged)
         self._movers.append(mover)
+        # Sparse per-child Q at the root (ego-frame ids, -1 padding). Absent for a caller
+        # that does not supply it, which keeps the visit-count path unchanged.
+        ids = np.full(MAX_RECORDED_CHILDREN, -1, dtype=np.int32)
+        qs = np.zeros(MAX_RECORDED_CHILDREN, dtype=np.float32)
+        if child_ids is not None:
+            k = min(len(child_ids), MAX_RECORDED_CHILDREN)
+            ids[:k] = child_ids[:k]
+            qs[:k] = child_q[:k]
+        self._child_ids.append(ids)
+        self._child_q.append(qs)
 
     def label_last(self, n, winner):
         """Set z for the last `n` freshly-added, still-unlabelled samples (one game).
@@ -117,6 +135,8 @@ class SelfPlayDataset:
         self.privileged = np.stack(self._priv).astype(np.float32)
         self.z = np.asarray(self._z, dtype=np.float32)
         self.game_ids = np.asarray(self._game_ids, dtype=np.int64)
+        self.child_ids = np.stack(self._child_ids).astype(np.int32)
+        self.child_q = np.stack(self._child_q).astype(np.float32)
         assert len(self.z) == len(self.boards), 'unlabelled samples remain (call label_last per game)'
         # Free the per-sample lists: after stacking they're pure duplication of the
         # arrays above, and a parallel worker ships this whole object back to the main
@@ -124,6 +144,7 @@ class SelfPlayDataset:
         # to just the compact arrays instead of shipping both copies.
         self._boards = self._globals = self._masks = []
         self._visits = self._opp = self._priv = []
+        self._child_ids = self._child_q = []
         return self
 
     def __len__(self):
@@ -148,6 +169,9 @@ class SelfPlayDataset:
         ds.opp_onehots = np.concatenate([p.opp_onehots for p in parts])
         ds.privileged = np.concatenate([p.privileged for p in parts])
         ds.z = np.concatenate([p.z for p in parts])
+        if all(p.child_ids is not None for p in parts):
+            ds.child_ids = np.concatenate([p.child_ids for p in parts])
+            ds.child_q = np.concatenate([p.child_q for p in parts])
         ids, offset = [], 0
         for p in parts:
             part_ids = p.game_ids
@@ -165,6 +189,7 @@ class SelfPlayDataset:
             path, boards=self.boards, globals=self.globals, masks=self.masks,
             visit_targets=self.visit_targets, opp_onehots=self.opp_onehots,
             privileged=self.privileged, z=self.z, game_ids=self.game_ids,
+            child_ids=self.child_ids, child_q=self.child_q,
         )
 
     @classmethod
@@ -174,6 +199,8 @@ class SelfPlayDataset:
         ds.boards, ds.globals, ds.masks = d['boards'], d['globals'], d['masks']
         ds.visit_targets, ds.opp_onehots = d['visit_targets'], d['opp_onehots']
         ds.privileged, ds.z = d['privileged'], d['z']
+        if 'child_ids' in d:
+            ds.child_ids, ds.child_q = d['child_ids'], d['child_q']
         if 'game_ids' in d:
             ds.game_ids = d['game_ids']
         else:
@@ -209,6 +236,10 @@ class SelfPlayDataset:
                 'privileged': torch.from_numpy(self.privileged[idx]).to(device),
                 'z': torch.from_numpy(self.z[idx]).to(device),
                 'index': torch.from_numpy(np.ascontiguousarray(idx)).to(device),
+                **({} if self.child_ids is None else {
+                    'child_ids': torch.from_numpy(self.child_ids[idx].astype(np.int64)).to(device),
+                    'child_q': torch.from_numpy(self.child_q[idx]).to(device),
+                }),
             }
 
 
@@ -330,12 +361,18 @@ def play_selfplay_game(bot, env, dataset, *, temperature, temp_moves, max_turns,
             move_agree = int(policy_argmax is not None
                              and policy_argmax == max(visit_counts, key=visit_counts.get))
             agree_sum += move_agree
+            # Per-child root Q, ego-frame, sparse — the completed-Q target's input. A search
+            # that does not expose it (any bot other than PuctBot) records nothing and the
+            # visit-count path is unaffected.
+            root_q = bot.last_stats.get('root_q') or {}
+            child_ids = [WarChestEnv.remap_action(a) if mover == 2 else a for a in root_q]
+            child_q = [root_q[a] for a in root_q]
             dataset.add(
                 board=obs['board'], global_feats=obs['global'],
                 mask=obs['valid_action_mask'],
                 visit_target=_ego_visit_target(visit_counts, mover),
                 opp_onehot=_pool_onehot(), privileged=env.get_privileged_features(),
-                mover=mover,
+                mover=mover, child_ids=child_ids, child_q=child_q,
             )
             priors = bot.last_stats.get('policy_priors') or {}
             as_apprentice = bool(priors) and apprentice_frac > 0.0 \
@@ -354,7 +391,8 @@ def play_selfplay_game(bot, env, dataset, *, temperature, temp_moves, max_turns,
                 agree_sum -= move_agree
                 apprentice_sum -= int(as_apprentice)
                 for lst in (dataset._boards, dataset._globals, dataset._masks,
-                            dataset._visits, dataset._opp, dataset._priv, dataset._movers):
+                            dataset._visits, dataset._opp, dataset._priv, dataset._movers,
+                            dataset._child_ids, dataset._child_q):
                     lst.pop()
                 _, _, term, trunc, info = env.make_random_step()
         if term:
@@ -452,6 +490,42 @@ def _sharpen_target(visit_targets, visit_temp):
     return sharpened / sharpened.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
 
+def _completed_q_target(joint, child_ids, child_q, q_scale):
+    """Gumbel-AlphaZero's improved policy as a dense `[B, A]` CE target.
+
+    `π'(a) ∝ π(a) · exp(q_scale · Q(a))` over the root children the search evaluated, zero
+    elsewhere — i.e. the *current* policy re-weighted by how much better or worse the search
+    found each move to be, which is the AlphaZero-family target that is a provable policy
+    improvement at low simulation counts (Danihelka et al., ICLR 2022, docs/IDEAS.md R.3b).
+
+    Two reasons it belongs here rather than the visit counts. The visit distribution is a
+    hard-ish label: it says which move to pick and, at ~118 expansions over 8 children,
+    almost nothing about the margin — and three independent CE-on-visits variants measured
+    ~0.50 against base with a 0.733 teacher (R.10.15a). And Q for *every* child is available
+    for free here: forced playouts (`forced_playouts_k`) guarantee each root child is visited,
+    so the paper's value-completion step for unvisited actions has nothing to complete.
+
+    `q_scale` converts a shaped-return advantage into logit units. Q's p5-p95 span was
+    measured at 1.74 (`eval_value_calibration.py puct`, docs/decision.md), so a scale of ~2
+    makes a full-span Q difference worth ~3.5 logits; it is calibratable offline on a recorded
+    round, which is why it is a parameter and not a constant.
+    """
+    q_present = child_ids >= 0
+    # Gather the policy's own log-prob for each recorded child (clamped index for the padding
+    # slots, which `q_present` masks out anyway).
+    safe_ids = child_ids.clamp_min(0)
+    child_logp = joint.gather(1, safe_ids)
+    logits = child_logp + q_scale * child_q
+    logits = logits.masked_fill(~q_present, -float('inf'))
+    weights = torch.softmax(logits, dim=1)
+    target = torch.zeros_like(joint)
+    # scatter_ADD, not scatter_: the padding slots clamp to index 0 and would otherwise
+    # overwrite a real child that happens to be action id 0 with their masked-out zero.
+    # Recorded children are distinct, so adding is exact for the real ones.
+    target.scatter_add_(1, safe_ids, weights * q_present)
+    return target
+
+
 def _kl_to_reference(ref_joint, joint):
     """KL(ref || new) from two joint log-prob tensors `[B, A]` (illegal ids at -1e9,
     `exp(-1e9) == 0` so they drop out of the sum on their own — no mask needed).
@@ -507,7 +581,7 @@ def _disagreement_mask(dataset, policy, indices, device, minibatch_size=512):
 def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=3e-4,
             lr_critic=3e-4, grad_clip=1.0, device='cpu', val_frac=0.1, log_every=1,
             train_critic=True, visit_temp=0.5, kl_coeff=0.0, early_stop=True, patience=2,
-            disagree_weight=1.0):
+            disagree_weight=1.0, target_mode='visits', q_scale=2.0):
     """Distil `policy` (CE→visits) and, unless `train_critic=False`, `critic` (MSE→z).
 
     Two independent Adam passes (like PPO's separate actor/critic optimisers). The
@@ -556,7 +630,19 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
     disagreeing subset, so that result was about the corruption, not about the subset.
     The held-out metric stays **unweighted**: it is the early-stopping criterion, and what it
     has to answer is "am I overfitting this round's data", which the weighting would distort.
+
+    `target_mode='completed_q'` replaces the visit-count target with
+    `softmax(log π + q_scale · Q)` over the root children the search evaluated
+    (`_completed_q_target`) — the policy re-weighted by the search's measured margin rather
+    than by which move it happened to visit most. It needs a dataset carrying `child_q`
+    (recorded from 2026-08-20 on) and it makes `visit_temp` inapplicable, since the target is
+    no longer a visit distribution. `'visits'` is the default and the pre-existing behaviour.
     """
+    if target_mode not in ('visits', 'completed_q'):
+        raise ValueError(f"target_mode must be 'visits' or 'completed_q', got {target_mode!r}")
+    if target_mode == 'completed_q' and dataset.child_q is None:
+        raise ValueError("target_mode='completed_q' needs a dataset with recorded child_q "
+                         "(regenerate with `gen`; datasets from before 2026-08-20 have none)")
     n = len(dataset)
     game_ids = dataset.game_ids if dataset.game_ids is not None else np.arange(n)
     train_idx, val_idx = _split_by_game(game_ids, val_frac)
@@ -599,7 +685,12 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
             # Policy: cross-entropy to the (sharpened) visit distribution, plus an
             # optional KL trust-region term against the round's starting policy.
             joint = policy.joint_log_probs_batch(batch)  # [B, A], illegal at -1e9
-            tgt = _sharpen_target(batch['visit_targets'], visit_temp)
+            if target_mode == 'completed_q':
+                with torch.no_grad():
+                    tgt = _completed_q_target(joint, batch['child_ids'], batch['child_q'],
+                                              q_scale)
+            else:
+                tgt = _sharpen_target(batch['visit_targets'], visit_temp)
             per_sample = -(tgt * joint).sum(dim=1)
             if weight_by_index is None:
                 ce = per_sample.mean()
@@ -641,7 +732,8 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
                  'kl': kl_sum / max(1, n_mb)}
         if watch:
             held = evaluate_distillation(dataset, policy, critic, device=device,
-                                         indices=val_idx, visit_temp=visit_temp)
+                                         indices=val_idx, visit_temp=visit_temp,
+                                         target_mode=target_mode, q_scale=q_scale)
             stats['val_ce'] = held['ce']
             stats['val_mse'] = held['mse']
             improved = False
@@ -681,7 +773,8 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
                         best_epoch['critic'] + 1, best['mse'])
 
     val = evaluate_distillation(dataset, policy, critic, device=device, indices=val_idx,
-                                visit_temp=visit_temp) if n_val else {}
+                                visit_temp=visit_temp, target_mode=target_mode,
+                                q_scale=q_scale) if n_val else {}
     return {'history': history, 'val': val, 'n_train': len(train_idx), 'n_val': n_val,
             'best_epoch': best_epoch['policy'] + 1 if watch else None,
             'epochs_run': len(history), 'n_val_games': int(len(np.unique(game_ids[val_idx])))
@@ -689,7 +782,8 @@ def distill(dataset, policy, critic, *, epochs=4, minibatch_size=256, lr_policy=
 
 
 def evaluate_distillation(dataset, policy, critic, *, device='cpu', indices=None,
-                          minibatch_size=512, visit_temp=1.0):
+                          minibatch_size=512, visit_temp=1.0, target_mode='visits',
+                          q_scale=2.0):
     """Held-out `(ce, mse, agreement, policy_entropy, visit_entropy)`:
     - `ce`/`mse`: CE to visits (sharpened by `visit_temp`, see `_sharpen_target`),
       critic MSE to z (the actual training objectives).
@@ -712,7 +806,10 @@ def evaluate_distillation(dataset, policy, critic, *, device='cpu', indices=None
     with torch.inference_mode():
         for batch in dataset.iter_minibatches(minibatch_size, device, shuffle=False, indices=indices):
             joint = policy.joint_log_probs_batch(batch)
-            tgt = _sharpen_target(batch['visit_targets'], visit_temp)
+            if target_mode == 'completed_q':
+                tgt = _completed_q_target(joint, batch['child_ids'], batch['child_q'], q_scale)
+            else:
+                tgt = _sharpen_target(batch['visit_targets'], visit_temp)
             ce_sum += float((-(tgt * joint).sum(dim=1)).sum().item())
             val = critic.value_batch(batch).reshape(-1)
             mse_sum += float(((val - batch['z']) ** 2).sum().item())

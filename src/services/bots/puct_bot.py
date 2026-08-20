@@ -221,6 +221,7 @@ class PuctBot(PolicyCriticBot):
         # apprentice-driven data-gen samples its own move from).
         self._search_visits = []
         self._search_priors = []
+        self._search_q = []
         # The root node of the search currently running, so `_select` can tell the root
         # apart from every other node (forced playouts apply at the root only).
         self._root_node = None
@@ -237,6 +238,7 @@ class PuctBot(PolicyCriticBot):
         """
         self._search_visits = []
         self._search_priors = []
+        self._search_q = []
         action = super().act(env)
         self.last_stats['visit_counts'] = self._combine_visit_counts(self._search_visits)
         # The policy's own top move (argmax of the raw, pre-noise priors) — self-play
@@ -249,6 +251,11 @@ class PuctBot(PolicyCriticBot):
         # plays from this, so the states in the dataset are the ones the *student* visits
         # while the targets stay the search's (docs/IDEAS.md R.10.12).
         self.last_stats['policy_priors'] = priors
+        # Per-child mean value at the root, mover's perspective — the quantity a visit-count
+        # target discards. `expert_iteration` records it so a policy target can express *how
+        # much* better the search thinks a move is, not just which one it picked
+        # (docs/IDEAS.md R.3b's completed-Q target; R.10.15a is why that matters).
+        self.last_stats['root_q'] = self._combine_root_q(self._search_q)
         return action
 
     @staticmethod
@@ -275,6 +282,26 @@ class PuctBot(PolicyCriticBot):
             for a in combined:
                 combined[a] /= total_w
         return combined
+
+    @staticmethod
+    def _combine_root_q(search_q):
+        """Fold per-search root Q estimates into one `{absolute action id: Q}` map.
+
+        Unlike visit counts, Q is already on a common scale across determinizations (it is a
+        value, not a count), so this is a plain simulation-weighted mean over the searches
+        that visited a given child at all. A child no search visited is absent rather than
+        zero — zero is a *value* here, and forced playouts (`forced_playouts_k`) exist
+        precisely so that this case is empty in practice.
+        """
+        num, den = {}, {}
+        for n_sims, q_map in search_q:
+            w = float(n_sims)
+            for action, q in q_map.items():
+                if q is None:
+                    continue
+                num[action] = num.get(action, 0.0) + w * q
+                den[action] = den.get(action, 0.0) + w
+        return {a: num[a] / den[a] for a in num if den[a] > 0}
 
     # ------------------------------------------------------------------
     # Search — replaces LookaheadCriticBot's beam `_act_once`
@@ -324,6 +351,8 @@ class PuctBot(PolicyCriticBot):
         # real evaluations and should inform the choice.
         self._search_visits.append((sims, self._pruned_root_visits(root)))
         self._search_priors.append((sims, root_priors))
+        self._search_q.append((sims, {a: (e.W / e.N) if e.N > 0 else None
+                                      for a, e in root.children.items()}))
         stats = {
             'depth_reached': self._max_depth_reached,
             'nodes_visited': self._n_expansions,
