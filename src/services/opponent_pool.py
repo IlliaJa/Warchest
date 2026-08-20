@@ -16,7 +16,10 @@ class OpponentPool:
                  p_lookahead_critic=0.0, lookahead_critic_time_budget=0.1,
                  lookahead_critic_device='cpu', p_puct=0.0, puct_time_budget=0.1,
                  puct_device='cpu', p_random_eval=0.0, random_eval_seed=0,
-                 random_eval_reply_branching=2, p_policy_theta=0.0):
+                 random_eval_reply_branching=2, p_policy_theta=0.0,
+                 p_puct_live=0.0, puct_max_simulations=None,
+                 puct_live_time_budget=1.0, puct_live_max_simulations=100,
+                 puct_blind=True, puct_forced_playouts_k=2.0):
         self._snapshots = deque(maxlen=max_size)
         self._snapshot_every = snapshot_every
         self._batch_count = 0
@@ -27,6 +30,7 @@ class OpponentPool:
         self._greedy_bot = GreedyBot()
         self._weights = {'random': p_random, 'greedy': p_greedy, 'pool': p_pool,
                          'lookahead_critic': p_lookahead_critic, 'puct': p_puct,
+                         'puct_live': p_puct_live,
                          'random_eval': p_random_eval, 'policy_theta': p_policy_theta}
         # RandomEvalBot: the B1 randomised-coefficient family (docs/IDEAS.md B1). One
         # instance, resampling its 8-dim leaf-evaluator θ on every `sample()` — so the
@@ -58,8 +62,29 @@ class OpponentPool:
         # exists (a fresh run with no snapshot yet must keep p_puct=0). Built lazily
         # and reused the same way.
         self._puct_time_budget = puct_time_budget
+        self._puct_max_simulations = puct_max_simulations
         self._puct_device = puct_device
         self._puct_bot = None
+        # `puct_live`: the same search, but its priors come from the newest *training*
+        # snapshot instead of a frozen checkpoint, so the opponent's strength tracks the
+        # student's instead of being overtaken by it (the recorded `wr_lookahead`
+        # 0.04 -> 0.95 trajectory is what being overtaken looks like). Its leaf value stays
+        # the frozen critic from disk: the pool broadcasts policy snapshots, not critic
+        # ones, and a search leaf on a half-trained critic is what made ExIt's outcome mode
+        # drift (docs/independent_opponents.md §1).
+        #
+        # Both variants get `see_opponent_hand=False` and KataGo forced playouts by default:
+        # blind + forced playouts measured 0.733 against the raw policy where the cheating,
+        # quota-less default measured 0.567 (docs/IDEAS.md R.10.13/R.10.14), so this is the
+        # stronger *and* the fair configuration. And strength comes from node count, not
+        # from wall-clock -- 1.0 s buys ~220 expansions on one box and ~118 on another -- so
+        # the live variant is capped by `max_simulations` with the time budget as a ceiling.
+        self._puct_live_time_budget = puct_live_time_budget
+        self._puct_live_max_simulations = puct_live_max_simulations
+        self._puct_blind = puct_blind
+        self._puct_forced_playouts_k = puct_forced_playouts_k
+        self._puct_live_bot = None
+        self._puct_live_loaded_count = -1
         # Reused across sample() calls: a pool opponent is only ever active within a
         # single (sequential) episode, so one instance can be recycled — we swap its
         # weights via load_state_dict instead of reconstructing a net + re-transferring
@@ -67,10 +92,11 @@ class OpponentPool:
         self._cached_opp = None
 
     def set_weights(self, *, p_random, p_greedy, p_pool, p_lookahead_critic=0.0, p_puct=0.0,
-                    p_random_eval=0.0, p_policy_theta=0.0):
+                    p_random_eval=0.0, p_policy_theta=0.0, p_puct_live=0.0):
         """Replace sampling weights. Values are normalised automatically."""
         self._weights = {'random': p_random, 'greedy': p_greedy, 'pool': p_pool,
                          'lookahead_critic': p_lookahead_critic, 'puct': p_puct,
+                         'puct_live': p_puct_live,
                          'random_eval': p_random_eval, 'policy_theta': p_policy_theta}
 
     @property
@@ -81,6 +107,7 @@ class OpponentPool:
                 'p_pool': self._weights['pool'],
                 'p_lookahead_critic': self._weights['lookahead_critic'],
                 'p_puct': self._weights['puct'],
+                'p_puct_live': self._weights['puct_live'],
                 'p_random_eval': self._weights['random_eval'],
                 'p_policy_theta': self._weights['policy_theta']}
 
@@ -139,10 +166,39 @@ class OpponentPool:
             from .bots.puct_bot import PuctBot
             self._puct_bot = PuctBot(
                 time_budget=self._puct_time_budget,
+                max_simulations=self._puct_max_simulations,
+                see_opponent_hand=not self._puct_blind,
+                forced_playouts_k=self._puct_forced_playouts_k,
                 device=self._puct_device,
                 stats_log_every=0,  # silent in the rollout hot path
             )
         return self._puct_bot
+
+    def _get_puct_live_bot(self):
+        """The PuctBot whose priors track the policy being trained.
+
+        Built once from the newest checkpoints on disk (for the architecture and the critic),
+        then re-pointed at the most recent pool snapshot whenever a newer one has arrived —
+        the same `load_state_dict`-into-a-cached-net trick the `pool` opponent uses, so an
+        episode never pays for constructing a net. With no snapshot yet (the first batches of
+        a fresh run) it plays on the disk weights, which is exactly the frozen variant.
+        """
+        if self._puct_live_bot is None:
+            from .bots.puct_bot import PuctBot
+            self._puct_live_bot = PuctBot(
+                time_budget=self._puct_live_time_budget,
+                max_simulations=self._puct_live_max_simulations,
+                see_opponent_hand=not self._puct_blind,
+                forced_playouts_k=self._puct_forced_playouts_k,
+                device=self._puct_device,
+                stats_log_every=0,
+                name='puct_live',
+            )
+        if self._snapshots and self._puct_live_loaded_count != self._append_count:
+            self._puct_live_bot._policy.load_state_dict(self._snapshots[-1])
+            self._puct_live_bot._policy.eval()
+            self._puct_live_loaded_count = self._append_count
+        return self._puct_live_bot
 
     def _get_policy_theta_bot(self):
         """Lazily build (once) the shared PolicyThetaBot. Unlike `random_eval` it needs a
@@ -183,7 +239,8 @@ class OpponentPool:
         types = ['random', 'greedy']
         if self._snapshots:
             types.append('pool')
-        for optional in ('lookahead_critic', 'puct', 'random_eval', 'policy_theta'):
+        for optional in ('lookahead_critic', 'puct', 'puct_live', 'random_eval',
+                         'policy_theta'):
             if self._weights.get(optional, 0.0) > 0.0:
                 types.append(optional)
         weights = np.array([self._weights[t] for t in types], dtype=float)
@@ -198,6 +255,8 @@ class OpponentPool:
             return self._get_lookahead_bot(), 'lookahead_critic'
         if choice == 'puct':
             return self._get_puct_bot(), 'puct'
+        if choice == 'puct_live':
+            return self._get_puct_live_bot(), 'puct_live'
         if choice == 'random_eval':
             bot = self._get_random_eval_bot()
             bot.new_episode()

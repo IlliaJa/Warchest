@@ -41,6 +41,9 @@ OPP_TYPE_IDX = {'random': 0, 'greedy': 1, 'pool': 2}
 # strength, and nothing about it is policy-derived.
 OPP_ONEHOT_SLOT = {**OPP_TYPE_IDX, 'lookahead_critic': OPP_TYPE_IDX['pool'],
                    'puct': OPP_TYPE_IDX['pool'],
+                   # `puct_live` is the same bot searching on the *current* policy's
+                   # snapshot rather than a frozen checkpoint, so it shares puct's slot.
+                   'puct_live': OPP_TYPE_IDX['pool'],
                    'random_eval': OPP_TYPE_IDX['greedy'],
                    # policy_theta is policy-derived (its candidate set comes from a frozen
                    # checkpoint), so `pool` is its honest analogue, not `greedy`.
@@ -55,7 +58,7 @@ OPP_ONEHOT_SLOT = {**OPP_TYPE_IDX, 'lookahead_critic': OPP_TYPE_IDX['pool'],
 # together would leave in the advantage exactly the per-opponent offset this is removing.
 # Not fed to any network, so it is free to grow: adding an entry breaks no checkpoint.
 OPP_GROUP_IDX = {'random': 0, 'greedy': 1, 'pool': 2, 'lookahead_critic': 3, 'puct': 4,
-                 'random_eval': 5, 'policy_theta': 6}
+                 'random_eval': 5, 'policy_theta': 6, 'puct_live': 7}
 # Shared bucket for an opponent label nobody registered above. Warned about once per
 # process rather than raised, so adding a bot to the pool cannot kill a running job — but
 # it does mean that bot's advantages are centred together with any other stranger.
@@ -82,7 +85,8 @@ def opp_group_id(opp_type):
 # reactive bots consume — see `_opponent_env_action`. `random_eval` is a SimGreedyBot
 # subclass, so it belongs here despite being a *heuristic* bot rather than a deep search:
 # what puts a bot in this set is the interface it speaks, not how hard it thinks.
-_SEARCH_OPP_TYPES = frozenset({'lookahead_critic', 'puct', 'random_eval', 'policy_theta'})
+_SEARCH_OPP_TYPES = frozenset({'lookahead_critic', 'puct', 'puct_live', 'random_eval',
+                               'policy_theta'})
 
 
 def _opponent_env_action(opp, opp_type, env, obs, acting_pid):

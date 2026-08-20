@@ -2742,3 +2742,76 @@ in the order their cost argues for:
    of the same idea. A Q-based target (or Gumbel's completed-Q, R.3b) carries *how much* better
    the search's move was, which is exactly the information a hard label discards, and it is the
    only untried lever that does not need a new opponent in the rollout hot path.
+
+### R.10.16 A third opponent phase, and the completed-Q result that motivates it (2026-08-20)
+
+**First, the target-shape A/B, because it closes the imitation track.** One recorded round
+(16135 samples, agreement 0.942), five arms differing *only* in what the policy is distilled
+toward, each played against base alone at k=400 (se ≈ 2.5 pp):
+
+| target | WR vs base | post-distill agreement |
+|---|---|---|
+| `visits` | 0.460 | 0.941 |
+| `completed_q`, σ=0.5 | 0.480 | 0.997 |
+| **`completed_q`, σ=1** | **0.512** | 0.989 |
+| `completed_q`, σ=2 | 0.500 | 0.980 |
+| `completed_q`, σ=4 | 0.490 | 0.960 |
+
+Completed-Q beats the visit target by 0.052 ± 0.035 (1.5 σ) and still sits at parity with
+base. The diagnostic in the last column is the useful part: a target that respects the
+search's margin *barely moves the policy at all*, because at ~118 expansions the Q gaps
+between the top root children are small next to the policy's own logit gaps. The teacher wins
+0.733 by accumulating ~2.3 small corrections per game, and "small" is literal.
+
+**So the imitation track is done, with five negative results and no remaining free
+parameter:** visits (0.480–0.500), sharpened visits, disagreement-weighted (0.503–0.520),
+double volume (0.487), and completed-Q at four scales (0.460–0.512) — all with a teacher
+measured at 0.733 on its own machine, blind, and searching on a correct observation. What
+none of them can do is transfer an advantage that is *diffuse over many small margins* through
+a per-move label.
+
+**What replaces it: on-policy RL against the search** (R.10.10's recorded fallback). PPO's
+gradient consumes game outcomes, not labels, so a 0.02-per-move edge accumulated over 40
+decisions arrives as a lost game, which is a signal a label cannot carry. Shipped as a third
+opponent phase rather than a new algorithm, because `ppo.py` already had the machinery:
+
+| phase | schedule | trigger |
+|---|---|---|
+| `initial` | unchanged | — |
+| `finetune` | `lookahead_critic` 0.4 / frozen `puct` 0.4 / `pool` 0.2 | `wr_vs_greedy_eval` ≥ 0.75 (unchanged) |
+| **`finetune2`** | `pool` 0.5 / **`puct_live` 0.5** | `wr_vs_lookahead_train` ≥ 0.60, held for 3 consecutive evals |
+
+`puct_live` is the new piece: a `PuctBot` whose priors are the **newest snapshot of the policy
+being trained** (its leaf value stays the frozen critic from disk, since the pool broadcasts
+policy snapshots and not critic ones). It cannot be overtaken by construction, which is the
+whole point — the last run ended at `wr_lookahead` 0.71 and ~0.60 against a frozen puct, and
+B8's measurement is that an opponent you beat contributes near-noise to the gradient once
+advantages are centred per opponent while still costing full rollout time. It reuses `puct`'s
+critic one-hot slot (widening `OPP_TYPE_IDX` would break every v1/v2 checkpoint) and gets its
+own `OPP_GROUP_IDX` entry so its advantages are centred separately.
+
+Three implementation points that are measurements, not choices:
+
+* **Both puct variants default to blind + forced playouts**, because that pair measured 0.733
+  against the raw policy where the cheating, quota-less default measured 0.567 (R.10.13,
+  R.10.14). The stronger configuration is also the fair one.
+* **Strength is bought in nodes, not seconds** (`--puct-live-max-simulations`, default 100,
+  with the time budget as a ceiling). A second buys ~220 expansions on the laptop and ~118 on
+  desktop-legion; a wall-clock budget is not portable between boxes and 0.1 s is ~12
+  expansions, i.e. an opponent measured at 0.500 against the raw policy.
+* **The node cap does *not* make cheap positions cheap.** `_act_once` runs the full cap every
+  move (measured: 41 nodes per ply at `max_simulations=40` whether the position had 5 legal
+  moves or 21), so the cost is flat. On desktop-legion at ~8.5 ms/node: `p_puct_live=0.5` with
+  100 sims is ~114 s of rollout wall per batch, ~57 s at either `p=0.25` with 100 sims or
+  `p=0.5` with 50, ~35 s at `p=0.5` with 30. This is the trade to pick deliberately — a
+  1500-batch run is ~47 h at the first setting and ~15 h at the last.
+
+**The trigger needs its own note.** It reads a rolling mean over the last 100 *training*
+episodes, which at a 0.4 weight is ~4 batches (se ≈ 5 pp), so a bare crossing fires on noise:
+it must hold at 3 consecutive evals, over ≥50 recorded episodes, and the promotion is one-way
+(flipping the opponent distribution back and forth on that noise is worse than either phase).
+And on a warm start from a checkpoint that already beats `lookahead_critic` — the last run
+ended at 0.71 — the condition is satisfied in the first evals, so `finetune` is a formality
+unless `--finetune2-min-batch` deliberately holds it open. 390 tests;
+`tests/test_finetune2_phase.py` pins the registration, the snapshot re-pointing (and that it
+degrades to the frozen checkpoint before any snapshot exists), and every branch of the trigger.

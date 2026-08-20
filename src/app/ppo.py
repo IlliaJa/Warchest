@@ -228,6 +228,7 @@ class PPOTrainer:
             'p_pool': hp['p_pool_initial'],
             'p_lookahead_critic': hp['p_lookahead_critic_initial'],
             'p_puct': hp.get('p_puct_initial', 0.0),
+            'p_puct_live': hp.get('p_puct_live_initial', 0.0),
             'p_random_eval': hp.get('p_random_eval_initial', 0.0),
             'p_policy_theta': hp.get('p_policy_theta_initial', 0.0),
         }
@@ -237,9 +238,37 @@ class PPOTrainer:
             'p_pool': hp['p_pool_finetune'],
             'p_lookahead_critic': hp['p_lookahead_critic_finetune'],
             'p_puct': hp.get('p_puct_finetune', 0.0),
+            'p_puct_live': hp.get('p_puct_live_finetune', 0.0),
             'p_random_eval': hp.get('p_random_eval_finetune', 0.0),
             'p_policy_theta': hp.get('p_policy_theta_finetune', 0.0),
         }
+        # Third phase (2026-08-20). Rationale: `lookahead_critic` and a *frozen* puct are
+        # both opponents the policy eventually overtakes -- the last run ended at
+        # `wr_lookahead` 0.71 and ~0.60 against frozen puct -- and an opponent you beat
+        # contributes near-noise to the gradient once advantages are centred per opponent
+        # (docs/IDEAS.md B8). So once the policy is reliably ahead of `lookahead_critic`,
+        # the schedule hands its share to a puct whose priors track the *current* policy,
+        # which cannot be overtaken by construction.
+        self._opp_weights_finetune2 = {
+            'p_random': hp.get('p_random_finetune2', 0.0),
+            'p_greedy': hp.get('p_greedy_finetune2', 0.0),
+            'p_pool': hp.get('p_pool_finetune2', 0.5),
+            'p_lookahead_critic': hp.get('p_lookahead_critic_finetune2', 0.0),
+            'p_puct': hp.get('p_puct_finetune2', 0.0),
+            'p_puct_live': hp.get('p_puct_live_finetune2', 0.5),
+            'p_random_eval': hp.get('p_random_eval_finetune2', 0.0),
+            'p_policy_theta': hp.get('p_policy_theta_finetune2', 0.0),
+        }
+        self._wr_finetune2_threshold = hp.get('wr_lookahead_finetune2_threshold', 0.60)
+        # The trigger reads a rolling *training* win rate over the last 100 episodes, which
+        # at a 0.4 weight is only ~4 batches (se ~ 5 pp), so a bare threshold crossing fires
+        # on noise. It must hold at this many consecutive evals, and the phase is one-way:
+        # dropping back would flip the opponent distribution mid-run on the same noise.
+        self._finetune2_confirm_evals = hp.get('finetune2_confirm_evals', 3)
+        self._finetune2_min_batch = hp.get('finetune2_min_batch', 0)
+        self._finetune2_min_episodes = hp.get('finetune2_min_episodes', 50)
+        self._in_finetune2 = False
+        self._finetune2_streak = 0
         # Advantage normalisation (docs/next_iteration.md §5 row 6). 'per_opponent' centres
         # advantages inside each opponent group, which is what lets `critic_v3` drop the
         # opponent one-hot without putting the opponent-identity offset back into the policy
@@ -254,6 +283,11 @@ class PPOTrainer:
             )
         self._lookahead_critic_time_budget = hp['lookahead_critic_time_budget']
         self._puct_time_budget = hp.get('puct_time_budget', 0.1)
+        self._puct_max_simulations = hp.get('puct_max_simulations', None)
+        self._puct_live_time_budget = hp.get('puct_live_time_budget', 1.0)
+        self._puct_live_max_simulations = hp.get('puct_live_max_simulations', 100)
+        self._puct_blind = hp.get('puct_blind', True)
+        self._puct_forced_playouts_k = hp.get('puct_forced_playouts_k', 2.0)
         self._random_eval_reply_branching = hp.get('random_eval_reply_branching', 2)
         # Dense critic targets (docs/IDEAS.md #12): also regress the critic on opponent-
         # decision nodes via an auxiliary MC-return loss, on top of the unchanged main GAE
@@ -297,7 +331,13 @@ class PPOTrainer:
             p_lookahead_critic=hp['p_lookahead_critic_initial'],
             lookahead_critic_time_budget=hp['lookahead_critic_time_budget'],
             p_puct=hp.get('p_puct_initial', 0.0),
+            p_puct_live=hp.get('p_puct_live_initial', 0.0),
             puct_time_budget=hp.get('puct_time_budget', 0.1),
+            puct_max_simulations=hp.get('puct_max_simulations', None),
+            puct_live_time_budget=hp.get('puct_live_time_budget', 1.0),
+            puct_live_max_simulations=hp.get('puct_live_max_simulations', 100),
+            puct_blind=hp.get('puct_blind', True),
+            puct_forced_playouts_k=hp.get('puct_forced_playouts_k', 2.0),
             p_random_eval=hp.get('p_random_eval_initial', 0.0),
             random_eval_seed=hp.get('rollout_seed', 0),
             random_eval_reply_branching=hp.get('random_eval_reply_branching', 2),
@@ -311,6 +351,7 @@ class PPOTrainer:
         self._wr_vs_greedy = deque(maxlen=100)
         self._wr_vs_lookahead_critic = deque(maxlen=100)
         self._wr_vs_puct = deque(maxlen=100)
+        self._wr_vs_puct_live = deque(maxlen=100)
         self._wr_vs_random_eval = deque(maxlen=100)
         self._wr_vs_policy_theta = deque(maxlen=100)
 
@@ -479,6 +520,11 @@ class PPOTrainer:
                 seed_base=self._rollout_seed,
                 lookahead_critic_time_budget=self._lookahead_critic_time_budget,
                 puct_time_budget=self._puct_time_budget,
+                puct_max_simulations=self._puct_max_simulations,
+                puct_live_time_budget=self._puct_live_time_budget,
+                puct_live_max_simulations=self._puct_live_max_simulations,
+                puct_blind=self._puct_blind,
+                puct_forced_playouts_k=self._puct_forced_playouts_k,
                 collect_dense=self._dense_critic,
                 random_eval_reply_branching=self._random_eval_reply_branching,
             )
@@ -926,10 +972,7 @@ class PPOTrainer:
         wr_random_eval = random_eval_wins / self._eval_episodes
         wr_greedy_eval = greedy_wins / self._eval_episodes
 
-        if wr_greedy_eval >= self._wr_finetune_threshold:
-            self._pool.set_weights(**self._opp_weights_finetune)
-        else:
-            self._pool.set_weights(**self._opp_weights_initial)
+        phase = self._apply_opponent_phase(wr_greedy_eval, batch_num)
 
         # Score, not win rate, is the "is this policy better than the saved one" number:
         # truncations count for neither side and are common in a near-mirror match, so a
@@ -948,6 +991,7 @@ class PPOTrainer:
             f'[eval] batch={batch_num} '
             f'wr_greedy={wr_greedy_eval:.3f} '
             f'wr_random={wr_random_eval:.3f} '
+            f'phase={phase} '
             f'elo_policy={elo_pol:.0f} elo_greedy={elo_grdy:.0f}'
             + (f' | vs {self._eval_reference.name}: '
                f'score={ref_stats["score_vs_reference_eval"]:.3f} '
@@ -959,8 +1003,54 @@ class PPOTrainer:
                 'elo_policy': elo_pol,
                 'wr_vs_greedy_eval': wr_greedy_eval,
                 'wr_vs_random_eval': wr_random_eval,
+                'opp_phase': {'initial': 0, 'finetune': 1, 'finetune2': 2}[phase],
                 **ref_stats,
             })
+
+    def _apply_opponent_phase(self, wr_greedy_eval, batch_num):
+        """Set the opponent weights for the phase this policy has reached; return its name.
+
+        Three phases (the third added 2026-08-20):
+
+        * `initial` -> `finetune` on `wr_vs_greedy_eval >= wr_greedy_finetune_threshold`,
+          re-checked every eval in both directions — unchanged behaviour.
+        * `finetune` -> `finetune2` once the policy is *reliably* ahead of
+          `lookahead_critic` in training. Reliably, because the input is a rolling mean over
+          the last 100 training episodes, which at a 0.4 weight is ~4 batches (se ~ 5 pp):
+          the threshold has to hold at `finetune2_confirm_evals` consecutive evals over at
+          least `finetune2_min_episodes` recorded episodes. One-way, because flipping the
+          opponent distribution back and forth on that noise is worse than either phase.
+
+        Note what the trigger implies on a warm start: a checkpoint that already beats
+        `lookahead_critic` (the last run ended at 0.71) satisfies it in the first evals, so
+        `finetune` is a formality unless `finetune2_min_batch` holds it open deliberately.
+        """
+        if self._in_finetune2:
+            self._pool.set_weights(**self._opp_weights_finetune2)
+            return 'finetune2'
+        if wr_greedy_eval < self._wr_finetune_threshold:
+            self._finetune2_streak = 0
+            self._pool.set_weights(**self._opp_weights_initial)
+            return 'initial'
+
+        n_seen = len(self._wr_vs_lookahead)
+        wr_la = float(np.mean(self._wr_vs_lookahead)) if n_seen else 0.0
+        ready = (n_seen >= self._finetune2_min_episodes
+                 and wr_la >= self._wr_finetune2_threshold
+                 and batch_num >= self._finetune2_min_batch)
+        self._finetune2_streak = self._finetune2_streak + 1 if ready else 0
+        if self._finetune2_streak >= self._finetune2_confirm_evals:
+            self._in_finetune2 = True
+            logger.info(
+                'opponent phase -> finetune2 at batch %d: wr_vs_lookahead_train=%.3f over '
+                '%d episodes held >= %.2f for %d consecutive evals. New weights: %s',
+                batch_num, wr_la, n_seen, self._wr_finetune2_threshold,
+                self._finetune2_streak,
+                {k: v for k, v in self._opp_weights_finetune2.items() if v})
+            self._pool.set_weights(**self._opp_weights_finetune2)
+            return 'finetune2'
+        self._pool.set_weights(**self._opp_weights_finetune)
+        return 'finetune'
 
     def _eval_episode(self, opp, main_pid) -> str:
         """Play one game for evaluation only. Returns 'win' / 'lose' / 'truncated'."""
@@ -997,6 +1087,8 @@ class PPOTrainer:
                 self._wr_vs_lookahead_critic.append(int(ep['outcome'] == 'win'))
             elif ep['opp_type'] == 'puct':
                 self._wr_vs_puct.append(int(ep['outcome'] == 'win'))
+            elif ep['opp_type'] == 'puct_live':
+                self._wr_vs_puct_live.append(int(ep['outcome'] == 'win'))
             elif ep['opp_type'] == 'policy_theta':
                 # One number over the whole verified family — θ is redrawn per episode, so
                 # this is the win rate against a *distribution* of strong opponents.
@@ -1012,6 +1104,8 @@ class PPOTrainer:
         wr_lookahead = (float(np.mean(self._wr_vs_lookahead_critic))
                         if self._wr_vs_lookahead_critic else 0.0)
         wr_puct = float(np.mean(self._wr_vs_puct)) if self._wr_vs_puct else 0.0
+        wr_puct_live = (float(np.mean(self._wr_vs_puct_live))
+                        if self._wr_vs_puct_live else 0.0)
         wr_random_eval = (float(np.mean(self._wr_vs_random_eval))
                           if self._wr_vs_random_eval else 0.0)
         wr_policy_theta = (float(np.mean(self._wr_vs_policy_theta))
@@ -1130,6 +1224,7 @@ class PPOTrainer:
                 'wr_vs_greedy_train': wr_greedy,
                 'wr_vs_lookahead_critic_train': wr_lookahead,
                 'wr_vs_puct_train': wr_puct,
+                'wr_vs_puct_live_train': wr_puct_live,
                 'wr_vs_random_eval_train': wr_random_eval,
                 'wr_vs_policy_theta_train': wr_policy_theta,
                 'actor_loss': s['avg_actor'],
@@ -1266,6 +1361,55 @@ if __name__ == '__main__':
         '--no-reference-eval', action='store_true',
         help='Skip the frozen-checkpoint eval opponent (saves eval_episodes games per eval).')
     parser.add_argument(
+        '--p-puct-live-finetune2', type=float, default=0.5,
+        help='Share of finetune2-phase episodes played against a PuctBot whose priors are '
+             'the newest snapshot of the policy being trained (its leaf value stays the '
+             'frozen critic from disk). Unlike the frozen puct it cannot be overtaken: the '
+             'last run ended at wr_lookahead 0.71 and ~0.60 against frozen puct, and an '
+             'opponent you beat contributes near-noise once advantages are centred per '
+             'opponent (docs/IDEAS.md B8).')
+    parser.add_argument(
+        '--p-pool-finetune2', type=float, default=0.5,
+        help='Share of finetune2-phase episodes played against frozen self-play snapshots.')
+    parser.add_argument(
+        '--puct-live-max-simulations', type=int, default=100,
+        help='Node budget per move for the finetune2 live-puct opponent. This, not the time '
+             'budget, is what sets its strength: a second buys ~220 expansions on one box and '
+             '~118 on another (docs/IDEAS.md R.10.13), and 118 measured 0.733 against the raw '
+             'policy while ~30 measured ~0.55. It is also the whole cost: on desktop-legion '
+             '(~8.5 ms/node, 10 workers, 64 episodes/batch, ~42 opponent plies) the rollout '
+             'wall per batch runs ~114 s at p_puct_live=0.5 with 100 sims, ~57 s at either '
+             'p=0.25 with 100 sims or p=0.5 with 50, and ~35 s at p=0.5 with 30. Pick the '
+             'pair by how many batches the run needs, not by the node count alone.')
+    parser.add_argument(
+        '--puct-live-time-budget', type=float, default=1.0,
+        help='Wall-clock CEILING per move for the live-puct opponent. Set it ABOVE '
+             'max_simulations * the per-node cost or the timer, not the node cap, becomes the '
+             'real limiter — a node is ~4 ms on a fast laptop and ~8.5 ms on desktop-legion, '
+             'so 100 sims needs ~0.9 s there and a 0.3 s budget would deliver ~35 expansions, '
+             'where the search reproduces its own prior on ~95 %% of moves. Note the search '
+             'does NOT stop early in simple positions: it runs the full node cap every move, '
+             'so the cost is flat.')
+    parser.add_argument(
+        '--puct-max-simulations', type=int, default=None,
+        help='Node budget per move for the FROZEN puct opponent (finetune phase). Default '
+             'None = limited by --puct-time-budget alone, which at 0.1 s is ~12 expansions '
+             '— cheap, but no stronger than a pool snapshot (docs/IDEAS.md R.0.2, R.9.2).')
+    parser.add_argument(
+        '--wr-lookahead-finetune2-threshold', type=float, default=0.60,
+        help='Rolling training win rate against lookahead_critic that promotes finetune -> '
+             'finetune2. Note a warm start from a checkpoint that already beats it (the last '
+             'run ended at 0.71) satisfies this in the first evals — use '
+             '--finetune2-min-batch to hold finetune open deliberately.')
+    parser.add_argument(
+        '--finetune2-confirm-evals', type=int, default=3,
+        help='Consecutive evals the threshold above must hold before the phase switches. It '
+             'reads a mean over the last 100 training episodes (~4 batches at a 0.4 weight, '
+             'se ~ 5 pp), so a single crossing is noise. The switch is one-way.')
+    parser.add_argument(
+        '--finetune2-min-batch', type=int, default=0,
+        help='Earliest batch at which finetune2 may start, regardless of the win rate.')
+    parser.add_argument(
         '--p-policy-theta-finetune', type=float, default=0.0,
         help='Share of finetune-phase episodes played against the verified PolicyThetaBot '
              'family (docs/bots.md): six θ, each measured to beat lookahead_critic '
@@ -1377,8 +1521,8 @@ if __name__ == '__main__':
         # pool, with lookahead_critic holding the same 15% slice.
         'p_random_finetune': 0.00,
         'p_greedy_finetune': 0.00,
-        'p_pool_finetune': 0.5,
-        'p_lookahead_critic_finetune': 0.3,
+        'p_pool_finetune': 0.2,
+        'p_lookahead_critic_finetune': 0.4,
         # per-move search budget for the lookahead_critic training opponent. Small on
         # purpose: at its own 0.5s eval default a 15%-sampled search opponent would
         # dominate rollout wall-clock. 0.1s keeps it a distinct, tougher opponent
@@ -1391,8 +1535,46 @@ if __name__ == '__main__':
         # (e.g. 0.15, trimming the others) to train against it, and note each of its
         # moves runs a real 0.1s search — heavier than lookahead_critic per move.
         'p_puct_initial': 0.00,
-        'p_puct_finetune': 0.2,
+        'p_puct_finetune': 0.4,
         'puct_time_budget': 0.1,
+        # Node budget for the frozen puct opponent, and the reason it exists: strength
+        # comes from expansions, and a second buys ~220 of them on one box and ~118 on
+        # another (docs/IDEAS.md R.10.13), so a wall-clock budget is not portable and not
+        # even stable within a box. `None` = time-only, the pre-2026-08-20 behaviour.
+        # NOTE the arithmetic before setting a small time budget: at ~8.5 ms/expansion a
+        # 0.1 s budget is ~12 expansions, where the search reproduces its own prior on
+        # 94-99 % of moves and measured 0.500 against the raw policy — i.e. an opponent no
+        # stronger than a pool snapshot costing 1/100th as much (R.0.2, R.9.2).
+        'puct_max_simulations': cli_args.puct_max_simulations,
+        # Third phase (finetune2): a puct whose priors are the *current* policy's newest
+        # snapshot, so it stays ahead of the student instead of being overtaken. Budget is
+        # node-capped for the reason above; 1.0 s is the ceiling, not the target.
+        'p_puct_live_initial': 0.00,
+        'p_puct_live_finetune': 0.00,
+        'p_puct_live_finetune2': cli_args.p_puct_live_finetune2,
+        'puct_live_time_budget': cli_args.puct_live_time_budget,
+        'puct_live_max_simulations': cli_args.puct_live_max_simulations,
+        # Both puct variants: blind + KataGo forced playouts measured 0.733 against the raw
+        # policy where the cheating, quota-less default measured 0.567 (R.10.13/R.10.14), so
+        # this is the stronger *and* the fair configuration for a training opponent.
+        'puct_blind': True,
+        'puct_forced_playouts_k': 2.0,
+        # finetune2's own schedule: pool + live puct only. lookahead_critic and the frozen
+        # puct are dropped here by design — by this point the policy beats both, and an
+        # opponent you beat contributes near-noise once advantages are centred per opponent
+        # (docs/IDEAS.md B8) while still costing full rollout time.
+        'p_random_finetune2': 0.00,
+        'p_greedy_finetune2': 0.00,
+        'p_pool_finetune2': cli_args.p_pool_finetune2,
+        'p_lookahead_critic_finetune2': 0.00,
+        'p_puct_finetune2': 0.00,
+        # finetune -> finetune2 trigger: the rolling *training* win rate against
+        # lookahead_critic, which has to hold over consecutive evals because it is a mean
+        # over 100 episodes (~4 batches at a 0.4 weight, se ~ 5 pp).
+        'wr_lookahead_finetune2_threshold': cli_args.wr_lookahead_finetune2_threshold,
+        'finetune2_confirm_evals': cli_args.finetune2_confirm_evals,
+        'finetune2_min_episodes': 50,
+        'finetune2_min_batch': cli_args.finetune2_min_batch,
         # RandomEvalBot — the B1 randomised-coefficient family (docs/IDEAS.md B1), OFF by
         # default pending the coverage measurement it is supposed to buy. Unlike every
         # other entry here it is not one opponent: θ is redrawn per episode, so the slice

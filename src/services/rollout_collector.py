@@ -61,8 +61,13 @@ def _worker_loop(worker_id, task_q, result_q, counter, cfg):
     pool = OpponentPool(max_size=cfg['pool_max_size'], snapshot_every=10 ** 9,
                         p_random=1.0, p_greedy=0.0, p_pool=0.0, p_lookahead_critic=0.0,
                         lookahead_critic_time_budget=cfg['lookahead_critic_time_budget'],
-                        lookahead_critic_device='cpu', p_puct=0.0,
+                        lookahead_critic_device='cpu', p_puct=0.0, p_puct_live=0.0,
                         puct_time_budget=cfg.get('puct_time_budget', 0.1), puct_device='cpu',
+                        puct_max_simulations=cfg.get('puct_max_simulations'),
+                        puct_live_time_budget=cfg.get('puct_live_time_budget', 1.0),
+                        puct_live_max_simulations=cfg.get('puct_live_max_simulations', 100),
+                        puct_blind=cfg.get('puct_blind', True),
+                        puct_forced_playouts_k=cfg.get('puct_forced_playouts_k', 2.0),
                         p_random_eval=0.0,
                         # Per-worker θ stream (docs/IDEAS.md B1). Without the offset every
                         # worker would replay the *same* sequence of sampled playstyles, so
@@ -177,7 +182,9 @@ class ParallelRolloutCollector:
 
     def __init__(self, n_workers, *, policy_hidden_dim, policy_arch, pool_max_size, seed_base,
                  lookahead_critic_time_budget=0.1, puct_time_budget=0.1, collect_dense=False,
-                 random_eval_reply_branching=2):
+                 random_eval_reply_branching=2, puct_max_simulations=None,
+                 puct_live_time_budget=1.0, puct_live_max_simulations=100,
+                 puct_blind=True, puct_forced_playouts_k=2.0):
         self._ctx = mp.get_context('spawn')
         self._n = n_workers
         self._task_qs = [self._ctx.Queue() for _ in range(n_workers)]
@@ -191,6 +198,11 @@ class ParallelRolloutCollector:
             'seed_base': seed_base,
             'lookahead_critic_time_budget': lookahead_critic_time_budget,
             'puct_time_budget': puct_time_budget,
+            'puct_max_simulations': puct_max_simulations,
+            'puct_live_time_budget': puct_live_time_budget,
+            'puct_live_max_simulations': puct_live_max_simulations,
+            'puct_blind': puct_blind,
+            'puct_forced_playouts_k': puct_forced_playouts_k,
             'collect_dense': collect_dense,
             'random_eval_reply_branching': random_eval_reply_branching,
         }
