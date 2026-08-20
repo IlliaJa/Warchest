@@ -2633,3 +2633,62 @@ agreement and eval-time agreement should have been identical and were 0.17 apart
 was the whole signal. This project has a lot of quantities computed twice in different places
 (`_obs_logits` vs `joint_log_probs_batch`, gauntlet WR vs in-run eval, evaluator constants vs
 reward constants). Diffing them is cheap and has now paid twice.
+
+### R.10.15 The signal is 5.6 % of the samples, and the other 94 % dilute it to nothing (2026-08-20)
+
+With the teacher blinded (R.10.12), gated on its own machine at **0.733** (R.10.13/R.10.14)
+and no longer searching on a corrupted plane (R.10.14), the loop's first round measured
+**0.480** against base at k=100 — better than the 0.410 the same round measured before the
+plane fix, still not an improvement. The round's own numbers say why, and they are not about
+label noise or overfitting any more:
+
+* gen-time policy/search **agreement 0.944** — the search plays the policy's own top move on
+  94.4 % of decisions. Its 0.733 win rate comes from ~2.3 corrections per 41-decision game.
+* early stopping restored **epoch 1**, and post-distill agreement moved 0.944 → 0.947. The
+  policy barely moved, which is the correct response to a target that is 94 % "keep doing
+  what you already do".
+
+**The split, re-run on clean data — and it inverts R.10.10.** One round's own 15502 samples,
+no new self-play, three arms warm-started from the same base, k=200/pair (se ≈ 3.5 pp):
+
+| what is distilled | WR vs base | R.10.10's pre-fix number |
+|---|---|---|
+| all 15502 samples (what the loop does) | 0.500 | 0.40–0.41 (`agree_only`) |
+| the 867 disagreeing samples only | **0.520–0.530** | **0.28–0.29** (`disagree_only`) |
+| disagreeing samples weighted **20×** | **0.565** | — |
+| weighted 5× / 100× | 0.480 / 0.510 | — |
+
+R.10.10 measured the disagreeing subset as the *harmful* one and concluded that one-shot CE
+imitation of a search verdict has a ceiling. Both of that measurement's data defects sat
+**precisely** on the disagreeing subset — a teacher conditioning on the opponent's hidden hand
+(15.4 % of its moves, R.10.4/M3) and a search evaluating every position on a stale
+exploration plane (8.3 % of top-1 moves, R.10.14). Where search and prior agree, the label is
+the policy's own argmax and no corruption can change what it teaches; where they differ, the
+label was whatever the corruption made it. So R.10.10 measured the corruption, not the
+subset, and its ceiling argument no longer has evidence behind it. **867 samples beat 15502.**
+
+**Shipped:** `--disagree-weight` (default 1.0 = off), a per-sample CE weight for samples the
+round's starting policy already gets wrong. The mask is computed once against the policy as
+it stands at the round's start, so it is a property of the data — and with a replay window it
+re-filters older rounds' samples against the current policy for free. Weighted *mean*, so the
+CE scale and therefore the calibrated `--kl-coeff` keep their meaning; the held-out CE stays
+unweighted because it is the early-stopping criterion and its job is to detect overfitting.
+
+**Launched:** the same 8-round loop plus `--disagree-weight 20`
+(`data/exit/20260820-163543`).
+
+**What this says about the 70 % target, arithmetically.** A round at 0.565 against its
+predecessor is ~+45 Elo; five promoted rounds compound to ~0.79 against the original base,
+which would clear the target. That is the first time a measured per-round number in this
+project has been consistent with the goal. Two caveats, both real: 0.565 ± 0.035 is 1.9 σ,
+and the field it was measured in printed an intransitive-triple fraction of 0.300, so it is
+the best point estimate rather than a demonstrated effect; and per-round gains shrink as the
+student closes on the teacher, since the teacher's own edge is what is being distilled.
+
+**The next lever if this plateaus is signal *volume*, not weighting.** 200 games at 5.6 %
+divergence is 867 informative samples per round. Two ways to raise it, in order of cost:
+the replay window already accumulates them (~5 k by round 6, free), and more search per move
+raises the divergence *rate* — M3 measured 13.1 % at ~220 expansions against our 5.6 % at
+118. That reframes the budget question R.10.13 answered with "not worth +0.03 of teacher
+strength": the right quantity to buy with wall-clock is not teacher strength, it is how many
+samples per round carry a correction.
