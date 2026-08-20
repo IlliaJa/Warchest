@@ -2815,3 +2815,46 @@ ended at 0.71 — the condition is satisfied in the first evals, so `finetune` i
 unless `--finetune2-min-batch` deliberately holds it open. 390 tests;
 `tests/test_finetune2_phase.py` pins the registration, the snapshot re-pointing (and that it
 degrades to the frozen checkpoint before any snapshot exists), and every branch of the trigger.
+
+#### R.10.16a Warm start, and the instrument change hiding inside R.10.14
+
+**`--init-policy` / `--init-critic` (new).** `ppo.py` had no warm start at all — every run in
+this project's history began from random weights — so "continue this checkpoint against a
+stronger opponent" was not expressible. It is docs/IDEAS.md **#19**, never run. Three details
+that are load-bearing rather than plumbing:
+
+* The checkpoints' own `arch`/`hidden_dim` override the CLI. `policy_constructor` is what the
+  rollout workers use to rebuild pool opponents from broadcast snapshots, so a mismatch
+  surfaces as a worker crash mid-run rather than an error at startup.
+* **The critic's `return_mean`/`return_std` are restored into the `ReturnNormalizer`**
+  (`ReturnNormalizer.restore`). The critic predicts *normalised* returns, so a warm critic
+  read through a fresh (0, 1) normaliser is off by the whole affine transform it was trained
+  under — every `V` in the buffer and every GAE target would be wrong over exactly the early
+  batches the warm start exists for. A checkpoint saved before that pair existed is refused
+  rather than loaded blind.
+* An `OBS_VERSION` mismatch is refused; a one-sided warm start is warned about.
+
+Verified on a 2-batch run: `wr_greedy=0.897` at batch 1 (a fresh run is ~0.1–0.3), and
+`critic mean 0.4837` against `ret mean 0.4640` at `critic_mae 0.1228` — the net and its scale
+both arrived. Also shipped alongside, because the plan around this needs them:
+`--n-batches`, `--n-workers`, `--no-wandb`.
+
+**And the instrument change.** That smoke run reported `wr_lookahead=0.457`, against the 0.71
+the same policy ended its own training run at. Measured properly — gauntlet, k=100, the
+training budget of 0.1 s — `ckpt_20260817-2102` beats the *fixed* `lookahead_critic` **0.55 ±
+0.05** in a fully transitive field. So the exploration-plane fix (R.10.14) is worth about
+**+0.16** of win rate to `lookahead_critic`, on top of the +0.079 measured for `puct` — the
+beam search leans on the critic at every leaf, so it had more to gain than a tree that spends
+most of its evaluations on the prior.
+
+Two consequences, and the second one matters for reading any past number:
+
+1. **The finetune → finetune2 trigger is now a real gate.** At 0.55 the policy has to improve
+   to clear 0.60, where against the broken opponent it was already at 0.71 and would have
+   promoted on the first eval. `--finetune2-min-batch` is therefore no longer needed for its
+   original purpose (holding the phase open on a warm start).
+2. **`wr_lookahead` is not comparable across the fix.** Every value from before 2026-08-20 was
+   measured against a search reading a corrupted board plane, so the trajectory `0.04 → 0.95`
+   that B8 and R.9.2 both reason from is partly a story about a weakening instrument, not only
+   about a strengthening policy. The same caution applies to `wr_vs_puct_train` and to every
+   gauntlet standing that includes a search bot.
