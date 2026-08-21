@@ -2858,3 +2858,120 @@ Two consequences, and the second one matters for reading any past number:
    that B8 and R.9.2 both reason from is partly a story about a weakening instrument, not only
    about a strengthening policy. The same caution applies to `wr_vs_puct_train` and to every
    gauntlet standing that includes a search bot.
+
+### R.10.17 The warm start restored the weights and threw them away: schedules are not warm-started (2026-08-21)
+
+The sparring run of §R.10.16 was launched on desktop-legion as
+
+```
+python src/app/ppo.py --init-policy data/warchest_ppo_20260817-2102.pth \
+                      --init-critic data/warchest_critic_20260817-2102.pth \
+                      --finetune2-min-batch 300
+```
+
+and stopped at batch 356 of 1500 after ~4 h (`logs/ppo_20260821-062548.log`, W&B `tg4uefic`).
+It never entered `finetune2`, and it lost to the checkpoint it started from:
+
+| in-run reference eval vs `ckpt_20260817-2102` | score |
+|---|---|
+| batch 10 — still the checkpoint | **0.500** (10W/10L) |
+| batch 20 | 0.250 |
+| batch 40 | 0.100 |
+| batches ≥ 30, pooled (640 games) | 0.208 |
+| **whole run: 148W / 532L / 0D over 680 games** | **0.218 ± 0.016** |
+
+That is ~18 σ, at n large enough that the standing "one field is not a result" rule (§7 of the
+handoff) does not apply: it is a two-agent field at k = 680.
+
+**The cause is that `--init-policy` moves the weights and nothing else.** Every schedule in
+`PPOTrainer` — `entropy_coeff`, `verb_entropy_coeff`, both LRs, the holding/material/base
+shaping anneal — is a function of `batch_num / n_batches`, so a converged checkpoint gets
+trained under *early-run* settings:
+
+| knob | value the checkpoint converged at | this run, batch 356 | ratio |
+|---|---|---|---|
+| `entropy_coeff` | 0.003 | 0.0198 | **6.6×** |
+| `verb_entropy_coeff` | 0.010 | 0.0176 | 1.8× |
+| `lr` | 3.0e-5 | 2.36e-4 | **7.9×** |
+| shaping anneal | 0.10 (floor) | 0.60 | 6× |
+
+At those settings the entropy bonus is not a nudge, it is **the dominant term in the actor
+loss**: `0.025 · 1.123 + 0.02 · 0.644 = 0.041` against a mean `|actor_loss|` of `0.0204` over
+the run — and the surrogate's gradient at `ratio ≈ 1` with per-opponent-centred advantages is
+small and sign-inconsistent, where the entropy gradient has one direction. There is a feedback
+loop on top of it: the per-minibatch KL gate (`_update_actor`) skipped 134 of ~160 minibatches
+per batch at the start and only 62 of ~150 by batch 341, because a flatter policy moves the
+log-ratio less. Raising entropy buys more applied steps, which apply more entropy bonus.
+
+**The control is exact.** `logs/ppo_20260817-063713.log` is the run that *produced* this
+checkpoint (it saved `warchest_ppo_20260817-2102.pth` at 21:02), same `n_batches`, `lam`,
+`critic_v5`, `policy_factored_v2`, `adv_norm`. Compared at equal batch index:
+
+```
+     window   run  ent_frac  verb_ent wr_greedy     wr_la   shaping  terminal   bolster
+       1-20   old     0.862     1.052     0.006     0.000     0.042    -0.928     3.420
+       1-20   new     0.212     0.316     0.946     0.477     0.209     0.153     2.660  <- the checkpoint
+      21-60   new     0.452     0.627     0.940     0.310     0.142    -0.488     2.309
+     61-140   old     0.540     0.727     0.611     0.136     0.180    -0.038     1.027
+     61-140   new     0.506     0.687     0.808     0.222     0.133    -0.434     1.685
+    241-344   old     0.473     0.658     0.893     0.267     0.182    -0.087     0.841
+    241-344   new     0.475     0.660     0.798     0.256     0.101    -0.339     1.620  <- converged
+  1401-1500   old     0.204     0.309     0.920     0.668     0.224     0.170     2.422  <- the checkpoint
+```
+
+By batch ~240 the warm-started run **is** the cold run at the same schedule position:
+`ent_frac` 0.475 vs 0.473, `verb_ent` 0.660 vs 0.658, `wr_vs_lookahead_critic` 0.256 vs 0.267.
+`ent_frac` went 0.21 → 0.45 in the first 60 batches, and the reference score collapsed in the
+same window (0.500 at batch 10, 0.250 at batch 20). The warm start bought nothing: it paid 4 h
+of compute to arrive where batch 340 of a fresh run already is. The old run's own reference
+score is the same shape from the other side — 0.00–0.30 for its first 900 batches, crossing
+0.5 only past batch 1300, i.e. only once the anneal has finished. **The anneal is what converts
+a high-entropy explorer into a sharp player, and re-running it un-sharpens the checkpoint.**
+
+A second, independent reward change rode along: `anneal_base_shaping` does not appear in the
+08-17 run's hyperparameter dump at all (it was added 2026-08-18, R.0.3), so that checkpoint
+trained with the base-diff PBRS term at **full weight for all 1500 batches**, while this run
+anneals it 1.0 → 0.1. `score_shaping` per episode duly fell 0.209 → 0.101. Warm-starting also
+silently changes the objective unless the anneal is pinned.
+
+**Correction to R.10.16, consequence 1.** "At 0.55 the policy has to improve to clear 0.60" is
+too optimistic: measured *in-run*, at batches 1–20 where the weights are still the checkpoint,
+`wr_vs_lookahead_critic` reads **0.477** — and its own training run ended at 0.668, so the
+exploration-plane fix costs 0.19 of in-run win rate here (independently reproducing the +0.16
+gauntlet figure). The 0.60 gate is therefore **above what the starting checkpoint can reach**,
+not just above where it is; pre-fix, the same trajectory only crossed 0.60 around batch 1400.
+Worse, `_finetune2_streak` resets whenever `wr_vs_greedy_eval` dips under 0.75, which on a
+20-game eval (se ≈ 0.09 at 0.8) happened at 6 of 34 evals and also flapped the phase
+`finetune ↔ initial` every ten batches. A sparring run gated this way never spars.
+
+**Also found while reading the run:** `wr_vs_puct_live_train` logged a flat 0 for 356 batches
+and looks like a total loss, when in fact `puct_live` never played an episode and the deque was
+empty — an empty rolling win rate reported 0.0, which is a legal win rate.
+
+#### What shipped (2026-08-21)
+
+* **`--schedule-start-frac`** (default 0.0, unchanged behaviour): where in the annealing
+  schedule the run begins. The remainder is stretched over `n_batches`, so a run always ends
+  at the final values. `1.0` holds the final entropy/LR/shaping values throughout, which is
+  what continuing from an end-of-run checkpoint wants. A warm start with the knob left at 0.0
+  now logs a WARNING quoting this section.
+* **`--entropy-coeff` / `--entropy-coeff-final` / `--verb-entropy-coeff` /
+  `--verb-entropy-coeff-final` / `--lr-actor` / `--lr-critic` / `--lr-final-frac`** — these
+  were hard-coded in the `hp` dict, so none of the above was tunable from the command line.
+* **`--start-in-finetune2`**: enters the phase at batch 1 and sets the pool's weights before
+  the first rollout (`_apply_opponent_phase` only runs at eval time, so the flag alone would
+  have left the first `eval_every` batches on the `initial` distribution). Overrides
+  `--finetune2-min-batch`, which it warns about.
+* **`WR_NO_GAMES = -1.0`** for every unplayed rolling win rate, so "never met this opponent"
+  and "lost every game" stop sharing a value.
+* **The `RandomBot` game is gone from the eval phase.** It read exactly 1.000 at every eval of
+  both runs — all 1500 batches of one and all 350 of the other — while costing a third of an
+  eval that runs ~45 s against ~22 s batches. `wr_vs_random_eval` is removed from the logs and
+  from W&B, and `elo_policy` is now anchored on `greedy` alone, so it is not comparable in
+  absolute terms with earlier runs.
+
+Note this **inverts** step 2 of `docs/handoff_20260821.md` ("the warm-started policy begins
+collapsed; `verb_entropy_coeff_final` 0.01 → ~0.015 matters more, not less"). With the shipped
+schedule it did not stay collapsed for 40 batches. The problem was never the floor; it was the
+*initial* coefficient, applied to a converged net. Raising the floor is still admissible, but
+only from `--schedule-start-frac 1.0`, where the floor is the whole schedule.

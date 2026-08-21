@@ -29,7 +29,7 @@ from src.services.environment.rollout_core import (
 from src.services.opponent_pool import OpponentPool
 from src.services.rollout_collector import ParallelRolloutCollector
 from src.utils.rollout_buffer import RolloutBuffer
-from src.services.bots import GreedyBot, RandomBot
+from src.services.bots import GreedyBot
 from src.utils.elo import EloTracker
 
 # SHAPING_C / C_MAT / OPP_TYPE_IDX are defined in rollout_core (they belong to the per-step
@@ -49,6 +49,11 @@ from src.utils.elo import EloTracker
 SHAPING_ANNEAL_INIT = 1.0
 SHAPING_ANNEAL_FINAL = 0.1
 SHAPING_ANNEAL_HALF_FRAC = 0.5
+# Sentinel for a rolling win rate with no games behind it. Deliberately outside [0, 1]:
+# reporting 0.0 for "never played" is indistinguishable from "lost every game", which is
+# how `wr_vs_puct_live_train` read as a flat total loss through a run whose `finetune2`
+# phase never started.
+WR_NO_GAMES = -1.0
 # Reverse of OPP_GROUP_IDX, so the per-opponent advantage offsets log by name.
 OPP_GROUP_NAME = {v: k for k, v in OPP_GROUP_IDX.items()}
 # Where saved policies live; the eval reference opponent is picked from here.
@@ -233,6 +238,10 @@ class PPOTrainer:
         self._lr_actor_init = hp['lr_actor']
         self._lr_critic_init = hp['lr_critic']
         self._lr_final_frac = hp.get('lr_final_frac', 0.0)
+        # Where in the schedule this run starts (see `_schedule_frac`). 0.0 = a fresh run;
+        # 1.0 = hold the final entropy/LR/shaping values throughout, which is what a warm
+        # start from an end-of-run checkpoint wants.
+        self._schedule_start_frac = min(max(hp.get('schedule_start_frac', 0.0), 0.0), 1.0)
         self._holding_reward_rate = hp['holding_reward_rate']
         # anneal multiplier applied to holding + material shaping; set per batch.
         self._shaping_anneal = SHAPING_ANNEAL_INIT
@@ -301,7 +310,13 @@ class PPOTrainer:
         self._finetune2_confirm_evals = hp.get('finetune2_confirm_evals', 3)
         self._finetune2_min_batch = hp.get('finetune2_min_batch', 0)
         self._finetune2_min_episodes = hp.get('finetune2_min_episodes', 50)
-        self._in_finetune2 = False
+        # A warm start from a checkpoint that already cleared the earlier phases has nothing
+        # to gain from re-earning them, and the promotion trigger cannot be relied on to let
+        # it through: it wants `wr_vs_lookahead_critic` >= 0.60, and the checkpoint that
+        # ended the 2026-08-17 run at 0.71 reads 0.477 once the exploration-plane fix stops
+        # handicapping the search (docs/IDEAS.md R.10.14, R.10.17). So the phase is also
+        # settable directly, which is the only way a sparring run starts sparring.
+        self._in_finetune2 = hp.get('start_in_finetune2', False)
         self._finetune2_streak = 0
         # Advantage normalisation (docs/next_iteration.md §5 row 6). 'per_opponent' centres
         # advantages inside each opponent group, which is what lets `critic_v3` drop the
@@ -377,6 +392,14 @@ class PPOTrainer:
             random_eval_reply_branching=hp.get('random_eval_reply_branching', 2),
             p_policy_theta=hp.get('p_policy_theta_initial', 0.0),
         )
+        if self._in_finetune2:
+            # The pool is built with the `initial` weights, and `_apply_opponent_phase` only
+            # runs at eval time — without this the first `eval_every` batches would collect
+            # against the wrong distribution.
+            self._pool.set_weights(**self._opp_weights_finetune2)
+            logger.info(
+                'starting in opponent phase finetune2 (--start-in-finetune2). Weights: %s',
+                {k: v for k, v in self._opp_weights_finetune2.items() if v})
         self._buffer = RolloutBuffer()
         self._greedy_bot = GreedyBot()
         self._elo = EloTracker()
@@ -396,7 +419,7 @@ class PPOTrainer:
 
         # Frozen previous-generation policy the eval phase plays against, so a run answers
         # "is this policy better than the last one I saved?" directly instead of only
-        # "how does it do against greedy/random?" — which both saturate long before the
+        # "how does it do against greedy?" — which saturates long before the
         # policy stops improving. Loaded ONCE here, before the first batch, from a path
         # resolved once at startup (see `latest_policy_checkpoint`): re-globbing at every
         # eval call would start picking up checkpoints THIS run wrote, making the baseline
@@ -426,9 +449,10 @@ class PPOTrainer:
     def _update_schedules(self, batch_num: int):
         """Linearly anneal the entropy coefficient and both learning rates.
 
-        ``frac`` runs 0.0 (first batch) -> 1.0 (last batch).
+        ``frac`` runs ``schedule_start_frac`` (first batch) -> 1.0 (last batch); see
+        `_schedule_frac`.
         """
-        frac = (batch_num - 1) / max(self._n_batches - 1, 1)
+        frac = self._schedule_frac(batch_num)
         self._entropy_coeff = (
             self._entropy_coeff_init
             + frac * (self._entropy_coeff_final - self._entropy_coeff_init)
@@ -444,14 +468,33 @@ class PPOTrainer:
             group['lr'] = self._lr_critic_init * lr_scale
 
         # Holding + material shaping anneal: 1.0 -> SHAPING_ANNEAL_FINAL over the first
-        # SHAPING_ANNEAL_HALF_FRAC of the run, then held at the floor. Used at COLLECTION
-        # time; kept pure (see _compute_shaping_anneal) so the overlap path can compute the
-        # next batch's value without disturbing this batch's LR/entropy.
+        # SHAPING_ANNEAL_HALF_FRAC of the schedule, then held at the floor. Used at
+        # COLLECTION time; kept pure (see _compute_shaping_anneal) so the overlap path can
+        # compute the next batch's value without disturbing this batch's LR/entropy.
         self._shaping_anneal = self._compute_shaping_anneal(batch_num)
 
+    def _schedule_frac(self, batch_num: int) -> float:
+        """Schedule progress for this batch: ``schedule_start_frac`` -> 1.0 over the run.
+
+        Every schedule in this trainer (entropy, verb entropy, both LRs, the shaping
+        anneal) is a function of *fractional progress through the run*, so a warm start
+        that restores weights but leaves this at 0.0 puts early-training settings on a
+        converged checkpoint. Measured cost of exactly that (docs/IDEAS.md R.10.17): a
+        checkpoint warm-started at frac 0.0 went from `ent_frac` 0.21 to 0.49 in 40 batches
+        and scored 0.218 +- 0.016 over 680 games against *itself*, converging onto the cold
+        run's own curve at the same batch index.
+
+        ``schedule_start_frac`` names where in the schedule the run begins; the remainder
+        is stretched over its `n_batches`, so a run always ends at the final values. 1.0
+        means "hold the final values throughout", which is the setting for continuing from
+        an end-of-run checkpoint.
+        """
+        frac = (batch_num - 1) / max(self._n_batches - 1, 1)
+        start = self._schedule_start_frac
+        return min(start + frac * (1.0 - start), 1.0)
+
     def _compute_shaping_anneal(self, batch_num: int) -> float:
-        half = max(self._n_batches * SHAPING_ANNEAL_HALF_FRAC, 1.0)
-        anneal_frac = min((batch_num - 1) / half, 1.0)
+        anneal_frac = min(self._schedule_frac(batch_num) / SHAPING_ANNEAL_HALF_FRAC, 1.0)
         return SHAPING_ANNEAL_INIT + anneal_frac * (SHAPING_ANNEAL_FINAL - SHAPING_ANNEAL_INIT)
 
     def _base_shaping_anneal(self, anneal: float) -> float:
@@ -916,7 +959,7 @@ class PPOTrainer:
         """
         if path is None:
             logger.info(
-                '[eval] no reference policy: eval runs against greedy/random only. '
+                '[eval] no reference policy: eval runs against greedy only. '
                 f'(nothing matched {POLICY_CKPT_GLOB}, or it was disabled explicitly)'
             )
             return
@@ -929,7 +972,7 @@ class PPOTrainer:
         except Exception as e:
             logger.warning(
                 f'[eval] could not load reference policy {path!r}: {e}. Eval runs against '
-                f'greedy/random only; pass --reference-policy to point at a loadable one.'
+                f'greedy only; pass --reference-policy to point at a loadable one.'
             )
             return
         ref.eval()
@@ -951,14 +994,27 @@ class PPOTrainer:
                f'emits v{env_version}')
         )
 
+    @staticmethod
+    def _rolling_wr(deq) -> float:
+        """Mean of a rolling win-rate deque, or WR_NO_GAMES if it holds no games."""
+        return float(np.mean(deq)) if deq else WR_NO_GAMES
+
     def _maybe_eval(self, batch_num: int):
+        """Two opponents per eval: `greedy` (the cross-run Elo anchor) and the reference.
+
+        `RandomBot` used to be the third, and was dropped 2026-08-21: it read exactly
+        1.000 for all 1500 batches of the 2026-08-17 run and all 350 of the next one, so
+        it cost a third of the eval budget (eval is ~45 s per `eval_every`=10 batches
+        against ~22 s batches) to report a constant. `wr_vs_random_eval` is therefore gone
+        from the logs and from W&B, and `elo_policy` is now anchored on `greedy` alone —
+        not comparable in absolute terms with runs before this change.
+        """
         if batch_num % self._eval_every != 0:
             return
 
         self._policy.eval()
         self._critic.eval()
         greedy_wins = 0
-        random_eval_wins = 0
         ref_wins = 0
         ref_losses = 0
         ref_draws = 0
@@ -975,20 +1031,11 @@ class PPOTrainer:
             else:
                 self._elo.draw('policy', 'greedy')
 
-            outcome = self._eval_episode(RandomBot(), main_pid)
-            if outcome == 'win':
-                self._elo.win('policy', 'random')
-                random_eval_wins += 1
-            elif outcome == 'lose':
-                self._elo.win('random', 'policy')
-            else:
-                self._elo.draw('policy', 'random')
-
             if self._eval_reference is not None:
-                # Deliberately NOT fed into self._elo: the reference plays nobody but the
-                # current policy, so the pair would float freely and drag elo_policy off
-                # the greedy/random anchor it is comparable across runs by. The score
-                # below is the whole signal, and it needs no rating system.
+                # Deliberately NOT fed into self._elo: the reference changes every run, so
+                # the pair would float freely and drag elo_policy off the `greedy` anchor
+                # it is comparable across runs by. The score below is the whole signal,
+                # and it needs no rating system.
                 outcome = self._eval_episode(self._eval_reference, main_pid)
                 if outcome == 'win':
                     ref_wins += 1
@@ -1002,8 +1049,6 @@ class PPOTrainer:
 
         elo_pol = self._elo.rating('policy')
         elo_grdy = self._elo.rating('greedy')
-        elo_rnd = self._elo.rating('random')
-        wr_random_eval = random_eval_wins / self._eval_episodes
         wr_greedy_eval = greedy_wins / self._eval_episodes
 
         phase = self._apply_opponent_phase(wr_greedy_eval, batch_num)
@@ -1024,7 +1069,6 @@ class PPOTrainer:
         logger.info(
             f'[eval] batch={batch_num} '
             f'wr_greedy={wr_greedy_eval:.3f} '
-            f'wr_random={wr_random_eval:.3f} '
             f'phase={phase} '
             f'elo_policy={elo_pol:.0f} elo_greedy={elo_grdy:.0f}'
             + (f' | vs {self._eval_reference.name}: '
@@ -1036,7 +1080,6 @@ class PPOTrainer:
             wandb.log({
                 'elo_policy': elo_pol,
                 'wr_vs_greedy_eval': wr_greedy_eval,
-                'wr_vs_random_eval': wr_random_eval,
                 'opp_phase': {'initial': 0, 'finetune': 1, 'finetune2': 2}[phase],
                 **ref_stats,
             })
@@ -1055,9 +1098,13 @@ class PPOTrainer:
           least `finetune2_min_episodes` recorded episodes. One-way, because flipping the
           opponent distribution back and forth on that noise is worse than either phase.
 
-        Note what the trigger implies on a warm start: a checkpoint that already beats
-        `lookahead_critic` (the last run ended at 0.71) satisfies it in the first evals, so
-        `finetune` is a formality unless `finetune2_min_batch` holds it open deliberately.
+        Note what the trigger implies on a warm start: it is calibrated on a pre-2026-08-20
+        number. The 2026-08-17 run ended at `wr_lookahead` 0.71, but the exploration-plane
+        fix made `lookahead_critic` ~0.19 stronger, and that same checkpoint reads 0.477 in
+        the first batches of a warm-started run — *below* the 0.60 threshold. So a warm
+        start does not sail through this gate, it never reaches it: use
+        `--start-in-finetune2` to enter the phase directly, or `--finetune2-min-batch` to
+        hold `finetune` open deliberately.
         """
         if self._in_finetune2:
             self._pool.set_weights(**self._opp_weights_finetune2)
@@ -1068,7 +1115,9 @@ class PPOTrainer:
             return 'initial'
 
         n_seen = len(self._wr_vs_lookahead_critic)
-        wr_la = float(np.mean(self._wr_vs_lookahead_critic)) if n_seen else 0.0
+        # Module constant, not `self._rolling_wr`: this method is unit-tested against a
+        # SimpleNamespace stub, which carries data attributes only.
+        wr_la = float(np.mean(self._wr_vs_lookahead_critic)) if n_seen else WR_NO_GAMES
         ready = (n_seen >= self._finetune2_min_episodes
                  and wr_la >= self._wr_finetune2_threshold
                  and batch_num >= self._finetune2_min_batch)
@@ -1133,17 +1182,17 @@ class PPOTrainer:
                 # A drop here is coverage arriving, not a regression.
                 self._wr_vs_random_eval.append(int(ep['outcome'] == 'win'))
 
-        wr_pool = float(np.mean(self._wr_vs_pool)) if self._wr_vs_pool else 0.0
-        wr_greedy = float(np.mean(self._wr_vs_greedy)) if self._wr_vs_greedy else 0.0
-        wr_lookahead = (float(np.mean(self._wr_vs_lookahead_critic))
-                        if self._wr_vs_lookahead_critic else 0.0)
-        wr_puct = float(np.mean(self._wr_vs_puct)) if self._wr_vs_puct else 0.0
-        wr_puct_live = (float(np.mean(self._wr_vs_puct_live))
-                        if self._wr_vs_puct_live else 0.0)
-        wr_random_eval = (float(np.mean(self._wr_vs_random_eval))
-                          if self._wr_vs_random_eval else 0.0)
-        wr_policy_theta = (float(np.mean(self._wr_vs_policy_theta))
-                           if self._wr_vs_policy_theta else 0.0)
+        # WR_NO_GAMES, not 0.0, when an opponent has not been played: 0.0 is a legal win
+        # rate and reads as "loses every game". `wr_vs_puct_live_train` sat at a flat 0 for
+        # the whole 2026-08-21 run and looked like a total loss when in fact `finetune2`
+        # had never started and the deque was empty (docs/IDEAS.md R.10.17).
+        wr_pool = self._rolling_wr(self._wr_vs_pool)
+        wr_greedy = self._rolling_wr(self._wr_vs_greedy)
+        wr_lookahead = self._rolling_wr(self._wr_vs_lookahead_critic)
+        wr_puct = self._rolling_wr(self._wr_vs_puct)
+        wr_puct_live = self._rolling_wr(self._wr_vs_puct_live)
+        wr_random_eval = self._rolling_wr(self._wr_vs_random_eval)
+        wr_policy_theta = self._rolling_wr(self._wr_vs_policy_theta)
 
         s = update_stats
         avg_turns = float(np.mean([ep['turns'] for ep in self._batch_eps]))
@@ -1388,7 +1437,7 @@ if __name__ == '__main__':
         '--reference-policy', default=None,
         help='Policy checkpoint the eval phase plays the current policy against, so a run '
              'reports whether it beat the last saved generation rather than only how it '
-             f'does against greedy/random. Default: the newest {POLICY_CKPT_GLOB} by mtime. '
+             f'does against greedy. Default: the newest {POLICY_CKPT_GLOB} by mtime. '
              'Resolved ONCE at startup — checkpoints this run saves later can never become '
              'their own baseline. Pass --no-reference-eval to skip the match.')
     parser.add_argument(
@@ -1478,6 +1527,58 @@ if __name__ == '__main__':
         '--finetune2-min-batch', type=int, default=0,
         help='Earliest batch at which finetune2 may start, regardless of the win rate.')
     parser.add_argument(
+        '--start-in-finetune2', action='store_true',
+        help='Enter the finetune2 opponent phase at batch 1 instead of waiting for the win-'
+             'rate gate. This is the setting for a warm-started sparring run: the gate wants '
+             'wr_vs_lookahead_critic >= 0.60, and the checkpoint that ended the 2026-08-17 '
+             'run at 0.71 reads 0.477 now that the exploration-plane fix has stopped '
+             'handicapping the search (docs/IDEAS.md R.10.14/R.10.17), so the phase the run '
+             'exists to test would never begin. Overrides --finetune2-min-batch and the '
+             'confirm-evals streak; the pool is set to the finetune2 weights before the '
+             'first rollout.')
+    parser.add_argument(
+        '--schedule-start-frac', type=float, default=0.0,
+        help='Where in the annealing schedule this run starts, 0.0-1.0. Every schedule here '
+             '(entropy coeff, verb-entropy coeff, both LRs, the holding/material/base '
+             'shaping anneal) is a function of fractional progress through the run, so the '
+             'default 0.0 puts *early-training* settings on whatever weights --init-policy '
+             'restored. Measured cost of that (docs/IDEAS.md R.10.17): entropy coeff 6.6x '
+             'and LR 7.9x the values the checkpoint converged under, ent_frac 0.21 -> 0.49 '
+             'in 40 batches, and 0.218 +- 0.016 over 680 games against the checkpoint the '
+             'run started from. Pass 1.0 to hold the final values for the whole run, which '
+             'is what continuing from an end-of-run checkpoint wants; the remaining '
+             'schedule is stretched over n_batches, so a run always ends at the final '
+             'values.')
+    parser.add_argument(
+        '--entropy-coeff', type=float, default=0.025,
+        help='Initial coefficient on the flat joint-action entropy bonus, annealed to '
+             '--entropy-coeff-final. Tuned for a cold start; on a warm start prefer '
+             '--schedule-start-frac 1.0 (or set both ends near the final value) — at 0.025 '
+             'against a mean |actor_loss| of 0.020 the entropy term is the *dominant* term '
+             'in the actor loss and un-trains a converged policy.')
+    parser.add_argument(
+        '--entropy-coeff-final', type=float, default=0.003,
+        help='Coefficient the flat entropy bonus is annealed down to by the last batch.')
+    parser.add_argument(
+        '--verb-entropy-coeff', type=float, default=0.02,
+        help='Initial coefficient on the verb-marginal entropy bonus (docs/IDEAS.md #R8), '
+             'annealed to --verb-entropy-coeff-final. The flat bonus above is dominated by '
+             'the many spatial actions and barely constrains the 11-way verb head.')
+    parser.add_argument(
+        '--verb-entropy-coeff-final', type=float, default=0.01,
+        help='Floor for the verb-entropy bonus. Deliberately non-zero, unlike the flat one: '
+             'rare verbs (BOLSTER, TACTIC) collapse out of the repertoire without it.')
+    parser.add_argument(
+        '--lr-actor', type=float, default=3e-4,
+        help='Initial actor learning rate, decayed to lr_actor * --lr-final-frac.')
+    parser.add_argument(
+        '--lr-critic', type=float, default=3e-4,
+        help='Initial critic learning rate, decayed to lr_critic * --lr-final-frac.')
+    parser.add_argument(
+        '--lr-final-frac', type=float, default=0.1,
+        help='Fraction of the initial LR both optimisers decay to by the last batch. 0.0 '
+             '(decay to zero) made the last ~25 %% of a run do no learning.')
+    parser.add_argument(
         '--p-policy-theta-finetune', type=float, default=0.0,
         help='Share of finetune-phase episodes played against the verified PolicyThetaBot '
              'family (docs/bots.md): six θ, each measured to beat lookahead_critic '
@@ -1533,8 +1634,9 @@ if __name__ == '__main__':
         'anneal_base_shaping': not cli_args.no_anneal_base_shaping,
         'ppo_epochs': 4,
         'ppo_eps': 0.2,
-        'entropy_coeff': 0.025,
-        'entropy_coeff_final': 0.003,  # linearly annealed from entropy_coeff over the run
+        'entropy_coeff': cli_args.entropy_coeff,
+        # linearly annealed from entropy_coeff over the run
+        'entropy_coeff_final': cli_args.entropy_coeff_final,
         # Dedicated entropy bonus on the top-level verb marginal P(verb) (docs/IDEAS.md #R8).
         # The flat-joint entropy above is dominated by the many spatial actions, so it
         # barely constrains the 11-way verb head and lets rare verbs (BOLSTER, TACTIC)
@@ -1542,8 +1644,11 @@ if __name__ == '__main__':
         # 10.2 -> 0.3 crash in ppo_20260713-144024). Unlike the flat coeff this anneals to a
         # meaningful floor, not near-zero, so the rare verbs stay sampled long enough for a
         # stack-punishing opponent / material PBRS to reinforce them. Set to 0.0 to disable.
-        'verb_entropy_coeff': 0.02,
-        'verb_entropy_coeff_final': 0.01,
+        'verb_entropy_coeff': cli_args.verb_entropy_coeff,
+        'verb_entropy_coeff_final': cli_args.verb_entropy_coeff_final,
+        # Where in the schedule the run begins: 0.0 = a fresh run, 1.0 = hold the final
+        # entropy/LR/shaping values throughout. See PPOTrainer._schedule_frac.
+        'schedule_start_frac': cli_args.schedule_start_frac,
         'holding_reward_rate': holding_reward_rate,
         'minibatch_size': 64,
         # Parallel rollout collection (docs/parallel_rollouts.md). 1 = in-process; 6 leaves
@@ -1554,12 +1659,13 @@ if __name__ == '__main__':
         # in-flight buffer in RAM. A/B learning quality, and disable if RAM-bound.
         'overlap_collection': True,
         'rollout_seed': 0,
-        'lr_actor': 3e-4,
-        'lr_critic': 3e-4,
-        'lr_final_frac': 0.1,  # LR decays linearly to lr_*_init * this. Was 0.0 (decay to
+        'lr_actor': cli_args.lr_actor,
+        'lr_critic': cli_args.lr_critic,
+        # LR decays linearly to lr_*_init * lr_final_frac. Was 0.0 (decay to
         # zero): the last ~25% of training then did no learning and the elo plateau in
         # those batches was purely the vanishing LR. 0.1 keeps a small floor so late
         # self-play refinement still moves the weights.
+        'lr_final_frac': cli_args.lr_final_frac,
         # IDEAS.md #R5: widen the policy the same way the critic was widened, one clean
         # step (64 -> 128) so a policy-capacity gain stays attributable — no added conv
         # depth (the 3-layer trunk's radius-3 receptive field is deliberate, policy.py),
@@ -1643,6 +1749,7 @@ if __name__ == '__main__':
         'finetune2_confirm_evals': cli_args.finetune2_confirm_evals,
         'finetune2_min_episodes': 50,
         'finetune2_min_batch': cli_args.finetune2_min_batch,
+        'start_in_finetune2': cli_args.start_in_finetune2,
         # RandomEvalBot — the B1 randomised-coefficient family (docs/IDEAS.md B1), OFF by
         # default pending the coverage measurement it is supposed to buy. Unlike every
         # other entry here it is not one opponent: θ is redrawn per episode, so the slice
@@ -1751,6 +1858,19 @@ if __name__ == '__main__':
             'first batches being taught by noise, and a warm critic behind a random policy '
             'is evaluating states it will never see again. Prefer passing both.',
             'policy' if init_policy_meta else 'critic')
+    if init_policy_meta is not None and hp['schedule_start_frac'] == 0.0:
+        logger.warning(
+            'warm start with --schedule-start-frac 0.0: the weights are restored but every '
+            'schedule restarts at batch 1 of %d, so this run trains the checkpoint at '
+            'entropy_coeff=%.4f / lr=%.1e / shaping_anneal=%.2f — the settings a *fresh* run '
+            'uses. Measured cost (docs/IDEAS.md R.10.17): ent_frac 0.21 -> 0.49 in 40 '
+            'batches and 0.218 +- 0.016 over 680 games against the init checkpoint itself. '
+            'Pass --schedule-start-frac 1.0 unless this is deliberate.',
+            hp['n_batches'], hp['entropy_coeff'], hp['lr_actor'], SHAPING_ANNEAL_INIT)
+    if hp['start_in_finetune2'] and hp['finetune2_min_batch']:
+        logger.warning(
+            '--start-in-finetune2 makes --finetune2-min-batch %d dead: the phase is already '
+            'entered at batch 1.', hp['finetune2_min_batch'])
 
     def policy_constructor():
         return Policy(device=device, hidden_dim=hp['hidden_dim'], arch=hp['policy_arch'])
