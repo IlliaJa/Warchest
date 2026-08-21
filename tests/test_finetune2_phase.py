@@ -137,7 +137,7 @@ def _trainer(wr_lookahead, *, confirm=3, threshold=0.60, min_episodes=50, min_ba
         _finetune2_min_episodes=min_episodes,
         _in_finetune2=False,
         _finetune2_streak=0,
-        _wr_vs_lookahead=deque(wr_lookahead, maxlen=100),
+        _wr_vs_lookahead_critic=deque(wr_lookahead, maxlen=100),
         _opp_weights_initial={'tag': 'initial'},
         _opp_weights_finetune={'tag': 'finetune'},
         _opp_weights_finetune2={'tag': 'finetune2'},
@@ -163,16 +163,16 @@ def test_a_dip_resets_the_streak():
     t = _trainer([1] * 80)
     t._apply_opponent_phase(0.9, batch_num=100)
     t._apply_opponent_phase(0.9, batch_num=100)
-    t._wr_vs_lookahead = deque([0] * 80, maxlen=100)  # win rate collapses
+    t._wr_vs_lookahead_critic = deque([0] * 80, maxlen=100)  # win rate collapses
     assert t._apply_opponent_phase(0.9, batch_num=100) == 'finetune'
-    t._wr_vs_lookahead = deque([1] * 80, maxlen=100)
+    t._wr_vs_lookahead_critic = deque([1] * 80, maxlen=100)
     assert t._apply_opponent_phase(0.9, batch_num=100) == 'finetune'  # streak restarted
 
 
 def test_promotion_is_one_way():
     t = _trainer([1] * 80, confirm=1)
     assert t._apply_opponent_phase(0.9, batch_num=100) == 'finetune2'
-    t._wr_vs_lookahead = deque([0] * 80, maxlen=100)
+    t._wr_vs_lookahead_critic = deque([0] * 80, maxlen=100)
     # Neither a collapsed win rate nor a collapsed greedy eval takes it back: flipping the
     # opponent distribution on a noisy rolling mean is worse than either phase.
     assert t._apply_opponent_phase(0.9, batch_num=100) == 'finetune2'
@@ -196,6 +196,24 @@ def test_a_win_rate_under_the_threshold_never_promotes():
     for _ in range(4):
         assert t._apply_opponent_phase(0.9, batch_num=100) == 'finetune'
     assert all(w == {'tag': 'finetune'} for w in t._pool.applied)
+
+
+def test_the_stub_reads_the_same_attributes_the_real_trainer_sets():
+    """A `SimpleNamespace` stub accepts any attribute name, so a typo in the method under
+    test is invisible here and only surfaces at the first eval of a real run — which is
+    exactly how `self._wr_vs_lookahead` (the deque is `_wr_vs_lookahead_critic`) shipped.
+    Pin every `self._x` the method reads against what `PPOTrainer.__init__` assigns.
+    """
+    import inspect
+    import re
+
+    from src.app.ppo import PPOTrainer
+
+    read = {n for n in PPOTrainer._apply_opponent_phase.__code__.co_names
+            if n.startswith('_')}
+    assigned = set(re.findall(r'self\.(_\w+)\s*=',
+                              inspect.getsource(PPOTrainer.__init__)))
+    assert not read - assigned, f'never initialised: {sorted(read - assigned)}'
 
 
 # --------------------------------------------------------------------------- #

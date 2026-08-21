@@ -1067,8 +1067,8 @@ class PPOTrainer:
             self._pool.set_weights(**self._opp_weights_initial)
             return 'initial'
 
-        n_seen = len(self._wr_vs_lookahead)
-        wr_la = float(np.mean(self._wr_vs_lookahead)) if n_seen else 0.0
+        n_seen = len(self._wr_vs_lookahead_critic)
+        wr_la = float(np.mean(self._wr_vs_lookahead_critic)) if n_seen else 0.0
         ready = (n_seen >= self._finetune2_min_episodes
                  and wr_la >= self._wr_finetune2_threshold
                  and batch_num >= self._finetune2_min_batch)
